@@ -1,0 +1,119 @@
+:root {
+  --panel: rgba(18, 20, 26, 0.58);
+  --border: rgba(255, 255, 255, 0.1);
+  --text: #f1f3f6;
+  --muted: #a9b0bb;
+  --accent: #ffffff;
+  font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: var(--text);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #a9cdee;
+  user-select: none;
+}
+
+#view { display: block; width: 100vw; height: 100vh; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+}
+
+#hud { position: fixed; inset: 0; pointer-events: none; }
+body:not(.playing) #hud #crosshair { display: none; }
+
+#crosshair {
+  position: absolute; left: 50%; top: 50%;
+  width: 18px; height: 18px; transform: translate(-50%, -50%);
+}
+#crosshair::before, #crosshair::after {
+  content: ''; position: absolute; background: rgba(255, 255, 255, 0.92);
+  box-shadow: 0 0 2px rgba(0, 0, 0, 0.6);
+}
+#crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
+#crosshair::after { top: 8px; left: 0; width: 18px; height: 2px; }
+
+#tools {
+  position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
+  padding: 6px; display: flex; flex-direction: column; gap: 2px;
+}
+.tool {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 12px 7px 7px; border-radius: 7px; font-size: 14px; color: var(--muted);
+}
+.tool.active { background: rgba(255, 255, 255, 0.16); color: var(--accent); font-weight: 600; }
+.key {
+  display: inline-grid; place-items: center; min-width: 22px; height: 22px; padding: 0 5px;
+  border-radius: 5px; border: 1px solid var(--border); background: rgba(255, 255, 255, 0.08);
+  font-size: 11px; font-weight: 600; color: var(--text);
+}
+
+#bottom {
+  position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
+  display: flex; flex-direction: column; align-items: center; gap: 8px;
+}
+#status { padding: 7px 14px; font-size: 13px; color: var(--muted); white-space: nowrap; }
+#status b { color: var(--text); }
+#status .sep { margin: 0 8px; opacity: 0.5; }
+
+#hotbar { display: flex; gap: 4px; padding: 5px; }
+.slot {
+  position: relative; width: 48px; height: 48px; border-radius: 7px;
+  display: grid; place-items: center; border: 2px solid transparent;
+}
+.slot canvas { image-rendering: pixelated; border-radius: 3px; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4); }
+.slot.active { border-color: #fff; background: rgba(255, 255, 255, 0.14); }
+.slot .num {
+  position: absolute; left: 4px; top: 2px; font-size: 10px; font-weight: 700;
+  text-shadow: 0 1px 2px #000;
+}
+.slot .badge {
+  position: absolute; right: 4px; bottom: 4px; width: 7px; height: 7px;
+  border-radius: 1px; background: #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
+}
+
+#matname {
+  position: absolute; left: 50%; bottom: 128px; transform: translateX(-50%);
+  font-size: 15px; font-weight: 600; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+  opacity: 0; transition: opacity 0.25s;
+}
+#matname.show { opacity: 1; }
+
+#toast {
+  position: absolute; left: 50%; top: 22%; transform: translateX(-50%);
+  padding: 8px 16px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border);
+  font-size: 14px; opacity: 0; transition: opacity 0.25s;
+}
+#toast.show { opacity: 1; }
+
+#stats {
+  position: absolute; right: 16px; top: 16px; margin: 0; padding: 10px 12px;
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+#help { position: absolute; right: 16px; top: 50%; transform: translateY(-50%); padding: 14px 16px; width: 300px; }
+#help h3 { margin: 0 0 8px; font-size: 14px; }
+
+.controls {
+  display: grid; grid-template-columns: auto auto; gap: 5px 18px; font-size: 13px; color: var(--muted);
+}
+.controls .k { color: var(--text); text-align: right; }
+
+/* Small, non-blocking prompt shown while the mouse isn't captured. */
+#hint {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, 28px);
+  padding: 8px 16px; border-radius: 999px; font-size: 14px; white-space: nowrap;
+  pointer-events: none; transition: opacity 0.2s;
+}
+#hint .k { color: var(--muted); }
+#hint.hidden { opacity: 0; }
+body:not(.playing) #view { cursor: pointer; }

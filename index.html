@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dual Voxel Demo</title>
+    <link rel="stylesheet" href="/src/style.css" />
+  </head>
+  <body>
+    <canvas id="view"></canvas>
+
+    <div id="hud">
+      <div id="crosshair"></div>
+      <div id="tools" class="panel"></div>
+      <div id="matname"></div>
+      <div id="bottom">
+        <div id="status" class="panel"></div>
+        <div id="hotbar" class="panel"></div>
+      </div>
+      <div id="toast"></div>
+      <pre id="stats" class="panel" hidden></pre>
+      <div id="help" class="panel" hidden>
+        <h3>Controls</h3>
+        <div class="controls"></div>
+      </div>
+    </div>
+
+    <div id="hint" class="panel"></div>
+
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>
