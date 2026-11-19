@@ -18,12 +18,11 @@ import { OCC_SLOPE } from './World.js';
  * Player: brushes and terrain placement never make terrain solid inside
  * the player's box (pass `protect`).
  *
- * Specks: after each edit, tiny disconnected bits of terrain left inside
- * the edited region are dissolved.
+ * Specks: after each brush edit, tiny disconnected bits of terrain left
+ * inside the edited region are dissolved.
+ *
+ * Build: whole grid cells, for blocks and terrain alike (see fillCell).
  */
-
-/** Radius of the lump added/removed when building with terrain materials. */
-export const STAMP_RADIUS = 0.75;
 
 /** Disconnected terrain pieces this many voxels or smaller are removed after edits. */
 export const SPECK_MAX_VOXELS = 12;
@@ -172,7 +171,7 @@ export function removeSpecks(world, r) {
  * changes after reading (so neighbour-based brushes see the pre-edit state),
  * cleans up specks and marks meshes dirty.
  */
-function brush(world, box, seed, protect, fn) {
+function brush(world, box, seed, protect, fn, { specks = true } = {}) {
   const r = region(world, ...box);
   if (r.empty) return 0;
   const mask = reachable(world, r, seed);
@@ -193,7 +192,7 @@ function brush(world, box, seed, protect, fn) {
   for (let i = 0; i < writes.length; i += 5) world.setRaw(writes[i], writes[i + 1], writes[i + 2], writes[i + 3], writes[i + 4]);
   if (writes.length) {
     // Check a margin around the edit for specks it may have cut loose.
-    removeSpecks(world, region(world, r.x0 - 2, r.y0 - 2, r.z0 - 2, r.x1 + 2, r.y1 + 2, r.z1 + 2));
+    if (specks) removeSpecks(world, region(world, r.x0 - 2, r.y0 - 2, r.z0 - 2, r.x1 + 2, r.y1 + 2, r.z1 + 2));
     world.markDirtyBox(r.x0 - 2, r.y0 - 2, r.z0 - 2, r.x1 + 2, r.y1 + 2, r.z1 + 2);
   }
   return writes.length / 5;
@@ -306,62 +305,87 @@ function falloff(t) {
 // ------------------------------------------------------------------- build
 
 /**
- * Field for a block resting on terrain whose voxel below has field `below`:
- * just enough that the ground surface sits 0.1 above the block's base, so
- * there's never a gap under it. Always below 0.5, so a resting block is never
- * mistaken for a buried one.
+ * Terrain cells. Build works in whole grid cells for terrain as well as for
+ * blocks. A terrain cell's field is 179 inside and 76 in all 26 neighbours
+ * (they sum to 255, so the surface sits exactly on the cell's faces). That's
+ * the same ramp as flat generated ground, so cells merge with level ground,
+ * with each other (rows of cells make flat walls and floors on grid planes)
+ * and line up with blocks: a terrain cell beside a block is flush with it.
  */
-function footField(below) {
-  const a = below / 255;
-  return Math.round((a - (a - 0.5) / 0.6) * 255);
+export const CELL_IN = 179;
+export const CELL_OUT = 255 - CELL_IN;
+
+const cellBox = (x, y, z) => [x - 1, y - 1, z - 1, x + 1, y + 1, z + 1];
+
+/** Union a terrain cell into the world (never through blocks). */
+export function fillCell(world, x, y, z, material) {
+  return brush(world, cellBox(x, y, z), [x + 0.5, y + 0.5, z + 0.5], null, (vx, vy, vz, occ, mat) => {
+    const own = vx === x && vy === y && vz === z;
+    const target = own ? CELL_IN : CELL_OUT;
+    if (own) return occ >= target && mat === material ? null : [Math.max(occ, target), material];
+    if (occ >= target) return null;
+    return [target, mat || material];
+  }, { specks: false });
 }
 
-/** Field that puts the ground surface exactly at the base of the voxel above `below`. */
-function groundField(below) {
-  return 255 - below;
+/** Carve a terrain cell out of the world, leaving a hole whose walls sit on the cell's faces. */
+export function carveCell(world, x, y, z) {
+  return brush(world, cellBox(x, y, z), [x + 0.5, y + 0.5, z + 0.5], null, (vx, vy, vz, occ, mat) => {
+    const own = vx === x && vy === y && vz === z;
+    const target = own ? CELL_OUT : CELL_IN;
+    return occ > target ? [target, mat] : null;
+  });
 }
 
 /**
- * Build-tool place. Block materials make an exact cube; the voxel's field is
- * kept, lifted slightly when it rests on the ground. Terrain materials add a
- * small smooth lump (never inside the player, never through blocks).
+ * Build-tool place. Block materials make an exact cube; terrain materials
+ * fill the cell with terrain. Neither ever changes the terrain field stored
+ * under a block, so removing a block restores exactly what was there.
+ * (The caller checks the player isn't in the cell, as for blocks.)
  */
-export function placeAt(world, x, y, z, material, opts = {}) {
+export function placeAt(world, x, y, z, material) {
   if (y < 1 || !world.inBounds(x, y, z) || world.isBlock(x, y, z)) return false;
-  if (HARD[material]) {
-    let occ = world.getOcc(x, y, z);
-    const below = world.getOcc(x, y - 1, z);
-    if (!world.isBlock(x, y - 1, z) && below >= 128) occ = Math.max(occ, footField(below));
-    world.set(x, y, z, occ, material);
-  } else {
-    stampSphere(world, x + 0.5, y + 0.5, z + 0.5, STAMP_RADIUS, 'add', 255, material, { protect: opts.protect });
-  }
+  if (HARD[material]) world.set(x, y, z, world.getOcc(x, y, z), material);
+  else fillCell(world, x, y, z, material);
   return true;
 }
 
 /**
- * Build-tool remove.
- *  - A block resting on or above the ground just disappears; its foot lift
- *    is undone so the ground is exactly as before.
- *  - A block buried in terrain leaves a rounded pocket where it was.
- *  - Terrain gets a small smooth dent.
+ * Build-tool remove: always one cell.
+ *  - A block just disappears. The terrain field under it was never changed,
+ *    so the ground is exactly as before (if terrain reached into the block's
+ *    cell, it's back, in the material of the ground beside it).
+ *  - Terrain gets the cell carved out.
  */
 export function removeAt(world, x, y, z) {
   if (y < 1 || !world.isSolid(x, y, z)) return false;
-  const cx = x + 0.5, cy = y + 0.5, cz = z + 0.5;
   if (world.isBlock(x, y, z)) {
     const occ = world.getOcc(x, y, z);
-    if (occ >= 128) {
-      world.setRaw(x, y, z, occ, terrainMaterialNear(world, x, y, z));
-      stampSphere(world, cx, cy, cz, STAMP_RADIUS, 'sub');
-      world.markDirtyBox(x, y, z, x, y, z);
-    } else {
-      const below = world.getOcc(x, y - 1, z);
-      const nOcc = below >= 128 && !world.isBlock(x, y - 1, z) ? Math.min(occ, groundField(below)) : occ;
-      world.set(x, y, z, nOcc, nOcc ? terrainMaterialNear(world, x, y, z) : 0);
-    }
+    world.set(x, y, z, occ, occ ? surfaceMaterialAt(world, x, y, z) : 0);
   } else {
-    stampSphere(world, cx, cy, cz, STAMP_RADIUS, 'sub');
+    carveCell(world, x, y, z);
   }
   return true;
+}
+
+/**
+ * Material for terrain reappearing in a cell: the most common terrain beside
+ * it at the same height (so grass stays grass), else what's below, else nearby.
+ */
+function surfaceMaterialAt(world, x, y, z) {
+  const counts = new Map();
+  let best = 0, bestN = 0;
+  for (let dz = -1; dz <= 1; dz++)
+    for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dz) continue;
+      const m = world.getMat(x + dx, y, z + dz);
+      if (!m || HARD[m] || world.getOcc(x + dx, y, z + dz) === 0) continue;
+      const n = (counts.get(m) || 0) + 1;
+      counts.set(m, n);
+      if (n > bestN) { bestN = n; best = m; }
+    }
+  if (best) return best;
+  const below = world.getMat(x, y - 1, z);
+  if (below && !HARD[below]) return below;
+  return terrainMaterialNear(world, x, y, z);
 }

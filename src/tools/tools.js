@@ -7,7 +7,7 @@ import { stampSphere, stepForSpeed, smoothBrush, flattenBrush, paintBrush, place
 const SCULPT_SPEED = 3;
 
 export const TOOLS = [
-  { id: 'build', name: 'Build', key: 'Z', hint: 'LMB remove block · RMB place block' },
+  { id: 'build', name: 'Build', key: 'Z', hint: 'LMB remove · RMB place (one cell of block or terrain)' },
   { id: 'sculpt', name: 'Sculpt', key: 'X', hint: 'LMB dig · RMB raise' },
   { id: 'smooth', name: 'Smooth', key: 'C', hint: 'LMB smooth surface' },
   { id: 'flatten', name: 'Flatten', key: 'V', hint: 'LMB flatten to the height you clicked' },
@@ -136,10 +136,18 @@ export class ToolSystem {
     return { point: h.point.clone(), normal: n };
   }
 
+  /**
+   * Build works on grid cells for blocks and terrain alike. On smooth terrain
+   * the surface normal is snapped to its main axis, so you always target the
+   * cell straight below/beside the surface you aim at, never a diagonal one.
+   */
   buildTargets() {
     const { point: p, normal: n } = this.hit;
-    const remove = [Math.floor(p.x - n.x * 0.5), Math.floor(p.y - n.y * 0.5), Math.floor(p.z - n.z * 0.5)];
-    const place = [Math.floor(p.x + n.x * 0.5), Math.floor(p.y + n.y * 0.5), Math.floor(p.z + n.z * 0.5)];
+    const ax = Math.abs(n.x), ay = Math.abs(n.y), az = Math.abs(n.z);
+    const a = ay >= ax && ay >= az ? [0, Math.sign(n.y), 0] : ax >= az ? [Math.sign(n.x), 0, 0] : [0, 0, Math.sign(n.z)];
+    let remove = [Math.floor(p.x - a[0] * 0.5), Math.floor(p.y - a[1] * 0.5), Math.floor(p.z - a[2] * 0.5)];
+    if (!this.world.isSolid(...remove)) remove = [Math.floor(p.x - n.x * 0.5), Math.floor(p.y - n.y * 0.5), Math.floor(p.z - n.z * 0.5)];
+    const place = [Math.floor(p.x + a[0] * 0.5), Math.floor(p.y + a[1] * 0.5), Math.floor(p.z + a[2] * 0.5)];
     return { remove, place };
   }
 
@@ -229,7 +237,7 @@ export class ToolSystem {
       removeAt(this.world, ...remove);
     } else {
       if (this.player.intersectsVoxel(...place)) return;
-      placeAt(this.world, ...place, this.material, { protect: this.protect });
+      placeAt(this.world, ...place, this.material);
     }
   }
 

@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { World, OCC_SLOPE } from '../src/world/World.js';
 import { MAT, HARD } from '../src/world/materials.js';
 import { stampSphere, stepForSpeed, smoothBrush, flattenBrush, placeAt, removeAt, SPECK_MAX_VOXELS } from '../src/world/edits.js';
+import { PAD } from '../src/mesh/surfaceNets.js';
 import { meshChunk } from '../src/mesh/surfaceNets.js';
 
 const GROUND = 12;
@@ -132,16 +133,23 @@ describe('edits keep the terrain field smooth', () => {
     expect(w.isSolid(8, GROUND - 1, 26)).toBe(false);
   });
 
-  it('removing a buried block leaves a smooth pocket, not a hard hole', () => {
+  it('removing a block restores the terrain that was in its cell', () => {
     const w = flatWorld();
     const y = GROUND - 4; // deep underground: field is 255 here
     placeAt(w, 16, y, 16, MAT.BRICK);
-    expect(w.getOcc(16, y, 16)).toBe(255);
     removeAt(w, 16, y, 16);
     expect(w.isBlock(16, y, 16)).toBe(false);
-    expect(w.isSolid(16, y, 16)).toBe(false);
-    expect(w.isSolid(17, y, 16)).toBe(true); // neighbours remain ground
-    expect(maxStep(w)).toBeLessThanOrEqual(MAX_STEP);
+    expect(w.getOcc(16, y, 16)).toBe(255);
+
+    // Ground surface 0.3 above the cell centre, as on a slope: no pit, and grass stays grass.
+    const w2 = flatWorld();
+    const lift = Math.round((0.5 + 0.3 * OCC_SLOPE) * 255);
+    for (let z = 0; z < w2.sz; z++) for (let x = 0; x < w2.sx; x++) w2.setRaw(x, GROUND, z, lift, MAT.GRASS);
+    for (let z = 0; z < w2.sz; z++) for (let x = 0; x < w2.sx; x++) w2.setRaw(x, GROUND - 1, z, 255, MAT.DIRT);
+    placeAt(w2, 16, GROUND, 16, MAT.PLANKS);
+    removeAt(w2, 16, GROUND, 16);
+    expect(w2.getOcc(16, GROUND, 16)).toBe(lift);
+    expect(w2.getMat(16, GROUND, 16)).toBe(MAT.GRASS);
   });
 
   it('brushes never change the terrain stored inside blocks', () => {
@@ -205,5 +213,107 @@ describe('edits keep the terrain field smooth', () => {
     removeAt(w, 16, GROUND, 16);
     expect(w.isSolid(16, GROUND, 16)).toBe(false);
     expect([w.getOcc(16, GROUND - 1, 16), w.getOcc(16, GROUND - 2, 16)]).toEqual(before);
+  });
+
+  it('building with terrain fills exact grid cells', () => {
+    const w = flatWorld();
+    for (let x = 8; x < 14; x++) placeAt(w, x, GROUND, 8, MAT.DIRT);
+    for (let x = 8; x < 14; x++) expect(w.isSolid(x, GROUND, 8)).toBe(true);
+    expect(w.isSolid(14, GROUND, 8)).toBe(false);
+    expect(w.isSolid(10, GROUND + 1, 8)).toBe(false);
+    expect(w.isSolid(10, GROUND, 9)).toBe(false);
+    removeAt(w, 10, GROUND - 1, 20);
+    expect(w.isSolid(10, GROUND - 1, 20)).toBe(false);
+    expect(w.isSolid(11, GROUND - 1, 20)).toBe(true);
+    expect(w.isSolid(10, GROUND - 2, 20)).toBe(true);
+    expect(maxStep(w)).toBeLessThanOrEqual(MAX_STEP);
+  });
+});
+
+/** Terrain triangles of the whole world, as [ax, ay, az, bx, ...] per triangle. */
+function terrainTris(w) {
+  const out = [];
+  for (let i = 0; i < w.chunks.length; i++) {
+    const [cx, cy, cz] = w.chunkCoords(i);
+    const p = w.buildPadded(cx, cy, cz);
+    const m = meshChunk(p.occ, p.mat, p.size, p.origin, HARD);
+    for (let j = m.blockVertices * 3; j < m.position.length; j += 9) out.push(Array.from(m.position.subarray(j, j + 9)));
+  }
+  return out;
+}
+const centroid = (t) => [(t[0] + t[3] + t[6]) / 3, (t[1] + t[4] + t[7]) / 3, (t[2] + t[5] + t[8]) / 3];
+
+describe('terrain meets blocks cleanly', () => {
+  it('meshes ground in a one-voxel gap between blocks', () => {
+    const w = flatWorld();
+    for (let z = 9; z <= 14; z++) for (let x = 9; x <= 11; x++) if (!(x === 10 && z >= 10)) placeAt(w, x, GROUND, z, MAT.PLANKS);
+    let area = 0;
+    for (const t of terrainTris(w)) {
+      const [cx, , cz] = centroid(t);
+      if (cx > 10 && cx < 11 && cz > 10 && cz < 14) {
+        const e1 = [t[3] - t[0], t[5] - t[2]], e2 = [t[6] - t[0], t[8] - t[2]];
+        area += Math.abs(e1[0] * e2[1] - e1[1] * e2[0]) / 2;
+      }
+    }
+    expect(area).toBeGreaterThan(3.99);
+  });
+
+  it('level ground meets a block at its base, without a skirt', () => {
+    const w = flatWorld();
+    for (let z = 10; z < 20; z++) placeAt(w, 16, GROUND, z, MAT.BRICK);
+    for (const t of terrainTris(w)) {
+      for (let k = 0; k < 9; k += 3) {
+        const x = t[k], y = t[k + 1], z = t[k + 2];
+        // Every visible terrain vertex near the wall lies on the ground plane.
+        if (z > 11 && z < 18 && (x < 16 || x > 17) && Math.abs(x - 16.5) < 2) expect(y).toBeCloseTo(GROUND, 1.9); // ground rounds 76.5 → 77: 5 mm
+      }
+    }
+  });
+
+  it('a terrain cell built beside a block is flush with its top', () => {
+    const w = flatWorld();
+    const y = GROUND + 2; // in the air, on top of a pillar
+    for (let z = 10; z < 20; z++) {
+      for (let h = GROUND; h <= y; h++) placeAt(w, 17, h, z, MAT.BRICK);
+      placeAt(w, 16, y, z, MAT.PLANKS);
+      for (let h = GROUND; h <= y; h++) placeAt(w, 15, h, z, MAT.DIRT);
+    }
+    // The dirt column's top runs level (y + 1) right up to the planks: no groove at the joint.
+    let seen = 0;
+    for (const t of terrainTris(w)) {
+      for (let k = 0; k < 9; k += 3) {
+        const x = t[k], vy = t[k + 1], z = t[k + 2];
+        if (z > 11 && z < 18 && x > 15.5 && x < 16.01 && vy > y + 0.5) {
+          expect(vy).toBeCloseTo(y + 1, 3);
+          seen++;
+        }
+      }
+    }
+    expect(seen).toBeGreaterThan(0);
+  });
+
+  it('terrain never hangs off blocks that overhang the ground', () => {
+    // Ground sloping down along x: level with the beam's base at x = 12, 2 m below it at x = 22.
+    const w = new World(2, 2, 2, 16);
+    const h = (x) => GROUND + 1 - 0.2 * Math.max(0, x - 12);
+    for (let z = 0; z < w.sz; z++) for (let y = 0; y < w.sy; y++) for (let x = 0; x < w.sx; x++) {
+      const o = Math.round(Math.min(1, Math.max(0, 0.5 + (h(x + 0.5) - (y + 0.5)) * OCC_SLOPE)) * 255);
+      w.setRaw(x, y, z, o, o ? MAT.GRASS : 0);
+    }
+    for (let x = 10; x <= 22; x++) placeAt(w, x, GROUND + 1, 16, MAT.PLANKS);
+    const onBlock = (x, y, z) => {
+      const e = 1e-3;
+      for (const dx of [-e, e]) for (const dy of [-e, e]) for (const dz of [-e, e])
+        if (w.isBlock(Math.floor(x + dx), Math.floor(y + dy), Math.floor(z + dz))) return true;
+      return false;
+    };
+    let curtain = 0;
+    for (const t of terrainTris(w)) {
+      const [cx, cy, cz] = centroid(t);
+      // Terrain may close a gap of under half a voxel up to a block's face, but
+      // anything higher above the ground must lie on a block (hidden by it).
+      if (cy > h(cx) + 0.5 && !onBlock(cx, cy, cz)) curtain++;
+    }
+    expect(curtain).toBe(0);
   });
 });

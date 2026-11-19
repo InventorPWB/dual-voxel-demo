@@ -124,6 +124,77 @@ export function meshChunk(occ, mat, size, origin, hard, fallbackMat = 2) {
   const cAo = [];
   const cInBlock = [];
   const corO = new Float32Array(8);
+  const corS = new Uint8Array(8);
+  const corI = new Int32Array(8);
+
+  // Terrain field as the mesher sees it. Terrain voxels use their own field.
+  // A block uses the field stored under it, raised just enough that terrain
+  // next to it ends exactly on the block's face (a solid neighbour at v puts
+  // the surface on the face when the block reads 1 - v) or further in, where
+  // the block hides it. It's capped below the surface level, so terrain never
+  // grows out of a block, and the terrain mesh stays one closed surface that
+  // simply runs into blocks: flush where it meets them, never stretched
+  // across gaps under them. (If the stored field says terrain covers the
+  // block, it does.)
+  const fT = new Float32Array(occ.length);
+  for (let i = 0; i < occ.length; i++) {
+    if (!hard[mat[i]] || occ[i] >= 128) { fT[i] = occ[i]; continue; }
+    let e = occ[i];
+    for (const o of [1, -1, N, -N, NN, -NN]) {
+      const j = i + o;
+      if (j < 0 || j >= occ.length || hard[mat[j]] || occ[j] < 128) continue;
+      e = Math.max(e, Math.min(127, 255 - occ[j]));
+    }
+    fT[i] = e;
+  }
+  const solidT = (i) => fT[i] >= 128;
+
+  // Per-sample gradient of the field (central differences): the hermite
+  // normals for dual contouring are interpolated from these.
+  const grX = new Float32Array(occ.length), grY = new Float32Array(occ.length), grZ = new Float32Array(occ.length);
+  for (let z = 0; z < N; z++)
+    for (let y = 0; y < N; y++)
+      for (let x = 0; x < N; x++) {
+        const i = x + N * y + NN * z;
+        grX[i] = (fT[x < N - 1 ? i + 1 : i] - fT[x > 0 ? i - 1 : i]) / 255;
+        grY[i] = (fT[y < N - 1 ? i + N : i] - fT[y > 0 ? i - N : i]) / 255;
+        grZ[i] = (fT[z < N - 1 ? i + NN : i] - fT[z > 0 ? i - NN : i]) / 255;
+      }
+
+  // ---- dual contouring: least-squares vertex over the crossings' tangent planes
+  const qef = new Float64Array(9);
+  const qOut = new Float64Array(3);
+  const QEF_BIAS = 0.03; // pull toward the mass point, for stability on thin or noisy features
+  /** How far vertices go from the surface-nets average toward the dual-contouring point. */
+  const SHARPNESS = 0.85;
+  /** Crossing on a grid plane: ends sum to 1 (±GRID_EPS) and differ by about a full cell step. */
+  const GRID_EPS = 0.03;
+  const GRID_STEP = 0.37;
+
+  function addPlane(px, py, pz, nx, ny, nz) {
+    const d = nx * px + ny * py + nz * pz;
+    qef[0] += nx * nx; qef[1] += nx * ny; qef[2] += nx * nz;
+    qef[3] += ny * ny; qef[4] += ny * nz; qef[5] += nz * nz;
+    qef[6] += nx * d; qef[7] += ny * d; qef[8] += nz * d;
+  }
+
+  /** Solve (AᵀA + λI) x = Aᵀb + λm into qOut, clamped to the cell. */
+  function solveQEF(L, mx, my, mz) {
+    const a00 = qef[0] + L, a01 = qef[1], a02 = qef[2], a11 = qef[3] + L, a12 = qef[4], a22 = qef[5] + L;
+    const b0 = qef[6] + L * mx, b1 = qef[7] + L * my, b2 = qef[8] + L * mz;
+    const c00 = a11 * a22 - a12 * a12, c01 = a02 * a12 - a01 * a22, c02 = a01 * a12 - a02 * a11;
+    const det = a00 * c00 + a01 * c01 + a02 * c02;
+    let x = mx, y = my, z = mz;
+    if (Math.abs(det) > 1e-12) {
+      const c11 = a00 * a22 - a02 * a02, c12 = a01 * a02 - a00 * a12, c22 = a00 * a11 - a01 * a01;
+      x = (c00 * b0 + c01 * b1 + c02 * b2) / det;
+      y = (c01 * b0 + c11 * b1 + c12 * b2) / det;
+      z = (c02 * b0 + c12 * b1 + c22 * b2) / det;
+    }
+    qOut[0] = x < 0 ? 0 : x > 1 ? 1 : x;
+    qOut[1] = y < 0 ? 0 : y > 1 ? 1 : y;
+    qOut[2] = z < 0 ? 0 : z > 1 ? 1 : z;
+  }
 
   /** Is padded-voxel-space point r inside (or on the surface of) a block? */
   function inBlock(rx, ry, rz) {
@@ -143,27 +214,61 @@ export function meshChunk(occ, mat, size, origin, hard, fallbackMat = 2) {
     const existing = cellSlot[key];
     if (existing >= 0) return existing;
 
+    let touchesBlock = false;
     for (let k = 0; k < 8; k++) {
-      corO[k] = occ[(px + (k & 1)) + N * (py + ((k >> 1) & 1)) + NN * (pz + ((k >> 2) & 1))] / 255;
+      const ci = (px + (k & 1)) + N * (py + ((k >> 1) & 1)) + NN * (pz + ((k >> 2) & 1));
+      corI[k] = ci;
+      corO[k] = fT[ci] / 255;
+      corS[k] = solidT(ci) ? 1 : 0;
+      if (isHard(ci)) touchesBlock = true;
     }
+
+    // Vertex by dual contouring with normals from the field gradient, so it
+    // sits on the surface (built cells keep their full size and flat faces)
+    // instead of at the edge crossings' average (surface nets), which shrinks
+    // every edge and corner. Blended slightly toward that average for
+    // softened edges.
+    qef.fill(0);
     let sx = 0, sy = 0, sz = 0, n = 0;
     for (let e = 0; e < CELL_EDGES.length; e += 2) {
       const a = CELL_EDGES[e], b = CELL_EDGES[e + 1];
+      if (corS[a] === corS[b]) continue;
       const oa = corO[a], ob = corO[b];
-      if ((oa >= 0.5) === (ob >= 0.5)) continue;
       const t = (0.5 - oa) / (ob - oa);
-      sx += (a & 1) + (((b & 1) - (a & 1)) * t);
-      sy += ((a >> 1) & 1) + ((((b >> 1) & 1) - ((a >> 1) & 1)) * t);
-      sz += ((a >> 2) & 1) + ((((b >> 2) & 1) - ((a >> 2) & 1)) * t);
-      n++;
+      const cx = (a & 1) + (((b & 1) - (a & 1)) * t);
+      const cy = ((a >> 1) & 1) + ((((b >> 1) & 1) - ((a >> 1) & 1)) * t);
+      const cz = ((a >> 2) & 1) + ((((b >> 2) & 1) - ((a >> 2) & 1)) * t);
+      const ia = corI[a], ib = corI[b];
+      let gx = grX[ia] + (grX[ib] - grX[ia]) * t;
+      let gy = grY[ia] + (grY[ib] - grY[ia]) * t;
+      let gz = grZ[ia] + (grZ[ib] - grZ[ia]) * t;
+      let gl = Math.hypot(gx, gy, gz);
+      // A full-cell step whose ends sum to 1 puts the surface exactly on the
+      // grid plane between them (built cells, carved holes, level ground,
+      // terrain against a block face). Its true normal is the edge axis; the
+      // interpolated gradient isn't reliable at one-voxel scale (e.g. ground
+      // below a cell tilts it).
+      const onGrid = Math.abs(oa + ob - 1) < GRID_EPS && Math.abs(oa - ob) > GRID_STEP;
+      if (onGrid || gl < 1e-5) {
+        const bit = b - a, sg = corS[a] ? 1 : -1;
+        gx = bit === 1 ? -sg : 0; gy = bit === 2 ? -sg : 0; gz = bit === 4 ? -sg : 0; gl = 1;
+      }
+      addPlane(cx, cy, cz, -gx / gl, -gy / gl, -gz / gl);
+      sx += cx; sy += cy; sz += cz; n++;
     }
+    sx /= n; sy /= n; sz /= n;
+    solveQEF(touchesBlock ? 1e-4 : QEF_BIAS, sx, sy, sz);
     // q: vertex position in padded sample coordinates (sample P sits at q = P).
-    const qx = px + sx / n, qy = py + sy / n, qz = pz + sz / n;
+    // Where terrain meets a block, no softening: the joint is exact.
+    const k = touchesBlock ? 1 : SHARPNESS;
+    const qx = px + sx + (qOut[0] - sx) * k;
+    const qy = py + sy + (qOut[1] - sy) * k;
+    const qz = pz + sz + (qOut[2] - sz) * k;
 
-    // Normal: central-difference gradient of the smooth field (solid → empty).
-    let gx = field(occ, qx + 1, qy, qz) - field(occ, qx - 1, qy, qz);
-    let gy = field(occ, qx, qy + 1, qz) - field(occ, qx, qy - 1, qz);
-    let gz = field(occ, qx, qy, qz + 1) - field(occ, qx, qy, qz - 1);
+    // Shading normal: central-difference gradient of the smooth field (solid → empty).
+    let gx = field(fT, qx + 1, qy, qz) - field(fT, qx - 1, qy, qz);
+    let gy = field(fT, qx, qy + 1, qz) - field(fT, qx, qy - 1, qz);
+    let gz = field(fT, qx, qy, qz + 1) - field(fT, qx, qy, qz - 1);
     let len = Math.hypot(gx, gy, gz);
     if (len < 1e-5) { gx = 0; gy = -1; gz = 0; len = 1; }
     const nx = -gx / len, ny = -gy / len, nz = -gz / len;
@@ -187,7 +292,8 @@ export function meshChunk(occ, mat, size, origin, hard, fallbackMat = 2) {
 
   /** Terrain material for a block voxel's field: borrow a nearby terrain material. */
   function terrainMat(i) {
-    for (const o of [-N, 1, -1, NN, -NN, N]) {
+    // Beside first (so ground keeps its top material), then below, then above.
+    for (const o of [1, -1, NN, -NN, -N, N]) {
       const j = i + o;
       if (j >= 0 && j < occ.length && !isHard(j) && occ[j] > 0 && mat[j]) return mat[j];
     }
@@ -202,11 +308,11 @@ export function meshChunk(occ, mat, size, origin, hard, fallbackMat = 2) {
       for (let lx = 0; lx < size; lx++) {
         const px = lx + PAD, py = ly + PAD, pz = lz + PAD;
         const ia = px + N * py + NN * pz;
-        const sa = occ[ia] >= 128;
+        const sa = solidT(ia);
         for (let axis = 0; axis < 3; axis++) {
           const d = AX[axis];
           const ib = ia + off(d);
-          const sb = occ[ib] >= 128;
+          const sb = solidT(ib);
           if (sa === sb) continue;
 
           const u = AX[(axis + 1) % 3], v = AX[(axis + 2) % 3];
@@ -214,7 +320,17 @@ export function meshChunk(occ, mat, size, origin, hard, fallbackMat = 2) {
           quad[1] = cell(px - v[0], py - v[1], pz - v[2]);
           quad[2] = cell(px, py, pz);
           quad[3] = cell(px - u[0], py - u[1], pz - u[2]);
-          if (cInBlock[quad[0]] && cInBlock[quad[1]] && cInBlock[quad[2]] && cInBlock[quad[3]]) continue;
+          // Drop terrain that lies on or inside blocks (the block's faces show
+          // there). All four corners touching blocks isn't enough: ground in a
+          // one-voxel gap between blocks touches them at every corner, so the
+          // quad's centre must be on a block too.
+          if (cInBlock[quad[0]] && cInBlock[quad[1]] && cInBlock[quad[2]] && cInBlock[quad[3]]) {
+            let rx = 0, ry = 0, rz = 0;
+            for (let k = 0; k < 4; k++) {
+              rx += cPos[quad[k] * 3]; ry += cPos[quad[k] * 3 + 1]; rz += cPos[quad[k] * 3 + 2];
+            }
+            if (inBlock(rx / 4 - ox + PAD, ry / 4 - oy + PAD, rz / 4 - oz + PAD)) continue;
+          }
 
           const solid = sa ? ia : ib;
           const m = isHard(solid) ? terrainMat(solid) : mat[solid];
