@@ -42,51 +42,52 @@ body:not(.playing) #hud #crosshair { display: none; }
 #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
 #crosshair::after { top: 8px; left: 0; width: 18px; height: 2px; }
 
-#tools {
-  position: absolute; left: 16px; top: 50%; transform: translateY(-50%);
-  padding: 6px; display: flex; flex-direction: column; gap: 2px;
-}
-.tool {
-  display: flex; align-items: center; gap: 10px;
-  padding: 7px 12px 7px 7px; border-radius: 7px; font-size: 14px; color: var(--muted);
-}
-.tool.active { background: rgba(255, 255, 255, 0.16); color: var(--accent); font-weight: 600; }
-.key {
-  display: inline-grid; place-items: center; min-width: 22px; height: 22px; padding: 0 5px;
-  border-radius: 5px; border: 1px solid var(--border); background: rgba(255, 255, 255, 0.08);
-  font-size: 11px; font-weight: 600; color: var(--text);
-}
-
-#bottom {
+#hotbar {
   position: absolute; left: 50%; bottom: 16px; transform: translateX(-50%);
-  display: flex; flex-direction: column; align-items: center; gap: 8px;
+  display: flex; gap: 4px; padding: 5px;
 }
-#status { padding: 7px 14px; font-size: 13px; color: var(--muted); white-space: nowrap; }
-#status b { color: var(--text); }
-#status .sep { margin: 0 8px; opacity: 0.5; }
-
-#hotbar { display: flex; gap: 4px; padding: 5px; }
 .slot {
-  position: relative; width: 48px; height: 48px; border-radius: 7px;
+  position: relative; width: 50px; height: 50px; border-radius: 7px;
   display: grid; place-items: center; border: 2px solid transparent;
 }
-.slot canvas { image-rendering: pixelated; border-radius: 3px; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4); }
+.slot canvas, .item canvas { image-rendering: pixelated; filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.5)); }
 .slot.active { border-color: #fff; background: rgba(255, 255, 255, 0.14); }
 .slot .num {
   position: absolute; left: 4px; top: 2px; font-size: 10px; font-weight: 700;
   text-shadow: 0 1px 2px #000;
 }
-.slot .badge {
-  position: absolute; right: 4px; bottom: 4px; width: 7px; height: 7px;
-  border-radius: 1px; background: #fff; box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.5);
-}
 
-#matname {
-  position: absolute; left: 50%; bottom: 128px; transform: translateX(-50%);
-  font-size: 15px; font-weight: 600; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
-  opacity: 0; transition: opacity 0.25s;
+#itemname {
+  position: absolute; left: 50%; bottom: 84px; transform: translateX(-50%);
+  text-align: center; font-size: 15px; font-weight: 600; text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+  opacity: 0; transition: opacity 0.25s; white-space: nowrap;
 }
-#matname.show { opacity: 1; }
+#itemname span { display: block; margin-top: 2px; font-size: 12px; font-weight: 400; color: #e1e5ea; }
+#itemname.show { opacity: 1; }
+
+/* Inventory: a GUI screen, not an in-world tool. */
+#inventory {
+  position: fixed; left: 50%; top: 46%; transform: translate(-50%, -50%);
+  padding: 16px 18px 18px; max-height: calc(100vh - 140px); overflow: auto;
+  background: rgba(18, 20, 26, 0.82);
+}
+#inventory .head { display: flex; align-items: baseline; gap: 14px; }
+#inventory h3 { margin: 0; font-size: 16px; }
+#inventory .hover { font-size: 14px; color: #fff; font-weight: 600; }
+#inventory .sub { margin: 4px 0 10px; font-size: 12px; color: var(--muted); }
+#inventory .section { margin: 12px 0 6px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+#inventory .tools { display: flex; gap: 4px; }
+#inventory .grid { display: grid; gap: 4px; align-items: center; }
+#inventory .colhead { font-size: 11px; color: var(--muted); text-align: center; }
+#inventory .rowhead { font-size: 12px; color: var(--muted); padding-right: 10px; white-space: nowrap; }
+.item {
+  width: 48px; height: 48px; display: grid; place-items: center; border-radius: 7px;
+  background: rgba(255, 255, 255, 0.05); border: 1px solid transparent; cursor: pointer;
+}
+.item:hover { background: rgba(255, 255, 255, 0.16); border-color: rgba(255, 255, 255, 0.35); }
+body.inventory #hotbar { pointer-events: auto; }
+body.inventory #hotbar .slot { cursor: pointer; }
+body.inventory #view { cursor: default; }
 
 #toast {
   position: absolute; left: 50%; top: 22%; transform: translateX(-50%);

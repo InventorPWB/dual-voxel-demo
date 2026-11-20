@@ -5,9 +5,10 @@ import { TEX_SIZE, texturePixels } from './textures.js';
 export const SKY_COLOR = 0xa9cdee;
 
 /**
- * Returns { terrain, blocks } materials sharing one shader: triplanar-mapped pixel-art textures from
- * a texture array (one texel grid per metre, so block faces show exactly one
- * tile), Lambert sun + hemisphere ambient, baked AO and fog.
+ * The one material for the voxel world: triplanar-mapped pixel-art textures
+ * from a texture array (one tile per metre in world space, so brick and plank
+ * patterns line up across neighbouring shapes), wrap-Lambert sun +
+ * hemisphere ambient, baked AO and fog.
  */
 export function createTerrainMaterial() {
   // Build the texture array: one layer per distinct texture name.
@@ -94,7 +95,7 @@ export function createTerrainMaterial() {
         vec3 w = pow(abs(n), vec3(8.0));
         w /= (w.x + w.y + w.z);
         vec3 L = uLayers[vMat];
-        // Nudge sample points off exact block faces so nearest filtering is stable.
+        // Nudge sample points off exact grid faces so nearest filtering is stable.
         vec3 p = vPos - n * 0.001;
         vec3 cx = texture(uTex, vec3(p.z, p.y, L.y)).rgb;
         vec3 cy = texture(uTex, vec3(p.x, p.z, n.y >= 0.0 ? L.x : L.z)).rgb;
@@ -113,9 +114,5 @@ export function createTerrainMaterial() {
     `,
   };
 
-  // Same shader and uniforms for both. Blocks get a polygon offset so a block face
-  // always wins the depth test against terrain lying exactly on it.
-  const terrain = new THREE.ShaderMaterial(params);
-  const blocks = new THREE.ShaderMaterial({ ...params, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2 });
-  return { terrain, blocks };
+  return new THREE.ShaderMaterial(params);
 }

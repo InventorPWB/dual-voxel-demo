@@ -1,22 +1,27 @@
 import { Chunk } from './Chunk.js';
-import { MAT, HARD } from './materials.js';
-import { PAD } from '../mesh/surfaceNets.js';
+import { MAT } from './materials.js';
+import { packNormal } from './normals.js';
+import { PAD } from '../mesh/dualContour.js';
 
 export const CHUNK_SIZE = 32;
 
-/**
- * Occupancy change per metre across a smooth surface. Below 1 the 0→1 ramp
- * spans several voxels, which gives the mesher a usable gradient instead of
- * stair-stepped slopes.
- */
-export const OCC_SLOPE = 0.4;
+/** Edge length of one voxel, in metres. Voxel coords are integers; scene coords are metres. */
+export const VOXEL = 0.5;
+
+const AXES = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 
 /**
- * A finite grid of chunks. One representation for everything: terrain and
- * player-built blocks are the same voxels, and edits simply overwrite them.
+ * A finite grid of chunks. Every voxel has a material (0 = empty) and a
+ * shape state: 0 is smooth terrain, anything else a building piece (cube,
+ * wedge, ...; see shapes.js) drawn as its exact geometry.
+ *
+ * Smooth terrain is hermite data: on every voxel edge where terrain meets a
+ * non-terrain voxel, the exact crossing point and normal (edited by exact
+ * CSG, see csg.js). Terrain never extends into a building voxel; it stops
+ * exactly at its faces. Below the world is solid bedrock; beside and above, air.
  */
 export class World {
-  constructor(nx = 4, ny = 3, nz = 4, size = CHUNK_SIZE) {
+  constructor(nx = 8, ny = 4, nz = 8, size = CHUNK_SIZE) {
     if ((size & (size - 1)) !== 0) throw new Error('chunk size must be a power of two');
     this.size = size;
     this.shift = Math.log2(size);
@@ -44,43 +49,101 @@ export class World {
     return x >= 0 && y >= 0 && z >= 0 && x < this.sx && y < this.sy && z < this.sz;
   }
 
-  /** Occupancy 0..255. Below the world is solid bedrock; beside/above is air. */
-  getOcc(x, y, z) {
-    if (y < 0) return 255;
-    if (!this.inBounds(x, y, z)) return 0;
-    const c = this.chunks[this.chunkIndex(x >> this.shift, y >> this.shift, z >> this.shift)];
-    return c.occ[c.index(x & this.mask, y & this.mask, z & this.mask)];
+  chunkAt(x, y, z) {
+    return this.chunks[this.chunkIndex(x >> this.shift, y >> this.shift, z >> this.shift)];
   }
 
   getMat(x, y, z) {
     if (y < 0) return MAT.STONE;
     if (!this.inBounds(x, y, z)) return 0;
-    const c = this.chunks[this.chunkIndex(x >> this.shift, y >> this.shift, z >> this.shift)];
+    const c = this.chunkAt(x, y, z);
     return c.mat[c.index(x & this.mask, y & this.mask, z & this.mask)];
   }
 
-  isBlock(x, y, z) {
-    return HARD[this.getMat(x, y, z)] === 1;
-  }
-
-  /** Solid for gameplay: a block, or terrain above the 0.5 surface level. */
   isSolid(x, y, z) {
-    return this.getOcc(x, y, z) >= 128 || this.isBlock(x, y, z);
+    return this.getMat(x, y, z) !== 0;
   }
 
-  /** Write a voxel without marking meshes dirty (use markDirtyBox afterwards). */
-  setRaw(x, y, z, occ, mat) {
+  /** Shape state (0 = smooth terrain or empty). */
+  getShape(x, y, z) {
+    if (!this.inBounds(x, y, z)) return 0;
+    const c = this.chunkAt(x, y, z);
+    return c.shape[c.index(x & this.mask, y & this.mask, z & this.mask)] & 31;
+  }
+
+  /**
+   * For a building voxel: its offset (0 or 1 per axis) from the corner of the
+   * piece it was placed as, so new pieces can line up with that piece.
+   */
+  getPieceOffset(x, y, z) {
+    if (!this.inBounds(x, y, z)) return [0, 0, 0];
+    const c = this.chunkAt(x, y, z);
+    const b = c.shape[c.index(x & this.mask, y & this.mask, z & this.mask)];
+    return [(b >> 5) & 1, (b >> 6) & 1, (b >> 7) & 1];
+  }
+
+  /** Solid smooth terrain (bedrock counts). */
+  isTerrain(x, y, z) {
+    if (y < 0) return true;
+    return this.getMat(x, y, z) !== 0 && this.getShape(x, y, z) === 0;
+  }
+
+  /** A building piece voxel. */
+  isPiece(x, y, z) {
+    return this.getShape(x, y, z) !== 0;
+  }
+
+  /**
+   * Set a voxel's material and shape state, and for building voxels its
+   * offset within the piece (without touching edges or marking meshes dirty).
+   */
+  setVoxel(x, y, z, mat, shape, offset = null) {
     if (!this.inBounds(x, y, z)) return;
-    const c = this.chunks[this.chunkIndex(x >> this.shift, y >> this.shift, z >> this.shift)];
+    const c = this.chunkAt(x, y, z);
     const i = c.index(x & this.mask, y & this.mask, z & this.mask);
-    c.occ[i] = occ;
-    // A block voxel keeps its material even where the terrain field is empty.
-    c.mat[i] = occ === 0 && !HARD[mat] ? 0 : mat;
+    c.mat[i] = mat;
+    const off = offset && shape ? (offset[0] & 1) << 5 | (offset[1] & 1) << 6 | (offset[2] & 1) << 7 : 0;
+    c.shape[i] = mat ? shape | off : 0;
   }
 
-  set(x, y, z, occ, mat) {
-    this.setRaw(x, y, z, occ, mat);
-    this.markDirtyBox(x, y, z, x, y, z);
+  /** 255 if solid, else 0 (handy for trilinear "how solid is it here"). */
+  getOcc(x, y, z) {
+    return this.getMat(x, y, z) ? 255 : 0;
+  }
+
+  /** Set a voxel's material (0 = empty), keeping its shape state; empty clears it. */
+  setMat(x, y, z, mat) {
+    if (!this.inBounds(x, y, z)) return;
+    const c = this.chunkAt(x, y, z);
+    const i = c.index(x & this.mask, y & this.mask, z & this.mask);
+    c.mat[i] = mat;
+    if (!mat) c.shape[i] = 0;
+  }
+
+  /**
+   * Read the crossing on voxel (x, y, z)'s edge along `axis` (0/1/2, toward +).
+   * Returns false if the voxel has no edge data; else fills out = [t, a, b]
+   * (t in 0..1, a/b the packed normal bytes).
+   */
+  getEdge(x, y, z, axis, out) {
+    if (!this.inBounds(x, y, z)) return false;
+    const c = this.chunkAt(x, y, z);
+    if (!c.t) return false;
+    const i = c.index(x & this.mask, y & this.mask, z & this.mask);
+    out[0] = c.t[i * 3 + axis] / 255;
+    out[1] = c.n[(i * 3 + axis) * 2];
+    out[2] = c.n[(i * 3 + axis) * 2 + 1];
+    return true;
+  }
+
+  /** Store the crossing on voxel (x, y, z)'s +axis edge: t along it, normal (nx, ny, nz). */
+  setEdge(x, y, z, axis, t, nx, ny, nz) {
+    if (!this.inBounds(x, y, z)) return;
+    const c = this.chunkAt(x, y, z);
+    c.ensureEdges();
+    const i = c.index(x & this.mask, y & this.mask, z & this.mask);
+    c.t[i * 3 + axis] = Math.max(0, Math.min(255, Math.round(t * 255)));
+    packNormal(nx, ny, nz, c.n, (i * 3 + axis) * 2);
   }
 
   /**
@@ -102,33 +165,47 @@ export class World {
   }
 
   /**
-   * Copy a chunk plus PAD voxels of border from its neighbours, so each chunk
-   * can be meshed independently and still produce matching seams.
+   * Copy a chunk plus PAD voxels of border (materials, shapes and edge data), so each
+   * chunk can be meshed on its own and still produce matching seams. Edges at
+   * the world's border, where solid meets the outside, get a crossing halfway
+   * with the axis as normal.
    */
   buildPadded(cx, cy, cz) {
     const s = this.size;
     const N = s + 2 * PAD;
-    const occ = new Uint8Array(N * N * N);
     const mat = new Uint8Array(N * N * N);
+    const shape = new Uint8Array(N * N * N);
+    const et = new Uint8Array(N * N * N * 3);
+    const en = new Uint8Array(N * N * N * 6);
     const ox = cx * s, oy = cy * s, oz = cz * s;
-    let i = 0;
-    let solid = 0;
-    let blocks = false;
-    for (let z = 0; z < N; z++) {
-      for (let y = 0; y < N; y++) {
+    const e = [0, 0, 0];
+    let solid = 0, pieces = 0;
+    for (let z = 0, i = 0; z < N; z++)
+      for (let y = 0; y < N; y++)
         for (let x = 0; x < N; x++, i++) {
           const gx = ox + x - PAD, gy = oy + y - PAD, gz = oz + z - PAD;
-          const o = this.getOcc(gx, gy, gz);
           const m = this.getMat(gx, gy, gz);
-          occ[i] = o;
           mat[i] = m;
-          if (o >= 128) solid++;
-          if (HARD[m]) blocks = true;
+          shape[i] = this.getShape(gx, gy, gz);
+          if (m) solid++;
+          if (shape[i]) pieces++;
+          for (let a = 0; a < 3; a++) {
+            const [dx, dy, dz] = AXES[a];
+            const inside = this.inBounds(gx, gy, gz) && this.inBounds(gx + dx, gy + dy, gz + dz);
+            if (inside && this.getEdge(gx, gy, gz, a, e)) {
+              et[i * 3 + a] = Math.round(e[0] * 255);
+              en[(i * 3 + a) * 2] = e[1];
+              en[(i * 3 + a) * 2 + 1] = e[2];
+            } else {
+              // Outside the world (or no data): a crossing halfway, normal along the axis.
+              const solidHere = this.isTerrain(gx, gy, gz), solidThere = this.isTerrain(gx + dx, gy + dy, gz + dz);
+              const sg = solidHere && !solidThere ? 1 : -1;
+              et[i * 3 + a] = 128;
+              packNormal(dx * sg, dy * sg, dz * sg, en, (i * 3 + a) * 2);
+            }
+          }
         }
-      }
-    }
-    // Terrain that is fully solid or fully empty, with no blocks, has no surface.
-    const uniform = !blocks && (solid === 0 || solid === N * N * N);
-    return { occ, mat, size: s, origin: [ox, oy, oz], uniform };
+    const uniform = pieces === 0 && (solid === 0 || solid === N * N * N);
+    return { mat, shape, et, en, size: s, origin: [ox, oy, oz], uniform };
   }
 }

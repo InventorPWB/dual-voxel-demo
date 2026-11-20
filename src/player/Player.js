@@ -1,11 +1,12 @@
 import * as THREE from 'three';
+import { VOXEL } from '../world/World.js';
 
 const RADIUS = 0.3;
 const HEIGHT = 1.8;
 const EYE = 1.62;
-const STEP = 1.05; // highest ledge walked up automatically (one block)
+const STEP = 0.55; // highest ledge walked up automatically (one voxel); 1 m needs a jump
 const SNAP = 0.35; // how far we stick to the ground when walking down slopes
-const WALKABLE = 0.6; // contact normal y above this counts as floor (~53°)
+const WALKABLE = 0.5; // contact normal y above this counts as floor (60°): 45° slopes built from 0.5 m voxels are a little uneven
 const MAX_SUBSTEP = 0.1; // metres per collision substep
 const GRAVITY = 28;
 const JUMP_V = 8.6;
@@ -28,6 +29,7 @@ const _raycaster = new THREE.Raycaster();
  * blocks alike) via their BVHs, so you stand exactly on the surface you see,
  * slide smoothly along walls and slopes, and never catch on hidden voxel
  * edges. Walkable slopes push you straight up (no sliding while standing).
+ * Everything here is in metres; voxels are VOXEL metres on a side.
  */
 export class Player {
   constructor(world, camera, getColliders) {
@@ -60,14 +62,15 @@ export class Player {
     return this.flying;
   }
 
-  /** Does the player's box (optionally padded) overlap voxel (x, y, z)? */
+  /** Does the player's box (optionally padded, metres) overlap voxel (x, y, z)? */
   intersectsVoxel(x, y, z, pad = 0) {
     const p = this.pos;
+    const V = VOXEL;
     const hw = RADIUS + pad;
     return (
-      x + 1 > p.x - hw && x < p.x + hw &&
-      z + 1 > p.z - hw && z < p.z + hw &&
-      y + 1 > p.y - pad && y < p.y + HEIGHT + pad
+      (x + 1) * V > p.x - hw && x * V < p.x + hw &&
+      (z + 1) * V > p.z - hw && z * V < p.z + hw &&
+      (y + 1) * V > p.y - pad && y * V < p.y + HEIGHT + pad
     );
   }
 
@@ -168,17 +171,17 @@ export class Player {
     return false;
   }
 
-  /** Solidity at a point: trilinear terrain field, with blocks counted as solid (0..1). */
+  /** Solidity (0..1) at a point in metres: the trilinear field. */
   fieldAt(x, y, z) {
     const w = this.world;
-    const fx = x - 0.5, fy = y - 0.5, fz = z - 0.5;
+    const fx = x / VOXEL - 0.5, fy = y / VOXEL - 0.5, fz = z / VOXEL - 0.5;
     const x0 = Math.floor(fx), y0 = Math.floor(fy), z0 = Math.floor(fz);
     const tx = fx - x0, ty = fy - y0, tz = fz - z0;
     let sum = 0;
     for (let k = 0; k < 8; k++) {
       const dx = k & 1, dy = (k >> 1) & 1, dz = (k >> 2) & 1;
       const vx = x0 + dx, vy = y0 + dy, vz = z0 + dz;
-      const o = w.isBlock(vx, vy, vz) ? 255 : w.getOcc(vx, vy, vz);
+      const o = w.getOcc(vx, vy, vz);
       sum += o * (dx ? tx : 1 - tx) * (dy ? ty : 1 - ty) * (dz ? tz : 1 - tz);
     }
     return sum / 255;
@@ -278,8 +281,8 @@ export class Player {
 
     // Stay inside the world's horizontal bounds; respawn if we fall out.
     const w = this.world;
-    this.pos.x = Math.min(w.sx - RADIUS, Math.max(RADIUS, this.pos.x));
-    this.pos.z = Math.min(w.sz - RADIUS, Math.max(RADIUS, this.pos.z));
+    this.pos.x = Math.min(w.sx * VOXEL - RADIUS, Math.max(RADIUS, this.pos.x));
+    this.pos.z = Math.min(w.sz * VOXEL - RADIUS, Math.max(RADIUS, this.pos.z));
     if (this.pos.y < -20) this.onFallOut?.();
 
     // Smooth the camera over step-ups so it doesn't snap.

@@ -1,19 +1,35 @@
 /**
- * A cubic chunk of voxels. Each voxel is two bytes, as in Roblox's terrain:
- *   occ – terrain occupancy 0..255 (>= 128 counts as solid; the surface sits at 0.5)
- *   mat – material id (see materials.js). A block material means the voxel is a
- *         full cube; its occ byte still carries the terrain field through it,
- *         so terrain stays smooth where it meets the block.
- * Voxel (x, y, z) covers the unit cube [x, x+1] × [y, y+1] × [z, z+1].
+ * A cubic chunk of voxels:
+ *   mat   – material id per voxel; 0 is empty, anything else is solid.
+ *   shape – low 5 bits: 0 for smooth terrain, otherwise a building shape
+ *           state (cube, wedge, ...; see shapes.js), drawn as exact geometry.
+ *           High 3 bits: the voxel's offset within the piece it was placed as.
+ * Smooth terrain is stored as hermite data:
+ *   edge – for each voxel, its three edges toward +x, +y, +z (voxel centre to
+ *          neighbour's centre). Where the surface crosses an edge (solidity
+ *          differs at its ends), `t` is where along it (0..1, stored ×255) and
+ *          `n` is the surface normal there (2 bytes, packed). Allocated only
+ *          once the chunk has any surface.
+ * Voxel (x, y, z) covers [x, x+1]·VOXEL on each axis, in metres.
  */
 export class Chunk {
   constructor(size) {
     this.size = size;
-    this.occ = new Uint8Array(size * size * size);
     this.mat = new Uint8Array(size * size * size);
+    this.shape = new Uint8Array(size * size * size);
+    this.t = null; // Uint8Array(n * 3)
+    this.n = null; // Uint8Array(n * 6)
   }
 
   index(x, y, z) {
     return x + this.size * (y + this.size * z);
+  }
+
+  ensureEdges() {
+    if (!this.t) {
+      const n = this.mat.length;
+      this.t = new Uint8Array(n * 3);
+      this.n = new Uint8Array(n * 6);
+    }
   }
 }

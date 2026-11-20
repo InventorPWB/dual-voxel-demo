@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
-import { HARD } from '../world/materials.js';
+import { CRISP } from '../world/materials.js';
+import { VOXEL } from '../world/World.js';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -11,11 +12,10 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
  * are re-meshed on a pool of web workers, nearest to the player first.
  */
 export class ChunkMeshes {
-  constructor(world, scene, materials) {
+  constructor(world, scene, material) {
     this.world = world;
     this.scene = scene;
-    // Geometry group 0 = block faces, group 1 = terrain.
-    this.material = [materials.blocks, materials.terrain];
+    this.material = material;
     this.meshes = new Array(world.chunks.length).fill(null);
     this.inFlight = new Array(world.chunks.length).fill(false);
     this.version = new Array(world.chunks.length).fill(0);
@@ -26,7 +26,7 @@ export class ChunkMeshes {
     this.idle = [];
     for (let i = 0; i < count; i++) {
       const worker = new Worker(new URL('../mesh/meshWorker.js', import.meta.url), { type: 'module' });
-      worker.postMessage({ type: 'init', hard: HARD });
+      worker.postMessage({ type: 'init', crisp: CRISP, scale: VOXEL });
       worker.onmessage = (e) => this.onResult(worker, e.data);
       this.idle.push(worker);
     }
@@ -37,11 +37,11 @@ export class ChunkMeshes {
     return this.world.dirty.size + this.inFlight.filter(Boolean).length;
   }
 
-  /** Dispatch dirty chunks to idle workers, closest to `focus` first. */
+  /** Dispatch dirty chunks to idle workers, closest to `focus` (metres) first. */
   update(focus) {
     const { world } = this;
     if (!world.dirty.size || !this.idle.length) return;
-    const s = world.size;
+    const s = world.size * VOXEL;
     const order = [...world.dirty].filter((i) => !this.inFlight[i]);
     order.sort((a, b) => dist2(world.chunkCoords(a), focus, s) - dist2(world.chunkCoords(b), focus, s));
     for (const index of order) {
@@ -58,7 +58,7 @@ export class ChunkMeshes {
       this.version[index]++;
       worker.postMessage(
         { type: 'mesh', index, version: this.version[index], ...padded },
-        [padded.occ.buffer, padded.mat.buffer],
+        [padded.mat.buffer, padded.shape.buffer, padded.et.buffer, padded.en.buffer],
       );
     }
   }
@@ -76,9 +76,6 @@ export class ChunkMeshes {
     g.setAttribute('normal', new THREE.BufferAttribute(msg.normal, 3));
     g.setAttribute('material', new THREE.BufferAttribute(msg.material, 1));
     g.setAttribute('ao', new THREE.BufferAttribute(msg.ao, 1));
-    const total = msg.position.length / 3;
-    g.addGroup(0, msg.blockVertices, 0);
-    g.addGroup(msg.blockVertices, total - msg.blockVertices, 1);
     g.computeBoundingSphere();
     g.computeBoundingBox();
     g.computeBoundsTree();

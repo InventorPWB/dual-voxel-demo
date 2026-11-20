@@ -1,6 +1,7 @@
 import { createNoise3D } from './noise.js';
 import { MAT } from './materials.js';
-import { OCC_SLOPE } from './World.js';
+import { VOXEL } from './World.js';
+import { fillFromSDF } from './csg.js';
 
 const smoothstep = (a, b, x) => {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -9,12 +10,14 @@ const smoothstep = (a, b, x) => {
 
 /**
  * Fill the world with rolling hills, a smooth mountain with a few overhangs,
- * a cliff terrace and a sandy lowland. Writes occupancy + material directly
- * into the same voxels the player edits.
+ * a cliff terrace and a sandy lowland. Shapes are defined in metres and
+ * sampled into the 0.5 m voxels the player edits.
  */
 export function generateWorld(world, seed = 1337) {
   const noise = createNoise3D(seed);
   const { sx, sy, sz } = world;
+  const V = VOXEL;
+  const W = sx * V, D = sz * V, TOP = sy * V; // world size in metres
 
   const fbm2 = (x, z, octaves) => {
     let sum = 0, amp = 1, freq = 1, norm = 0;
@@ -27,58 +30,58 @@ export function generateWorld(world, seed = 1337) {
     return sum / norm;
   };
 
-  const mx = sx * 0.66, mz = sz * 0.6; // mountain centre
+  const mx = W * 0.66, mz = D * 0.6; // mountain centre (m)
   const heightAt = (x, z) => {
-    let h = 24 + 9 * fbm2(x / 70, z / 70, 4);
+    let h = 20 + 8 * fbm2(x / 70, z / 70, 4);
     const dx = x - mx, dz = z - mz;
-    const mountain = Math.exp(-(dx * dx + dz * dz) / (2 * 21 * 21));
-    h += 40 * mountain * (0.85 + 0.15 * noise(x / 14, 5.3, z / 14));
+    const mountain = Math.exp(-(dx * dx + dz * dz) / (2 * 20 * 20));
+    h += 28 * mountain * (0.85 + 0.15 * noise(x / 14, 5.3, z / 14));
     // A terrace with a steep cliff edge.
-    h += 7 * smoothstep(-0.06, 0.06, noise(x / 55, 3.3, z / 55));
-    return Math.min(sy - 8, h);
+    h += 6 * smoothstep(-0.06, 0.06, noise(x / 55, 3.3, z / 55));
+    return Math.min(TOP - 6, h);
   };
 
+  // Height per voxel column (metres), interpolated between column centres.
   const H = new Float32Array(sx * sz);
-  for (let z = 0; z < sz; z++) for (let x = 0; x < sx; x++) H[x + sx * z] = heightAt(x + 0.5, z + 0.5);
-
+  for (let z = 0; z < sz; z++) for (let x = 0; x < sx; x++) H[x + sx * z] = heightAt((x + 0.5) * V, (z + 0.5) * V);
   const hAt = (x, z) => H[Math.min(sx - 1, Math.max(0, x)) + sx * Math.min(sz - 1, Math.max(0, z))];
+  const height = (vx, vz) => {
+    const fx = vx - 0.5, fz = vz - 0.5;
+    const x0 = Math.floor(fx), z0 = Math.floor(fz), tx = fx - x0, tz = fz - z0;
+    const a = hAt(x0, z0) + (hAt(x0 + 1, z0) - hAt(x0, z0)) * tx;
+    const b = hAt(x0, z0 + 1) + (hAt(x0 + 1, z0 + 1) - hAt(x0, z0 + 1)) * tx;
+    return a + (b - a) * tz;
+  };
 
-  for (let z = 0; z < sz; z++) {
-    for (let x = 0; x < sx; x++) {
-      const h = H[x + sx * z];
-      const slope = Math.hypot(hAt(x + 1, z) - hAt(x - 1, z), hAt(x, z + 1) - hAt(x, z - 1)) * 0.5;
-      // 3D noise only near the surface on high ground: gives overhangs on the mountain.
-      const overhang = smoothstep(34, 46, h) * 4.5;
+  // Signed distance (voxels, positive inside): height above the point, plus
+  // 3D noise near the surface on high ground for a few overhangs.
+  const sdf = (vx, vy, vz) => {
+    const h = height(vx, vz);
+    const wy = vy * V;
+    let d = h - wy;
+    const overhang = smoothstep(30, 40, h) * 4;
+    if (overhang > 0 && Math.abs(d) < 8) d += overhang * noise(vx * V / 16, wy / 12, vz * V / 16);
+    return d / V;
+  };
 
-      let depth = 0; // solid voxels since the last air voxel, counted from the top
-      for (let y = sy - 1; y >= 0; y--) {
-        let d = h - (y + 0.5);
-        if (overhang > 0 && Math.abs(d) < 8) d += overhang * noise(x / 16, y / 12, z / 16);
-        let occ = y === 0 ? 255 : Math.round(Math.min(1, Math.max(0, 0.5 + d * OCC_SLOPE)) * 255);
+  // Materials by depth below the surface and steepness.
+  const matAt = (x, y, z, d) => {
+    const h = hAt(x, z);
+    const slope = Math.hypot(hAt(x + 1, z) - hAt(x - 1, z), hAt(x, z + 1) - hAt(x, z - 1)) / (2 * V);
+    const dd = d * V; // metres below the surface
+    if (h < 17.5 && dd <= 1.5) return MAT.SAND;
+    if (slope > 1.1) return dd <= 0.6 && slope < 1.6 ? MAT.GRASS : MAT.STONE;
+    if (dd <= 0.6) return MAT.GRASS;
+    if (dd <= 2.5) return MAT.DIRT;
+    return MAT.STONE;
+  };
 
-        if (occ >= 128) depth++;
-        else depth = 0;
-        if (occ === 0) {
-          world.setRaw(x, y, z, 0, 0);
-          continue;
-        }
-
-        const dd = Math.max(1, depth);
-        let mat;
-        if (h < 21.5 && dd <= 3) mat = MAT.SAND;
-        else if (slope > 1.1 || h > 64) mat = dd <= 1 && slope < 1.6 && h <= 64 ? MAT.GRASS : MAT.STONE;
-        else if (dd === 1) mat = MAT.GRASS;
-        else if (dd <= 4) mat = MAT.DIRT;
-        else mat = MAT.STONE;
-        world.setRaw(x, y, z, occ, mat);
-      }
-    }
-  }
-  world.markAllDirty();
+  fillFromSDF(world, sdf, matAt);
 }
 
-/** Highest solid voxel y in a column, or 0. */
+/** Height in metres of the top of the highest solid voxel in the column containing metre point (x, z). */
 export function surfaceHeight(world, x, z) {
-  for (let y = world.sy - 1; y >= 0; y--) if (world.isSolid(x, y, z)) return y + 1;
+  const vx = Math.floor(x / VOXEL), vz = Math.floor(z / VOXEL);
+  for (let y = world.sy - 1; y >= 0; y--) if (world.isSolid(vx, y, vz)) return (y + 1) * VOXEL;
   return 0;
 }
