@@ -57,6 +57,10 @@ Everything is an item in the hotbar. Left mouse breaks or digs, right mouse plac
   - **Placing** writes the piece's voxel states (with foundations on uneven ground).
   - **Removing** clears the aimed-at cell, pieces and terrain alike. Terrain left around the hole gets flat faces.
 - **Safety:** nothing ever becomes solid inside the player, and tiny floating bits of terrain left by edits are dissolved.
+- **Shadows** (`src/render/SunShadow.js`): one 4096² sun shadow map fitted to the whole world (about 4 cm per texel), sampled in the shared terrain shader, so blocks, shaped pieces and smooth terrain all cast and receive shadows alike.
+  - It is only redrawn when a chunk mesh changes or the sun moves (about 1 ms for the whole world). Otherwise shadows cost only a 9-tap hardware PCF lookup per pixel.
+  - Self-shadowing is kept off with a slope-scaled polygon offset plus a normal offset in the shader. The sun's wrap lighting fades out at the terminator, so it doesn't meet a hard shadow edge.
+  - Hold **[** or **]** to swing the sun around and watch the shadows move.
 - **Collision** (`src/player/Player.js`) is a capsule against the rendered meshes.
   - Ledges up to one voxel (0.5 m) are stepped up automatically, so stairs are walkable. A 1 m block needs a jump.
   - Slopes up to 60° are walkable.

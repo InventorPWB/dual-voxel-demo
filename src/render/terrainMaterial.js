@@ -4,13 +4,24 @@ import { TEX_SIZE, texturePixels } from './textures.js';
 
 export const SKY_COLOR = 0xa9cdee;
 
+/** Direction towards the sun at the start (azimuth and elevation in radians). */
+export const SUN_AZIMUTH = Math.atan2(0.35, 0.45);
+export const SUN_ELEVATION = 0.95;
+
+export function sunDirection(azimuth, elevation = SUN_ELEVATION, out = new THREE.Vector3()) {
+  const c = Math.cos(elevation);
+  return out.set(Math.cos(azimuth) * c, Math.sin(elevation), Math.sin(azimuth) * c);
+}
+
 /**
  * The one material for the voxel world: triplanar-mapped pixel-art textures
  * from a texture array (one tile per metre in world space, so brick and plank
- * patterns line up across neighbouring shapes), wrap-Lambert sun +
- * hemisphere ambient, baked AO and fog.
+ * patterns line up across neighbouring shapes), wrap-Lambert sun with
+ * real-time shadows from `shadow` (a SunShadow), hemisphere ambient, baked AO
+ * and fog. Blocks, shaped pieces and smooth terrain all share it, so they all
+ * cast and receive shadows the same way.
  */
-export function createTerrainMaterial() {
+export function createTerrainMaterial(shadow) {
   // Build the texture array: one layer per distinct texture name.
   const names = [];
   const layerOf = (n) => {
@@ -49,7 +60,10 @@ export function createTerrainMaterial() {
     uniforms: {
       uTex: { value: tex },
       uLayers: { value: layers },
-      uSunDir: { value: new THREE.Vector3(0.45, 0.8, 0.35).normalize() },
+      uSunDir: { value: shadow.direction },
+      uShadowMap: { value: shadow.texture },
+      uShadowMatrix: { value: shadow.matrix },
+      uShadowTexel: { value: shadow.texel }, // (uv per texel, metres per texel)
       uSunColor: { value: raw(0xfff1d6) },
       uSkyColor: { value: raw(0xc4dcf5) },
       uGroundColor: { value: raw(0x6b5a48) },
@@ -84,12 +98,34 @@ export function createTerrainMaterial() {
       uniform vec3 uGroundColor;
       uniform vec3 uFogColor;
       uniform float uFogDensity;
+      uniform highp sampler2DShadow uShadowMap;
+      uniform mat4 uShadowMatrix;
+      uniform vec2 uShadowTexel;
       in vec3 vPos;
       in vec3 vNormal;
       flat in int vMat;
       in float vAo;
       in float vDepth;
       layout(location = 0) out vec4 outColor;
+
+      // Sun visibility: 0 = fully shadowed, 1 = lit.
+      float sunShadow(vec3 n, float ndl) {
+        // Normal offset, larger on grazing surfaces, keeps a surface from
+        // shadowing itself (acne) without detaching shadows from their casters.
+        float slope = 1.0 - clamp(ndl, 0.0, 1.0);
+        vec3 wp = vPos + n * uShadowTexel.y * (1.0 + 2.5 * slope);
+        vec3 sc = (uShadowMatrix * vec4(wp, 1.0)).xyz;
+        if (sc.x <= 0.0 || sc.x >= 1.0 || sc.y <= 0.0 || sc.y >= 1.0 || sc.z >= 1.0) return 1.0;
+        sc.z -= 0.0002;
+        // 3×3 taps of hardware 2×2 PCF: a smooth 4×4 tent, soft but still crisp at contact.
+        float s = 0.0;
+        float d = uShadowTexel.x;
+        for (int y = -1; y <= 1; y++)
+          for (int x = -1; x <= 1; x++)
+            s += texture(uShadowMap, vec3(sc.xy + vec2(x, y) * d, sc.z));
+        return s / 9.0;
+      }
+
       void main() {
         vec3 n = normalize(vNormal);
         vec3 w = pow(abs(n), vec3(8.0));
@@ -103,9 +139,16 @@ export function createTerrainMaterial() {
         vec3 albedo = cx * w.x + cy * w.y + cz * w.z;
 
         // Half-Lambert-ish wrap keeps slopes facing away from the sun from going muddy.
-        float sun = clamp(dot(n, uSunDir) * 0.8 + 0.2, 0.0, 1.0);
+        float ndl = dot(n, uSunDir);
+        float sun = clamp(ndl * 0.8 + 0.2, 0.0, 1.0);
+        // Faces turned away from the sun are in their own shadow, so the wrap
+        // light fades out towards the terminator instead of meeting a hard
+        // shadow edge there. Only look the map up where it can matter.
+        float facing = smoothstep(-0.15, 0.25, ndl);
+        float vis = facing > 0.0 ? min(facing, sunShadow(n, ndl)) : 0.0;
         vec3 hemi = mix(uGroundColor, uSkyColor, n.y * 0.5 + 0.5);
-        vec3 light = hemi * 0.6 + uSunColor * sun * 0.6;
+        // Shadowed areas keep a little cool sky fill so they read as shade, not as holes.
+        vec3 light = hemi * 0.62 + uSunColor * sun * vis * 0.72 + uSkyColor * (1.0 - vis) * sun * 0.06;
         vec3 color = albedo * light * vAo;
 
         float f = 1.0 - exp(-pow(vDepth * uFogDensity, 2.0));
