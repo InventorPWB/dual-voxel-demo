@@ -1,7 +1,8 @@
 import * as THREE from 'three';
 import { World, VOXEL } from './world/World.js';
 import { generateWorld, surfaceHeight } from './world/generate.js';
-import { createTerrainMaterial, SKY_COLOR } from './render/terrainMaterial.js';
+import { createTerrainMaterial, SKY_COLOR, SUN_AZIMUTH, sunDirection } from './render/terrainMaterial.js';
+import { SunShadow } from './render/SunShadow.js';
 import { ChunkMeshes } from './render/ChunkMeshes.js';
 import { Player } from './player/Player.js';
 import { Interaction } from './items/interaction.js';
@@ -32,7 +33,11 @@ const hud = new Hud(hotbar);
 hud.setLoading('Generating terrain…');
 
 const world = new World(8, 4, 8); // 128 × 64 × 128 m in 0.5 m voxels (16 m chunks)
-const chunkMeshes = new ChunkMeshes(world, scene, createTerrainMaterial());
+const shadow = new SunShadow(renderer, scene);
+let sunAzimuth = SUN_AZIMUTH;
+shadow.setDirection(sunDirection(sunAzimuth));
+const chunkMeshes = new ChunkMeshes(world, scene, createTerrainMaterial(shadow));
+chunkMeshes.onChange = () => { shadow.dirty = true; };
 const player = new Player(world, camera, () => chunkMeshes.list);
 const interaction = new Interaction({ world, scene, camera, chunkMeshes, player, hotbar });
 
@@ -175,6 +180,14 @@ function frame(now) {
   interaction.update(dt, locked, keys.has('ShiftLeft') || keys.has('ShiftRight'));
   chunkMeshes.update(player.pos);
 
+  // [ and ] swing the sun around the sky to show the shadows are live.
+  const sunSpin = (keys.has('BracketRight') ? 1 : 0) - (keys.has('BracketLeft') ? 1 : 0);
+  if (sunSpin) {
+    sunAzimuth += sunSpin * dt * 0.6;
+    shadow.setDirection(sunDirection(sunAzimuth));
+  }
+  shadow.update(chunkMeshes.list);
+
   if (!loaded && world.chunks.length && chunkMeshes.list.length && chunkMeshes.pending === 0) {
     loaded = true;
     hud.setLoading('');
@@ -200,4 +213,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Handy for poking at the demo from the devtools console.
-if (import.meta.env.DEV) window.demo = { world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };
+if (import.meta.env.DEV) window.demo = { shadow, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };

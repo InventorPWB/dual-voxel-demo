@@ -15,6 +15,7 @@ export const CONTROLS = [
   ['Choose item', '1–9 or mouse wheel'],
   ['Inventory', 'E'],
   ['Brush size', 'Alt + wheel'],
+  ['Move the sun', '[ and ]'],
   ['Help', 'H'],
   ['Stats', 'F3 or `'],
   ['Release mouse', 'Esc'],

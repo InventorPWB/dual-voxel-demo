@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { computeBoundsTree, disposeBoundsTree, acceleratedRaycast } from 'three-mesh-bvh';
 import { CRISP } from '../world/materials.js';
 import { VOXEL } from '../world/World.js';
+import { SHADOW_LAYER } from './SunShadow.js';
 
 THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
@@ -20,6 +21,7 @@ export class ChunkMeshes {
     this.inFlight = new Array(world.chunks.length).fill(false);
     this.version = new Array(world.chunks.length).fill(0);
     this.list = []; // live meshes, for raycasting
+    this.onChange = null; // called whenever a chunk's mesh is replaced or removed
     this.lastMeshMs = 0;
 
     const count = Math.max(2, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
@@ -84,6 +86,7 @@ export class ChunkMeshes {
 
   setGeometry(index, geometry) {
     let mesh = this.meshes[index];
+    if (mesh || geometry) this.onChange?.(index);
     if (mesh) {
       mesh.geometry.disposeBoundsTree();
       mesh.geometry.dispose();
@@ -99,6 +102,7 @@ export class ChunkMeshes {
     if (!mesh) {
       mesh = new THREE.Mesh(geometry, this.material);
       mesh.matrixAutoUpdate = false;
+      mesh.layers.enable(SHADOW_LAYER);
       this.meshes[index] = mesh;
       this.scene.add(mesh);
       this.list = this.meshes.filter(Boolean);
