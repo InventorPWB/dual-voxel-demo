@@ -2,6 +2,7 @@ import { createNoise3D } from './noise.js';
 import { MAT } from './materials.js';
 import { VOXEL } from './World.js';
 import { fillFromSDF } from './csg.js';
+import { growTrees, growGrass } from './trees.js';
 
 const smoothstep = (a, b, x) => {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -10,10 +11,11 @@ const smoothstep = (a, b, x) => {
 
 /**
  * Fill the world with rolling hills, a smooth mountain with a few overhangs,
- * a cliff terrace and a sandy lowland. Shapes are defined in metres and
- * sampled into the 0.5 m voxels the player edits.
+ * a cliff terrace and a sandy lowland, then trees and a grass cover. Shapes
+ * are defined in metres and sampled into the 0.5 m voxels the player edits.
+ * `avoid` keeps trees clear of places ({ x, z, r } in metres), like the spawn.
  */
-export function generateWorld(world, seed = 1337) {
+export function generateWorld(world, seed = 1337, { avoid = [] } = {}) {
   const noise = createNoise3D(seed);
   const { sx, sy, sz } = world;
   const V = VOXEL;
@@ -77,6 +79,8 @@ export function generateWorld(world, seed = 1337) {
   };
 
   fillFromSDF(world, sdf, matAt);
+  growTrees(world, seed + 1, { avoid });
+  growGrass(world, seed + 2);
 }
 
 /** Height in metres of the top of the highest solid voxel in the column containing metre point (x, z). */

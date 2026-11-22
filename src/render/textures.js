@@ -25,7 +25,8 @@ function vnoise(x, y, cell, s) {
 const jitter = (c, amt, r) => c.map((v) => v + (r - 0.5) * 2 * amt);
 const shade = (c, k) => c.map((v) => v * k);
 
-// Each generator returns [r, g, b] (0..255) for pixel (x, y); y = 0 is the top row.
+// Each generator returns [r, g, b] or [r, g, b, a] (0..255) for pixel (x, y);
+// y = 0 is the top row. Alpha 0 is a hole in cutout textures (glass, plants).
 const GENERATORS = {
   grass_top(x, y) {
     const n = vnoise(x, y, 8, 1);
@@ -114,6 +115,92 @@ const GENERATORS = {
     if (d1 < 2) c = shade(c, 1.12);
     return jitter(c, 6, hash(x, y, 27));
   },
+  bark(x, y) {
+    // Vertical ridges with darker furrows between them.
+    const ridge = vnoise(x, y * 0.25, 4, 30);
+    const fine = vnoise(x, y, 2, 31);
+    let c = [96 + 34 * ridge, 70 + 22 * ridge, 46 + 12 * ridge];
+    if (ridge < 0.32) c = shade(c, 0.66);
+    c = shade(c, 0.9 + 0.2 * fine);
+    return jitter(c, 4, hash(x, y, 32));
+  },
+  log_top(x, y) {
+    const d = Math.hypot(x + 0.5 - 16, y + 0.5 - 16) + 1.2 * vnoise(x, y, 8, 33);
+    if (d > 14.5) return GENERATORS.bark(x, y);
+    const ring = 0.5 + 0.5 * Math.cos(d * 1.6);
+    const c = [178 + 26 * ring, 140 + 20 * ring, 88 + 12 * ring];
+    return jitter(c, 4, hash(x, y, 34));
+  },
+  glass(x, y) {
+    // Clear, with a thin pale frame (one per metre) and a couple of glints.
+    if (x === 0 || y === 0 || x === 31 || y === 31) return [214, 228, 232, 255];
+    if (x === 1 || y === 1 || x === 30 || y === 30) return [176, 196, 204, 255];
+    const k = x + y;
+    if ((k === 11 || k === 13) && x > 3 && x < 10) return [236, 244, 248, 255];
+    if (k === 15 && x > 4 && x < 9) return [236, 244, 248, 255];
+    return [0, 0, 0, 0];
+  },
+  stained_glass(x, y) {
+    if (x <= 1 || y <= 1 || x >= 30 || y >= 30) return [38, 62, 112, 235];
+    const n = vnoise(x, y, 8, 35);
+    return [70 + 20 * n, 118 + 26 * n, 196 + 20 * n, 112 + 24 * n];
+  },
+  grass_blades(x, y) {
+    // A tuft: tapering blades rooted on the bottom row, lighter at the tips.
+    for (let b = 0; b < 11; b++) {
+      const root = 1 + Math.floor(hash(b, 0, 40) * 30);
+      const top = 2 + Math.floor(hash(b, 1, 40) * 16);
+      const lean = (hash(b, 2, 40) - 0.5) * 10;
+      if (y < top) continue;
+      const t = (31 - y) / (31 - top); // 0 at the root, 1 at the tip
+      const cx = root + lean * t * t;
+      const w = 1.4 * (1 - t) + 0.4;
+      if (Math.abs(x + 0.5 - cx) > w) continue;
+      const tone = hash(b, 3, 40);
+      const c = [62 + 50 * t + 20 * tone, 118 + 60 * t + 18 * tone, 38 + 22 * t];
+      return [...jitter(c, 5, hash(x, y, 41)), 255];
+    }
+    return [0, 0, 0, 0];
+  },
+  flowers(x, y) {
+    // Three flowers on stems among a few blades.
+    const heads = [[7, 9, [232, 214, 72]], [18, 6, [226, 96, 126]], [26, 12, [244, 244, 236]]];
+    for (const [hx, hy, col] of heads) {
+      const d = Math.hypot(x + 0.5 - hx, y + 0.5 - hy);
+      if (d < 1.3) return [214, 170, 60, 255];
+      if (d < 3.1) return [...jitter(col, 8, hash(x, y, 42)), 255];
+      if (Math.abs(x + 0.5 - hx) < 0.9 && y > hy) return [70, 128, 50, 255];
+    }
+    if (y > 20) return GENERATORS.grass_blades(x, y);
+    return [0, 0, 0, 0];
+  },
+  leaves(x, y) {
+    // Scattered pointed leaves, varied greens, holes between them. They stay
+    // inside a disc, so a card never shows a straight cut edge.
+    if (Math.hypot(x + 0.5 - 16, y + 0.5 - 16) > 15.5) return [0, 0, 0, 0];
+    for (let k = 0; k < 16; k++) {
+      const ca = hash(k, 0, 50) * Math.PI * 2, cr = Math.sqrt(hash(k, 1, 50)) * 9;
+      const cx = 16 + Math.cos(ca) * cr, cy = 16 + Math.sin(ca) * cr;
+      const a = hash(k, 2, 50) * Math.PI;
+      const dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+      const u = dx * Math.cos(a) + dy * Math.sin(a), v = -dx * Math.sin(a) + dy * Math.cos(a);
+      const r = (u / 6) ** 2 + (v / 3) ** 2;
+      if (r > 1) continue;
+      const tone = hash(k, 3, 50);
+      let c = [48 + 34 * tone, 96 + 46 * tone, 34 + 16 * tone];
+      if (Math.abs(v) < 0.5) c = shade(c, 1.15); // midrib
+      c = shade(c, 1.08 - 0.25 * r);
+      return [...jitter(c, 5, hash(x, y, 51)), 255];
+    }
+    return [0, 0, 0, 0];
+  },
+  leaves_hull(x, y) {
+    // The canopy's inner shell: dense, darker foliage.
+    const n = vnoise(x, y, 4, 52);
+    let c = [40 + 26 * n, 82 + 38 * n, 30 + 12 * n];
+    if (hash(x, y, 53) > 0.8) c = shade(c, 0.75);
+    return jitter(c, 6, hash(x, y, 54));
+  },
 };
 
 /** RGBA pixels for one texture, row 0 = top. */
@@ -122,9 +209,9 @@ export function texturePixels(name) {
   const out = new Uint8ClampedArray(TEX_SIZE * TEX_SIZE * 4);
   for (let y = 0; y < TEX_SIZE; y++)
     for (let x = 0; x < TEX_SIZE; x++) {
-      const [r, g, b] = gen(x, y);
+      const [r, g, b, a = 255] = gen(x, y);
       const i = (x + y * TEX_SIZE) * 4;
-      out[i] = r; out[i + 1] = g; out[i + 2] = b; out[i + 3] = 255;
+      out[i] = r; out[i + 1] = g; out[i + 2] = b; out[i + 3] = a;
     }
   return out;
 }
@@ -139,10 +226,17 @@ export function textureCanvas(name, size = TEX_SIZE) {
   return canvas;
 }
 
+/** Average colour of a texture's visible pixels (0..1 each). */
 export function averageColor(name) {
   const px = texturePixels(name);
-  let r = 0, g = 0, b = 0;
-  for (let i = 0; i < px.length; i += 4) { r += px[i]; g += px[i + 1]; b += px[i + 2]; }
-  const n = px.length / 4;
+  let r = 0, g = 0, b = 0, n = 0;
+  for (let i = 0; i < px.length; i += 4) {
+    if (px[i + 3] < 8) continue;
+    r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
+  }
+  n = n || 1;
   return [r / n / 255, g / n / 255, b / n / 255];
 }
+
+/** Every texture name, in a fixed order. */
+export const TEXTURE_NAMES = Object.keys(GENERATORS);

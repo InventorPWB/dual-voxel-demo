@@ -10,6 +10,8 @@
  *          differs at its ends), `t` is where along it (0..1, stored ×255) and
  *          `n` is the surface normal there (2 bytes, packed). Allocated only
  *          once the chunk has any surface.
+ * plant – plant id per voxel (see plants.js; grass, leaves, ...), only in
+ *         empty voxels. Allocated only once the chunk has a plant.
  * Voxel (x, y, z) covers [x, x+1]·VOXEL on each axis, in metres.
  */
 export class Chunk {
@@ -19,6 +21,7 @@ export class Chunk {
     this.shape = new Uint8Array(size * size * size);
     this.t = null; // Uint8Array(n * 3)
     this.n = null; // Uint8Array(n * 6)
+    this.plant = null; // Uint8Array(n)
   }
 
   index(x, y, z) {
@@ -31,5 +34,9 @@ export class Chunk {
       this.t = new Uint8Array(n * 3);
       this.n = new Uint8Array(n * 6);
     }
+  }
+
+  ensurePlants() {
+    if (!this.plant) this.plant = new Uint8Array(this.mat.length);
   }
 }

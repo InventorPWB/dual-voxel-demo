@@ -139,6 +139,8 @@ export class Hud {
 
     const tools = inv.querySelector('.tools');
     for (const t of INVENTORY.tools) tools.appendChild(cell(t));
+    const plants = inv.querySelector('.plants');
+    for (const p of INVENTORY.plants) plants.appendChild(cell(p));
 
     const grid = inv.querySelector('.grid');
     grid.style.gridTemplateColumns = `auto repeat(${SHAPES.length}, auto)`;

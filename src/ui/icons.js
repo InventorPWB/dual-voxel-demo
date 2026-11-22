@@ -28,6 +28,7 @@ export function itemIcon(item, px = 40) {
   const g = c.getContext('2d');
   g.imageSmoothingEnabled = false;
   if (item.kind === 'build') drawBuild(g, item, px);
+  else if (item.kind === 'plant') g.drawImage(textureCanvas(item.texture, px), 0, 0, px, px);
   else drawTool(g, item.id, px);
   cache.set(key, c);
   return cloneCanvas(c);

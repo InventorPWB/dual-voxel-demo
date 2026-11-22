@@ -5,6 +5,7 @@ import { placement, rotationForFacing } from '../world/shapes.js';
 import {
   sculptSphere, smoothBrush, flattenBrush, placeShape, removeShape, shapeSolidVoxels,
 } from '../world/edits.js';
+import { PLANTS, PLANT, PLANT_KIND, supportsPlant } from '../world/plants.js';
 import { meshChunk } from '../mesh/dualContour.js';
 import { averageColor } from '../render/textures.js';
 
@@ -24,6 +25,8 @@ const materialColor = (id) => {
   if (!tint.has(id)) tint.set(id, new THREE.Color(...averageColor(MATERIALS[id].top)));
   return tint.get(id);
 };
+const LEAF_COLOR = new THREE.Color(...averageColor('leaves'));
+const SMALL = { id: 'small', size: [1, 1, 1], lattice: [1, 1, 1], cells: () => 1 };
 
 /**
  * What the held item does in the world. The only things drawn in the world
@@ -102,8 +105,14 @@ export class Interaction {
     if (button === 2) this.rmb = true;
     const item = this.item;
     if (!item) return;
-    if (item.kind === 'build') {
+    if (button === 0 && this.hit?.leaf && item.kind !== 'tool') {
+      this.removeLeaf();
+      this.repeat = REPEAT_DELAY;
+    } else if (item.kind === 'build') {
       this.buildAction(button === 0 ? 'remove' : this.shift ? 'paint' : 'place');
+      this.repeat = REPEAT_DELAY;
+    } else if (item.kind === 'plant') {
+      this.plantAction(button === 0 ? 'remove' : 'place');
       this.repeat = REPEAT_DELAY;
     } else {
       // Level to whole metres, so a levelled pad lines up with the build grid.
@@ -125,13 +134,46 @@ export class Interaction {
 
   // ---- targeting -----------------------------------------------------------
 
+  /**
+   * What the crosshair is on: the nearest solid surface (chunk meshes), or a
+   * leaf voxel in front of it ({ leaf: [x, y, z] }, with the voxel face hit).
+   * Grass and flowers are looked through.
+   */
   raycast(reach) {
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera({ x: 0, y: 0 }, this.camera);
     this.raycaster.far = reach;
     const h = this.raycaster.intersectObjects(this.chunkMeshes.list, false)[0];
+    const leaf = this.leafRay(this.raycaster.ray, h ? h.distance : reach);
+    if (leaf) return leaf;
     if (!h) return null;
     return { point: h.point.clone(), normal: h.face.normal.clone() };
+  }
+
+  /** Voxel walk (Amanatides and Woo) along the ray for the first targetable plant within `far` metres. */
+  leafRay(ray, far) {
+    const o = ray.origin, d = ray.direction;
+    const p = [o.x / VOXEL, o.y / VOXEL, o.z / VOXEL], dir = [d.x, d.y, d.z];
+    const cell = p.map(Math.floor);
+    const step = dir.map((v) => (v > 0 ? 1 : -1));
+    const tDelta = dir.map((v) => (v ? Math.abs(1 / v) : Infinity));
+    const tMax = dir.map((v, k) => (v ? ((v > 0 ? cell[k] + 1 - p[k] : p[k] - cell[k]) / Math.abs(v)) : Infinity));
+    const limit = far / VOXEL;
+    let t = 0, axis = -1;
+    while (t <= limit) {
+      const id = this.world.getPlant(cell[0], cell[1], cell[2]);
+      if (id && PLANTS[id].targetable && axis >= 0) {
+        const normal = new THREE.Vector3();
+        normal.setComponent(axis, -step[axis]);
+        const point = new THREE.Vector3(o.x + d.x * t * VOXEL, o.y + d.y * t * VOXEL, o.z + d.z * t * VOXEL);
+        return { point, normal, leaf: cell.slice() };
+      }
+      axis = tMax[0] < tMax[1] ? (tMax[0] < tMax[2] ? 0 : 2) : tMax[1] < tMax[2] ? 1 : 2;
+      t = tMax[axis];
+      cell[axis] += step[axis];
+      tMax[axis] += tDelta[axis];
+    }
+    return null;
   }
 
   /**
@@ -158,9 +200,10 @@ export class Interaction {
     const L = item.shape.lattice;
     const size = placement(item.shape, [0, 0, 0], rot, flip).size;
 
-    // The voxel behind the surface you're aiming at.
-    const behind = p.map((v, j) => Math.floor(j === k ? v - sign * 0.05 : v));
-    const onPiece = w.isPiece(...behind);
+    // The voxel behind the surface you're aiming at. A leaf voxel counts as a
+    // piece on the plain grid, so you can build flush against canopies.
+    const behind = this.hit.leaf ? this.hit.leaf : p.map((v, j) => Math.floor(j === k ? v - sign * 0.05 : v));
+    const onPiece = w.isPiece(...behind) || !!this.hit.leaf;
     const onGround = !onPiece && w.isTerrain(...behind);
 
     // Across the face, snap to the grid of the piece you're aiming at (its
@@ -194,15 +237,17 @@ export class Interaction {
   update(dt, active, shift) {
     this.shift = shift;
     const item = this.item;
-    this.hit = active && item ? this.raycast(item.kind === 'build' ? BUILD_REACH : TOOL_REACH) : null;
+    this.hit = active && item ? this.raycast(item.kind === 'tool' ? TOOL_REACH : BUILD_REACH) : null;
     this.updateGizmos();
     if (!this.hit || !item) return;
 
-    if (item.kind === 'build') {
+    if (item.kind !== 'tool') {
       if (this.lmb || this.rmb) {
         this.repeat -= dt;
         if (this.repeat <= 0) {
-          this.buildAction(this.lmb ? 'remove' : this.shift ? 'paint' : 'place');
+          if (this.lmb && this.hit.leaf) this.removeLeaf();
+          else if (item.kind === 'build') this.buildAction(this.lmb ? 'remove' : this.shift ? 'paint' : 'place');
+          else this.plantAction(this.lmb ? 'remove' : 'place');
           this.repeat = REPEAT_RATE;
         }
       }
@@ -245,6 +290,47 @@ export class Interaction {
     if (MATERIALS[item.material].natural) this.lastNatural = item.material;
   }
 
+  // ---- plants ----------------------------------------------------------------
+
+  removeLeaf() {
+    const [x, y, z] = this.hit.leaf;
+    this.world.setPlant(x, y, z, 0);
+    this.world.markDirtyBox(x, y, z, x, y, z);
+  }
+
+  /** Leaves: a 1 m block of leaf voxels on the build grid. Grass: a small brush. */
+  plantAction(kind) {
+    const item = this.item;
+    if (!this.hit || !item || item.kind !== 'plant') return;
+    const w = this.world;
+    if (item.plant === PLANT.LEAVES) {
+      if (kind !== 'place') return; // removing is aimed (removeLeaf)
+      const p = this.shapeTarget(item, 'place');
+      for (const [x, y, z] of p.voxels) if (!w.isSolid(x, y, z)) w.setPlant(x, y, z, PLANT.LEAVES);
+      w.markDirtyBox(p.origin[0], p.origin[1], p.origin[2], p.origin[0] + p.size[0] - 1, p.origin[1] + p.size[1] - 1, p.origin[2] + p.size[2] - 1);
+      return;
+    }
+    // Grass: every column within the brush, in the empty voxel on the ground nearest the aim.
+    const r = item.radius / VOXEL;
+    const c = { x: this.hit.point.x / VOXEL, y: this.hit.point.y / VOXEL, z: this.hit.point.z / VOXEL };
+    let changed = false;
+    for (let z = Math.floor(c.z - r); z <= Math.floor(c.z + r); z++)
+      for (let x = Math.floor(c.x - r); x <= Math.floor(c.x + r); x++) {
+        if (Math.hypot(x + 0.5 - c.x, z + 0.5 - c.z) > r) continue;
+        for (let dy = 0; dy <= 6; dy++) {
+          const y = Math.floor(c.y) + (dy % 2 ? (dy + 1) / 2 : -dy / 2);
+          const here = w.getPlant(x, y, z);
+          if (kind === 'remove') {
+            if (PLANT_KIND[here] === 1) { w.setPlant(x, y, z, 0); changed = true; break; }
+          } else if (supportsPlant(w, x, y, z)) {
+            if (!here) { w.setPlant(x, y, z, item.plant); changed = true; }
+            break;
+          }
+        }
+      }
+    if (changed) w.markDirtyBox(Math.floor(c.x - r), Math.floor(c.y) - 4, Math.floor(c.z - r), Math.floor(c.x + r), Math.floor(c.y) + 4, Math.floor(c.z + r));
+  }
+
   /** Placing may not make anything solid inside the player. */
   blocksPlayer(p) {
     return shapeSolidVoxels(this.world, p).some(([x, y, z]) => this.player.intersectsVoxel(x, y, z));
@@ -260,6 +346,16 @@ export class Interaction {
     const r = this.radiusOf(item) / VOXEL; // voxels
     const { point, normal: n } = this.hit;
     const opts = { protect: this.protect };
+    // Digging tools also clear the leaves you aim at, within the brush.
+    if (this.hit.leaf && this.lmb && (item.id === 'pickaxe' || item.id === 'shovel')) {
+      const c = this.hit.leaf.map((v) => v + 0.5);
+      for (let z = Math.floor(c[2] - r); z <= Math.floor(c[2] + r); z++)
+        for (let y = Math.floor(c[1] - r); y <= Math.floor(c[1] + r); y++)
+          for (let x = Math.floor(c[0] - r); x <= Math.floor(c[0] + r); x++)
+            if (Math.hypot(x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]) <= r && w.getPlant(x, y, z) === PLANT.LEAVES) w.setPlant(x, y, z, 0);
+      w.markDirtyBox(Math.floor(c[0] - r), Math.floor(c[1] - r), Math.floor(c[2] - r), Math.floor(c[0] + r), Math.floor(c[1] + r), Math.floor(c[2] + r));
+      return;
+    }
     if (item.id === 'pickaxe' || item.id === 'shovel') {
       // The sphere sits just across the surface, overlapping it by `step`:
       // inside the ground to raise, outside it to dig. So the surface moves at
@@ -284,6 +380,30 @@ export class Interaction {
     const item = this.item;
     if (!this.hit || !item) return;
 
+    if (this.hit.leaf && item.kind !== 'tool' && (this.lmb || (item.kind === 'plant' && item.plant === PLANT.GRASS))) {
+      // The leaf voxel that left mouse removes.
+      const { mesh, edges } = this.ghostGeometry({ shape: SMALL, rot: 0, flip: false });
+      ghost.geometry = mesh;
+      ghostEdges.geometry = edges;
+      ghost.position.set(...this.hit.leaf.map((v) => v * VOXEL));
+      ghostEdges.position.copy(ghost.position);
+      this.ghostMat.color.copy(REMOVE_COLOR);
+      ghost.visible = ghostEdges.visible = true;
+      return;
+    }
+
+    if (item.kind === 'plant' && item.plant === PLANT.LEAVES) {
+      const p = this.shapeTarget(item, 'place');
+      const { mesh, edges } = this.ghostGeometry(p);
+      ghost.geometry = mesh;
+      ghostEdges.geometry = edges;
+      ghost.position.set(p.origin[0] * VOXEL, p.origin[1] * VOXEL, p.origin[2] * VOXEL);
+      ghostEdges.position.copy(ghost.position);
+      this.ghostMat.color.copy(LEAF_COLOR);
+      ghost.visible = ghostEdges.visible = true;
+      return;
+    }
+
     if (item.kind === 'build') {
       // While left mouse (remove) or Shift (paint) is held, show the footprint in the surface.
       const into = this.lmb || this.shift;
@@ -300,9 +420,9 @@ export class Interaction {
       return;
     }
 
-    const r = this.radiusOf(item);
+    const r = item.kind === 'plant' ? item.radius : this.radiusOf(item);
     const p = this.hit.point;
-    const color = { pickaxe: 0xff8a7c, shovel: this.rmb ? 0x7cff8a : 0xffb07c, trowel: 0x7cd8ff, level: 0xffd34d }[item.id];
+    const color = { pickaxe: 0xff8a7c, shovel: this.rmb ? 0x7cff8a : 0xffb07c, trowel: 0x7cd8ff, level: 0xffd34d }[item.id] ?? 0x9be07a;
     if (item.id === 'level') {
       const y = this.flattenY ?? Math.round(p.y);
       disc.position.set(p.x, y + 0.02, p.z);
@@ -314,7 +434,7 @@ export class Interaction {
       brush.position.copy(p);
       brush.scale.setScalar(r);
       brush.material.color.setHex(color);
-      brush.visible = true;
+      brush.visible = item.kind === 'tool';
       ring.position.copy(p).addScaledVector(this.hit.normal, 0.03);
       ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), this.hit.normal);
     }

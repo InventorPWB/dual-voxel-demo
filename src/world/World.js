@@ -19,6 +19,9 @@ const AXES = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
  * non-terrain voxel, the exact crossing point and normal (edited by exact
  * CSG, see csg.js). Terrain never extends into a building voxel; it stops
  * exactly at its faces. Below the world is solid bedrock; beside and above, air.
+ *
+ * Empty voxels may hold a plant (grass, leaves, ...; see plants.js). Plants
+ * are never solid; a voxel that becomes solid loses its plant.
  */
 export class World {
   constructor(nx = 8, ny = 4, nz = 8, size = CHUNK_SIZE) {
@@ -104,6 +107,25 @@ export class World {
     c.mat[i] = mat;
     const off = offset && shape ? (offset[0] & 1) << 5 | (offset[1] & 1) << 6 | (offset[2] & 1) << 7 : 0;
     c.shape[i] = mat ? shape | off : 0;
+    if (mat && c.plant) c.plant[i] = 0;
+  }
+
+  /** Plant id in voxel (x, y, z) (0 = none). */
+  getPlant(x, y, z) {
+    if (!this.inBounds(x, y, z)) return 0;
+    const c = this.chunkAt(x, y, z);
+    return c.plant ? c.plant[c.index(x & this.mask, y & this.mask, z & this.mask)] : 0;
+  }
+
+  /** Put a plant in an empty voxel (0 removes it). Ignored for solid voxels. Doesn't mark meshes dirty. */
+  setPlant(x, y, z, plant) {
+    if (!this.inBounds(x, y, z)) return;
+    const c = this.chunkAt(x, y, z);
+    const i = c.index(x & this.mask, y & this.mask, z & this.mask);
+    if (!plant) { if (c.plant) c.plant[i] = 0; return; }
+    if (c.mat[i]) return;
+    c.ensurePlants();
+    c.plant[i] = plant;
   }
 
   /** 255 if solid, else 0 (handy for trilinear "how solid is it here"). */
@@ -118,6 +140,7 @@ export class World {
     const i = c.index(x & this.mask, y & this.mask, z & this.mask);
     c.mat[i] = mat;
     if (!mat) c.shape[i] = 0;
+    else if (c.plant) c.plant[i] = 0;
   }
 
   /**
@@ -165,7 +188,8 @@ export class World {
   }
 
   /**
-   * Copy a chunk plus PAD voxels of border (materials, shapes and edge data), so each
+   * Copy a chunk plus PAD voxels of border (materials, shapes, edge data and
+   * plants; `plant` is null if there are none nearby), so each
    * chunk can be meshed on its own and still produce matching seams. Edges at
    * the world's border, where solid meets the outside, get a crossing halfway
    * with the axis as normal.
@@ -178,6 +202,16 @@ export class World {
     const et = new Uint8Array(N * N * N * 3);
     const en = new Uint8Array(N * N * N * 6);
     const ox = cx * s, oy = cy * s, oz = cz * s;
+    // Plants: only if this chunk or a neighbour within the pad has any.
+    let plant = null;
+    for (let dz = -1; dz <= 1 && !plant; dz++)
+      for (let dy = -1; dy <= 1 && !plant; dy++)
+        for (let dx = -1; dx <= 1 && !plant; dx++) {
+          const nx = cx + dx, ny = cy + dy, nz = cz + dz;
+          if (nx < 0 || ny < 0 || nz < 0 || nx >= this.nx || ny >= this.ny || nz >= this.nz) continue;
+          if (this.chunks[this.chunkIndex(nx, ny, nz)].plant) plant = new Uint8Array(N * N * N);
+        }
+    let plants = 0;
     const e = [0, 0, 0];
     let solid = 0, pieces = 0;
     for (let z = 0, i = 0; z < N; z++)
@@ -189,6 +223,7 @@ export class World {
           shape[i] = this.getShape(gx, gy, gz);
           if (m) solid++;
           if (shape[i]) pieces++;
+          if (plant && (plant[i] = this.getPlant(gx, gy, gz))) plants++;
           for (let a = 0; a < 3; a++) {
             const [dx, dy, dz] = AXES[a];
             const inside = this.inBounds(gx, gy, gz) && this.inBounds(gx + dx, gy + dy, gz + dz);
@@ -205,7 +240,8 @@ export class World {
             }
           }
         }
-    const uniform = pieces === 0 && (solid === 0 || solid === N * N * N);
-    return { mat, shape, et, en, size: s, origin: [ox, oy, oz], uniform };
+    const uniform = pieces === 0 && plants === 0 && (solid === 0 || solid === N * N * N);
+    if (!plants) plant = null;
+    return { mat, shape, et, en, plant, size: s, origin: [ox, oy, oz], uniform };
   }
 }

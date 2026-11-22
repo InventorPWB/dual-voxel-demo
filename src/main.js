@@ -1,7 +1,9 @@
 import * as THREE from 'three';
 import { World, VOXEL } from './world/World.js';
 import { generateWorld, surfaceHeight } from './world/generate.js';
-import { createTerrainMaterial, SKY_COLOR, SUN_AZIMUTH, sunDirection } from './render/terrainMaterial.js';
+import { createChunkMaterials, SKY_COLOR, SUN_AZIMUTH, sunDirection } from './render/terrainMaterial.js';
+import { createFoliageMaterials } from './render/foliageMaterial.js';
+import { lightingUniforms } from './render/lighting.js';
 import { SunShadow } from './render/SunShadow.js';
 import { ChunkMeshes } from './render/ChunkMeshes.js';
 import { Player } from './player/Player.js';
@@ -36,13 +38,16 @@ const world = new World(8, 4, 8); // 128 × 64 × 128 m in 0.5 m voxels (16 m ch
 const shadow = new SunShadow(renderer, scene);
 let sunAzimuth = SUN_AZIMUTH;
 shadow.setDirection(sunDirection(sunAzimuth));
-const chunkMeshes = new ChunkMeshes(world, scene, createTerrainMaterial(shadow));
+const chunkMeshes = new ChunkMeshes(world, scene, createChunkMaterials(shadow), createFoliageMaterials(shadow));
+const uTime = lightingUniforms(shadow).uTime;
 chunkMeshes.onChange = () => { shadow.dirty = true; };
 const player = new Player(world, camera, () => chunkMeshes.list);
 const interaction = new Interaction({ world, scene, camera, chunkMeshes, player, hotbar });
 
+const SPAWN_X = 46.5, SPAWN_Z = 40.5;
+
 function spawn() {
-  const x = 46.5, z = 40.5;
+  const x = SPAWN_X, z = SPAWN_Z;
   player.spawn(x, surfaceHeight(world, x, z) + 0.05, z);
   // Face the mountain.
   const dx = world.sx * VOXEL * 0.66 - x, dz = world.sz * VOXEL * 0.6 - z;
@@ -54,7 +59,7 @@ player.onFallOut = spawn;
 
 let loaded = false;
 setTimeout(() => {
-  generateWorld(world);
+  generateWorld(world, 1337, { avoid: [{ x: SPAWN_X, z: SPAWN_Z, r: 8 }] });
   spawn();
   hud.setLoading('Meshing chunks…');
 }, 30);
@@ -186,7 +191,8 @@ function frame(now) {
     sunAzimuth += sunSpin * dt * 0.6;
     shadow.setDirection(sunDirection(sunAzimuth));
   }
-  shadow.update(chunkMeshes.list);
+  shadow.update(chunkMeshes.list.concat(chunkMeshes.foliageList));
+  uTime.value = now / 1000;
 
   if (!loaded && world.chunks.length && chunkMeshes.list.length && chunkMeshes.pending === 0) {
     loaded = true;
@@ -201,7 +207,7 @@ function frame(now) {
     const p = player.pos;
     hud.setStats(
       `FPS        ${fps.toFixed(0)}\n` +
-      `Triangles  ${chunkMeshes.triangleCount().toLocaleString()}\n` +
+      `Triangles  ${chunkMeshes.triangleCount().toLocaleString()} solid, ${chunkMeshes.foliageTriangleCount().toLocaleString()} foliage\n` +
       `Chunks     ${chunkMeshes.list.length} meshed, ${chunkMeshes.pending} pending\n` +
       `Last mesh  ${chunkMeshes.lastMeshMs.toFixed(1)} ms (${chunkMeshes.workerCount} workers)\n` +
       `Position   ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
