@@ -131,17 +131,22 @@ const GENERATORS = {
     const c = [178 + 26 * ring, 140 + 20 * ring, 88 + 12 * ring];
     return jitter(c, 4, hash(x, y, 34));
   },
+  log_end(x, y) {
+    // End grain without a centre: wavy growth lines that tile, for wherever a
+    // trunk of smooth terrain is cut (its rings can't be centred on it).
+    const v = y + 2.5 * Math.sin((x / 32) * Math.PI * 2) + 1.5 * vnoise(x, y, 8, 36);
+    const ring = 0.5 + 0.5 * Math.cos((v / 32) * Math.PI * 2 * 5);
+    const c = [176 + 26 * ring, 138 + 20 * ring, 88 + 12 * ring];
+    return jitter(c, 4, hash(x, y, 37));
+  },
   glass(x, y) {
-    // Clear, with a thin pale frame (one per metre) and a couple of glints.
-    if (x === 0 || y === 0 || x === 31 || y === 31) return [214, 228, 232, 255];
-    if (x === 1 || y === 1 || x === 30 || y === 30) return [176, 196, 204, 255];
+    // Clear, with a couple of glints. (Its frame is drawn along each piece's outline.)
     const k = x + y;
     if ((k === 11 || k === 13) && x > 3 && x < 10) return [236, 244, 248, 255];
     if (k === 15 && x > 4 && x < 9) return [236, 244, 248, 255];
     return [0, 0, 0, 0];
   },
   stained_glass(x, y) {
-    if (x <= 1 || y <= 1 || x >= 30 || y >= 30) return [38, 62, 112, 235];
     const n = vnoise(x, y, 8, 35);
     return [70 + 20 * n, 118 + 26 * n, 196 + 20 * n, 112 + 24 * n];
   },
@@ -164,7 +169,7 @@ const GENERATORS = {
   },
   flowers(x, y) {
     // Three flowers on stems among a few blades.
-    const heads = [[7, 9, [232, 214, 72]], [18, 6, [226, 96, 126]], [26, 12, [244, 244, 236]]];
+    const heads = [[7, 9, [232, 214, 72]], [18, 6, [226, 96, 126]], [26, 12, [232, 226, 206]]];
     for (const [hx, hy, col] of heads) {
       const d = Math.hypot(x + 0.5 - hx, y + 0.5 - hy);
       if (d < 1.3) return [214, 170, 60, 255];
@@ -175,31 +180,41 @@ const GENERATORS = {
     return [0, 0, 0, 0];
   },
   leaves(x, y) {
-    // Scattered pointed leaves, varied greens, holes between them. They stay
-    // inside a disc, so a card never shows a straight cut edge.
-    if (Math.hypot(x + 0.5 - 16, y + 0.5 - 16) > 15.5) return [0, 0, 0, 0];
-    for (let k = 0; k < 16; k++) {
-      const ca = hash(k, 0, 50) * Math.PI * 2, cr = Math.sqrt(hash(k, 1, 50)) * 9;
+    // A spray of small leaves (a few centimetres each on a 1 m card), varied
+    // greens, holes between them. They stay inside a disc, so a card never
+    // shows a straight cut edge.
+    const d = Math.hypot(x + 0.5 - 16, y + 0.5 - 16);
+    if (d > 15.5) return [0, 0, 0, 0];
+    for (let k = 0; k < 70; k++) {
+      const ca = hash(k, 0, 50) * Math.PI * 2, cr = Math.sqrt(hash(k, 1, 50)) * 13;
       const cx = 16 + Math.cos(ca) * cr, cy = 16 + Math.sin(ca) * cr;
       const a = hash(k, 2, 50) * Math.PI;
       const dx = x + 0.5 - cx, dy = y + 0.5 - cy;
       const u = dx * Math.cos(a) + dy * Math.sin(a), v = -dx * Math.sin(a) + dy * Math.cos(a);
-      const r = (u / 6) ** 2 + (v / 3) ** 2;
+      const r = (u / 3) ** 2 + (v / 1.5) ** 2;
       if (r > 1) continue;
       const tone = hash(k, 3, 50);
-      let c = [48 + 34 * tone, 96 + 46 * tone, 34 + 16 * tone];
-      if (Math.abs(v) < 0.5) c = shade(c, 1.15); // midrib
-      c = shade(c, 1.08 - 0.25 * r);
-      return [...jitter(c, 5, hash(x, y, 51)), 255];
+      const c = shade([52 + 40 * tone, 104 + 46 * tone, 34 + 18 * tone], 1.1 - 0.3 * r);
+      return [...jitter(c, 6, hash(x, y, 51)), 255];
     }
     return [0, 0, 0, 0];
   },
   leaves_hull(x, y) {
-    // The canopy's inner shell: dense, darker foliage.
-    const n = vnoise(x, y, 4, 52);
-    let c = [40 + 26 * n, 82 + 38 * n, 30 + 12 * n];
-    if (hash(x, y, 53) > 0.8) c = shade(c, 0.75);
-    return jitter(c, 6, hash(x, y, 54));
+    // The crown's solid core: many small overlapping leaves over a mottled
+    // mid-green (no holes: the cards around it make the ragged outline),
+    // tiling seamlessly as it's mapped in world space.
+    for (let k = 0; k < 110; k++) {
+      const cx = hash(k, 0, 52) * 32, cy = hash(k, 1, 52) * 32;
+      const a = hash(k, 2, 52) * Math.PI;
+      let dx = x + 0.5 - cx, dy = y + 0.5 - cy;
+      dx -= 32 * Math.round(dx / 32); dy -= 32 * Math.round(dy / 32);
+      const u = dx * Math.cos(a) + dy * Math.sin(a), v = -dx * Math.sin(a) + dy * Math.cos(a);
+      const r = (u / 2.8) ** 2 + (v / 1.4) ** 2;
+      if (r > 1) continue;
+      const tone = hash(k, 3, 52);
+      return jitter(shade([46 + 32 * tone, 92 + 40 * tone, 32 + 14 * tone], 1.05 - 0.25 * r), 5, hash(x, y, 54));
+    }
+    return jitter(shade([40, 80, 30], 0.85 + 0.25 * vnoise(x, y, 4, 55)), 5, hash(x, y, 56));
   },
 };
 

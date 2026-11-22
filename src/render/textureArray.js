@@ -7,6 +7,10 @@ let shared = null;
  * Every procedural texture in one texture array, layer i = TEXTURE_NAMES[i]
  * (the mesh workers use the same order for plant layers). Shared by the
  * terrain, glass and foliage materials.
+ *
+ * Its mipmaps are made here rather than by the GPU (see `mipChain`), so
+ * cutout textures (grass, flowers, leaves, glass) look right at a distance.
+ * Call `attachMipmaps(renderer)` once to have them uploaded.
  */
 export function textureArray() {
   if (shared) return shared;
@@ -26,9 +30,78 @@ export function textureArray() {
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
   tex.magFilter = THREE.NearestFilter;
   tex.minFilter = THREE.NearestMipmapLinearFilter;
+  // Lets three allocate the levels; ours overwrite them right after (attachMipmaps).
   tex.generateMipmaps = true;
   tex.anisotropy = 4;
   tex.needsUpdate = true;
-  shared = { texture: tex, layerOf: (name) => TEXTURE_NAMES.indexOf(name) };
+  shared = { texture: tex, layerOf: (name) => TEXTURE_NAMES.indexOf(name), mips: mipChain(data, S, TEXTURE_NAMES.length) };
   return shared;
+}
+
+/** Upload the hand-made mip levels whenever three uploads the texture. */
+export function attachMipmaps(renderer) {
+  const { texture, mips } = textureArray();
+  texture.onUpdate = () => {
+    // three has just uploaded level 0 and left the texture bound.
+    const gl = renderer.getContext();
+    mips.forEach((m, i) => gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, i + 1, 0, 0, 0, m.size, m.size, m.layers, gl.RGBA, gl.UNSIGNED_BYTE, m.data));
+  };
+}
+
+/**
+ * Mip levels 1.. of the array, for cutout textures done right:
+ *  - colour is averaged weighted by alpha, so the (black, invisible) colour of
+ *    holes never darkens or tints a texture's visible edges;
+ *  - alpha is scaled per level so the share of texels that pass the cutout
+ *    test stays what it is at full size (coverage-preserving mipmaps), so
+ *    grass and leaves neither thin out nor turn to mush with distance.
+ */
+export function mipChain(data, size, layers) {
+  const out = [];
+  let src = data, s = size;
+  // Coverage of each layer at full size: the target for every smaller level.
+  const target = [];
+  for (let l = 0; l < layers; l++) target.push(coverage(data, l * size * size * 4, size * size, 1));
+  while (s > 1) {
+    const h = s >> 1;
+    const raw = new Uint8Array(h * h * 4 * layers);
+    for (let l = 0; l < layers; l++)
+      for (let y = 0; y < h; y++)
+        for (let x = 0; x < h; x++) {
+          let r = 0, g = 0, b = 0, a = 0, pr = 0, pg = 0, pb = 0;
+          for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+            const i = (l * s * s + (2 * y + dy) * s + 2 * x + dx) * 4;
+            const w = src[i + 3];
+            r += src[i] * w; g += src[i + 1] * w; b += src[i + 2] * w; a += w;
+            pr += src[i]; pg += src[i + 1]; pb += src[i + 2];
+          }
+          const o = (l * h * h + y * h + x) * 4;
+          if (a > 0) { raw[o] = r / a; raw[o + 1] = g / a; raw[o + 2] = b / a; }
+          else { raw[o] = pr / 4; raw[o + 1] = pg / 4; raw[o + 2] = pb / 4; }
+          raw[o + 3] = a / 4;
+        }
+    // Scale alpha per layer to keep its coverage (the unscaled level feeds the next one).
+    const level = raw.slice();
+    for (let l = 0; l < layers; l++) {
+      const at = l * h * h * 4, n = h * h;
+      if (target[l] >= 1 || target[l] <= 0) continue;
+      let lo = 0.5, hi = 8;
+      for (let k = 0; k < 16; k++) {
+        const mid = (lo + hi) / 2;
+        if (coverage(raw, at, n, mid) < target[l]) lo = mid; else hi = mid;
+      }
+      for (let i = 0; i < n; i++) level[at + i * 4 + 3] = Math.min(255, raw[at + i * 4 + 3] * hi);
+    }
+    out.push({ size: h, layers, data: level });
+    src = raw;
+    s = h;
+  }
+  return out;
+}
+
+/** Share of `n` texels from byte offset `at` whose alpha × scale passes the cutout test. */
+function coverage(data, at, n, scale) {
+  let c = 0;
+  for (let i = 0; i < n; i++) if (data[at + i * 4 + 3] * scale >= 127.5) c++;
+  return c / n;
 }

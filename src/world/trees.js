@@ -8,9 +8,8 @@ import { unpackNormal } from './normals.js';
 /**
  * Test vegetation for generated worlds: trees and a grass cover.
  *
- * A tree is ordinary world data: a smooth trunk of Log terrain (an exact
- * CSG union, so it can be dug and chopped like any ground), and a canopy of
- * leaf voxels in the plant layer around its top. Nothing else remembers it.
+ * A tree is ordinary world data: smooth Log terrain for the wood, and leaf
+ * voxels in the plant layer for the crown. Nothing else remembers it.
  */
 
 const e = [0, 0, 0];
@@ -43,46 +42,113 @@ export function rng(seed) {
   };
 }
 
+/** Smooth minimum of two distances: joins shapes with a rounded fillet of size k. */
+function smin(a, b, k) {
+  const h = Math.max(k - Math.abs(a - b), 0) / k;
+  return Math.min(a, b) - h * h * k * 0.25;
+}
+
 /**
- * Grow one tree with its foot at voxel column (x, z). Sizes are in metres.
- * Returns false if there's no ground there.
+ * Grow one tree with its foot at voxel column (x, z). Returns false if
+ * there's no ground there.
+ *
+ * Proportioned like a broad oak: the crown spreads 11-15 m, about as wide as
+ * the tree is tall, and 13-15 times the trunk's width. The trunk flares at
+ * the foot, tapers to a fork at 3-4.5 m and splits into 4-5 limbs that
+ * spread out and up, each forking once more, plus a leader up the middle.
+ * The crown is dense leaf clusters in two tiers (along and at the end of
+ * every limb, then a ring above and inward of those, then the top), so it
+ * builds up into a tall, lumpy dome and never reads as a hollow shell.
+ *
+ * The wood is smooth Log terrain (an exact CSG union of tapered capsules,
+ * blended with rounded fillets), so each tree leans, forks and spreads
+ * differently and can be dug or chopped like ground. Wood stays at least
+ * about 1.5 voxels thick, the least the terrain mesher draws reliably.
  */
 export function growTree(world, x, z, random = Math.random) {
   const g = groundAt(world, x, z);
   if (!g) return false;
   const V = VOXEL;
-  const height = (5 + 3 * random()) / V; // trunk, voxels above ground
-  const r0 = 0.55 / V, flare = 0.3 / V;
-  const leanX = (random() - 0.5) * 0.12, leanZ = (random() - 0.5) * 0.12;
-  const cx = x + 0.5, cz = z + 0.5, y0 = g.height - 1 / V, y1 = g.height + height;
+  const s = 0.85 + 0.35 * random(); // overall size
+  const m = (v) => v / V; // metres to voxels
 
-  // Trunk: a leaning, tapering capsule that flares into roots at the ground.
-  const axisAt = (y) => [cx + leanX * (y - g.height), cz + leanZ * (y - g.height)];
-  const sdf = (px, py, pz) => {
-    const yy = Math.max(y0, Math.min(y1, py));
-    const [ax, az] = axisAt(yy);
-    const above = Math.max(0, yy - g.height);
-    const r = r0 * (1 - 0.25 * above / height) + flare * Math.exp(-above / (0.6 / V));
-    // Cut flat at both ends: the top is hidden in the canopy, the bottom underground.
-    return -Math.max(Math.hypot(px - ax, pz - az) - r, py - y1, y0 - py);
-  };
-  const reach = Math.ceil(r0 + flare + 0.2 * height) + 2;
-  applyCSG(world, 'union', [x - reach, Math.floor(y0) - 1, z - reach, x + reach, Math.ceil(y1) + 2, z + reach], sdf, { material: MAT.LOG, keep: true });
+  // Trunk: from a metre underground up to the fork, leaning a little.
+  const foot = [x + 0.5, g.height - m(1), z + 0.5];
+  const lean = random() * Math.PI * 2, leanBy = 0.03 + 0.05 * random();
+  const forkH = m((3 + 1.5 * random()) * s);
+  const fork = [foot[0] + Math.cos(lean) * leanBy * forkH, g.height + forkH, foot[2] + Math.sin(lean) * leanBy * forkH];
+  const rBase = m(0.45), rFork = m(0.41), rLimb = m(0.38), flare = m(0.4);
+  const trunk = { a: foot, b: fork, ra: rBase, rb: rFork };
+  const segments = [];
 
-  // Canopy: a few overlapping noisy blobs around the top of the trunk.
-  const [tx, tz] = axisAt(y1);
-  const noise = createNoise3D(Math.floor(random() * 1e9));
-  const blobs = [];
-  const count = 2 + Math.floor(random() * 2);
-  for (let i = 0; i < count; i++) {
-    const a = random() * Math.PI * 2, d = i === 0 ? 0 : (0.8 + random() * 0.9) / V;
-    blobs.push({
-      x: tx + Math.cos(a) * d, y: y1 + (i === 0 ? 0.4 / V : (random() - 0.6) * 1.6 / V), z: tz + Math.sin(a) * d,
-      r: (i === 0 ? 3 : 2.2 + random() * 0.8) / V,
-    });
+  // Limbs spreading out and up from the fork, each forking once more.
+  const limbs = 4 + (random() < 0.5 ? 1 : 0);
+  const turn = random() * Math.PI * 2;
+  const clumps = [];
+  const tips = [];
+  const clump = (p, r, lift = 0.4) => clumps.push({ x: p[0], y: p[1] + m(lift), z: p[2], r: m(r * s) });
+  const along = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  for (let i = 0; i < limbs; i++) {
+    const a = turn + (i / limbs) * Math.PI * 2 + (random() - 0.5) * 0.6;
+    const len = m((3.8 + 1.4 * random()) * s), rise = 0.4 + 0.25 * random();
+    const out = Math.sqrt(1 - rise * rise);
+    const from = [fork[0], fork[1] - m(0.3 + 0.4 * random()), fork[2]];
+    const tip = [from[0] + Math.cos(a) * out * len, from[1] + rise * len, from[2] + Math.sin(a) * out * len];
+    segments.push({ a: from, b: tip, ra: rFork, rb: rLimb });
+    tips.push(tip);
+    clump(tip, 2.1 + 0.5 * random());
+    clump(along(from, tip, 0.5), 1.7 + 0.4 * random(), 0.9);
+    // A side branch from about halfway, turned off to one side and a little higher.
+    const at = along(from, tip, 0.45 + 0.15 * random());
+    const side = a + (random() < 0.5 ? -1 : 1) * (0.6 + 0.3 * random());
+    const sLen = len * (0.45 + 0.15 * random()), sRise = Math.min(0.85, rise + 0.2);
+    const sOut = Math.sqrt(1 - sRise * sRise);
+    const sTip = [at[0] + Math.cos(side) * sOut * sLen, at[1] + sRise * sLen, at[2] + Math.sin(side) * sOut * sLen];
+    segments.push({ a: at, b: sTip, ra: rLimb, rb: rLimb });
+    clump(sTip, 1.8 + 0.4 * random());
   }
+  // A leader up the middle, crowned by the top of the dome.
+  const leader = [fork[0], fork[1] + m(3.6 * s), fork[2]];
+  segments.push({ a: fork, b: leader, ra: rFork, rb: rLimb });
+  clump(leader, 2.5 + 0.4 * random(), 1.0);
+  clump([fork[0], fork[1] + m(1.4 * s), fork[2]], 2.4, 0.4);
+  // An upper tier: a cluster above and inward of each limb's end, so the
+  // crown builds up in layers into a tall dome instead of one flat spread.
+  for (const tip of tips) {
+    const p = along(tip, leader, 0.45 + 0.15 * random());
+    clump(p, 1.9 + 0.5 * random(), (1.2 + 0.8 * random()) * s);
+  }
+
+  const capsule = ({ a, b, ra, rb }, px, py, pz) => {
+    const bx = b[0] - a[0], by = b[1] - a[1], bz = b[2] - a[2];
+    const t = Math.max(0, Math.min(1, ((px - a[0]) * bx + (py - a[1]) * by + (pz - a[2]) * bz) / (bx * bx + by * by + bz * bz)));
+    return { d: Math.hypot(px - a[0] - bx * t, py - a[1] - by * t, pz - a[2] - bz * t), r: ra + (rb - ra) * t };
+  };
+  const fillet = m(0.35);
+  const sdf = (px, py, pz) => {
+    // The trunk, flaring into roots just at the ground (along its own axis, so no seam).
+    const c = capsule(trunk, px, py, pz);
+    let d = c.d - c.r - flare * Math.exp(-Math.max(0, py - g.height) / m(0.7));
+    for (const seg of segments) {
+      const k = capsule(seg, px, py, pz);
+      d = smin(d, k.d - k.r, fillet);
+    }
+    return -d;
+  };
+  let bx0 = Infinity, by0 = Infinity, bz0 = Infinity, bx1 = -Infinity, by1 = -Infinity, bz1 = -Infinity;
+  for (const { a, b } of [trunk, ...segments])
+    for (const p of [a, b]) {
+      bx0 = Math.min(bx0, p[0]); by0 = Math.min(by0, p[1]); bz0 = Math.min(bz0, p[2]);
+      bx1 = Math.max(bx1, p[0]); by1 = Math.max(by1, p[1]); bz1 = Math.max(bz1, p[2]);
+    }
+  const pad = Math.ceil(rBase + flare) + 2;
+  applyCSG(world, 'union', [Math.floor(bx0) - pad, Math.floor(by0) - 1, Math.floor(bz0) - pad, Math.ceil(bx1) + pad, Math.ceil(by1) + pad, Math.ceil(bz1) + pad],
+    sdf, { material: MAT.LOG, keep: true });
+
+  // Crown: the clusters, squashed into a dome, with a noisy edge.
+  const noise = createNoise3D(Math.floor(random() * 1e9));
   let x0 = Infinity, x1 = -Infinity, cy0 = Infinity, cy1 = -Infinity, z0 = Infinity, z1 = -Infinity;
-  for (const b of blobs) {
+  for (const b of clumps) {
     x0 = Math.min(x0, b.x - b.r); x1 = Math.max(x1, b.x + b.r);
     cy0 = Math.min(cy0, b.y - b.r); cy1 = Math.max(cy1, b.y + b.r);
     z0 = Math.min(z0, b.z - b.r); z1 = Math.max(z1, b.z + b.r);
@@ -93,15 +159,15 @@ export function growTree(world, x, z, random = Math.random) {
         if (!world.inBounds(vx, vy, vz) || world.isSolid(vx, vy, vz)) continue;
         const px = vx + 0.5, py = vy + 0.5, pz = vz + 0.5;
         let inside = -Infinity;
-        for (const b of blobs) {
-          // Squashed a little vertically: canopies are wider than tall.
+        for (const b of clumps) {
           const d = Math.hypot((px - b.x) / b.r, (py - b.y) / (b.r * 0.8), (pz - b.z) / b.r);
           inside = Math.max(inside, 1 - d);
         }
-        inside += 0.22 * noise(px * V / 1.6, py * V / 1.6, pz * V / 1.6);
+        inside += 0.22 * noise(px * V / 1.4, py * V / 1.4, pz * V / 1.4);
         if (inside > 0) world.setPlant(vx, vy, vz, PLANT.LEAVES);
       }
-  world.markDirtyBox(Math.floor(x0) - 1, Math.floor(Math.min(cy0, y0)) - 1, Math.floor(z0) - 1, Math.ceil(x1) + 1, Math.ceil(cy1) + 1, Math.ceil(z1) + 1);
+  world.markDirtyBox(Math.floor(Math.min(x0, bx0)) - pad, Math.floor(by0) - 1, Math.floor(Math.min(z0, bz0)) - pad,
+    Math.ceil(Math.max(x1, bx1)) + pad, Math.ceil(cy1) + 1, Math.ceil(Math.max(z1, bz1)) + pad);
   return true;
 }
 
@@ -109,7 +175,7 @@ export function growTree(world, x, z, random = Math.random) {
  * Scatter trees on a jittered grid (`spacing` metres apart) wherever the
  * ground is grass and fairly flat, keeping clear of `avoid` ({ x, z, r } in metres).
  */
-export function growTrees(world, seed = 7, { spacing = 11, avoid = [] } = {}) {
+export function growTrees(world, seed = 7, { spacing = 19, avoid = [] } = {}) {
   const random = rng(seed);
   const V = VOXEL;
   const W = world.sx * V, D = world.sz * V;

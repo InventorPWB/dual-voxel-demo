@@ -4,6 +4,7 @@ import { generateWorld, surfaceHeight } from './world/generate.js';
 import { createChunkMaterials, SKY_COLOR, SUN_AZIMUTH, sunDirection } from './render/terrainMaterial.js';
 import { createFoliageMaterials } from './render/foliageMaterial.js';
 import { lightingUniforms } from './render/lighting.js';
+import { attachMipmaps } from './render/textureArray.js';
 import { SunShadow } from './render/SunShadow.js';
 import { ChunkMeshes } from './render/ChunkMeshes.js';
 import { Player } from './player/Player.js';
@@ -38,6 +39,7 @@ const world = new World(8, 4, 8); // 128 × 64 × 128 m in 0.5 m voxels (16 m ch
 const shadow = new SunShadow(renderer, scene);
 let sunAzimuth = SUN_AZIMUTH;
 shadow.setDirection(sunDirection(sunAzimuth));
+attachMipmaps(renderer);
 const chunkMeshes = new ChunkMeshes(world, scene, createChunkMaterials(shadow), createFoliageMaterials(shadow));
 const uTime = lightingUniforms(shadow).uTime;
 chunkMeshes.onChange = () => { shadow.dirty = true; };
@@ -59,7 +61,7 @@ player.onFallOut = spawn;
 
 let loaded = false;
 setTimeout(() => {
-  generateWorld(world, 1337, { avoid: [{ x: SPAWN_X, z: SPAWN_Z, r: 8 }] });
+  generateWorld(world, 1337, { avoid: [{ x: SPAWN_X, z: SPAWN_Z, r: 10 }] });
   spawn();
   hud.setLoading('Meshing chunks…');
 }, 30);

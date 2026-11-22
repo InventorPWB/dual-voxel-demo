@@ -1,10 +1,17 @@
 import * as THREE from 'three';
 import { textureArray } from './textureArray.js';
+import { averageColor } from './textures.js';
 import { LIGHTING_GLSL, lightingUniforms } from './lighting.js';
 import { DEPTH_PARAMS, HIDDEN } from './SunShadow.js';
 
 /** Grass is drawn fully out to FADE_START metres and gone by FADE_END. */
 const FADE_START = 40, FADE_END = 60;
+/**
+ * From BLEND_START to BLEND_END metres grass takes on the colour of the grass
+ * ground under it, as games do: distant blades are thinner than a pixel, so
+ * any contrast with the ground shimmers as speckles and outlines.
+ */
+const BLEND_START = 10, BLEND_END = 38;
 
 const SWAY_GLSL = /* glsl */ `
   uniform float uTime;
@@ -19,7 +26,7 @@ const SWAY_GLSL = /* glsl */ `
 
 /**
  * Materials for the foliage meshes (src/mesh/foliage.js), by group:
- * [grass/flowers, leaves]. Cutout cards with alpha-to-coverage, drawn from
+ * [grass/flowers, leaves]. Alpha-tested cutout cards, drawn from
  * both sides, swaying in the wind, lit by the shared lighting. Leaves let a
  * little sun through from behind. Grass thins out and vanishes with distance,
  * where the ground's own grass texture carries the colour.
@@ -28,7 +35,7 @@ const SWAY_GLSL = /* glsl */ `
  * them without the sway, so the shadow map doesn't need redrawing every frame.
  */
 export function createFoliageMaterials(shadow) {
-  const { texture } = textureArray();
+  const { texture, layerOf } = textureArray();
   const head = /* glsl */ `
     precision highp sampler2DArray;
     uniform sampler2DArray uTex;
@@ -38,13 +45,15 @@ export function createFoliageMaterials(shadow) {
     in vec3 uvl;
     in float wind;
     in float ao;
+    in float seed;
     out vec3 vPos;
     out vec3 vNormal;
     out vec3 vUvl;
     out float vAo;
     out float vDepth;
-    out float vFade;
+    out float vFar;
     void main() {
+      float vFade;
       vec3 p = position + sway(position, wind);
       vPos = p;
       vNormal = normal;
@@ -52,15 +61,19 @@ export function createFoliageMaterials(shadow) {
       vAo = ao;
       float dist = distance(position, cameraPosition);
       #ifdef GRASS
+        // Thin out with distance a whole clump at a time (each has its own
+        // seed), so far grass doesn't turn to per-pixel noise.
         vFade = 1.0 - smoothstep(${FADE_START.toFixed(1)}, ${FADE_END.toFixed(1)}, dist);
+        vFar = smoothstep(${BLEND_START.toFixed(1)}, ${BLEND_END.toFixed(1)}, dist);
       #else
         vFade = 1.0;
+        vFar = 0.0;
       #endif
       vec4 mv = modelViewMatrix * vec4(p, 1.0);
       vDepth = -mv.z;
       gl_Position = projectionMatrix * mv;
-      // Past the fade, collapse the card so it costs nothing to rasterise.
-      if (vFade <= 0.0) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
+      // Faded out: collapse the card so it costs nothing to rasterise.
+      if (seed >= vFade) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
     }
   `;
   const fragmentShader = /* glsl */ `
@@ -71,31 +84,46 @@ export function createFoliageMaterials(shadow) {
     in vec3 vUvl;
     in float vAo;
     in float vDepth;
-    in float vFade;
+    in float vFar;
+    uniform float uHullLayer;
+    uniform vec3 uGroundTint;
     layout(location = 0) out vec4 outColor;
     void main() {
-      vec4 tex = texture(uTex, vUvl);
-      float a = cutoutAlpha(tex.a);
-      if (a <= 0.0) discard;
-      // Thin out with distance: a screen-door dissolve until nothing's left.
-      if (vFade < 1.0 && fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453) > vFade) discard;
       vec3 n = normalize(vNormal);
+      vec4 tex;
+      #ifdef LEAVES
+        if (abs(vUvl.z - uHullLayer) < 0.5) {
+          // The crown's core: triplanar from world position, one tile per metre.
+          vec3 w = pow(abs(n), vec3(4.0));
+          w /= w.x + w.y + w.z;
+          tex = texture(uTex, vec3(vPos.zy, uHullLayer)) * w.x
+              + texture(uTex, vec3(vPos.xz, uHullLayer)) * w.y
+              + texture(uTex, vec3(vPos.xy, uHullLayer)) * w.z;
+        } else tex = texture(uTex, vUvl);
+      #else
+        tex = texture(uTex, vUvl);
+      #endif
+      if (cutout(tex.a)) discard;
       #ifdef LEAVES
         vec3 color = shade(tex.rgb, vPos, n, vAo, 0.45, 1.0);
       #else
-        vec3 color = shade(tex.rgb, vPos, n, vAo, 0.3, 0.0);
+        // Far away: the ground's own colour and light, so blades melt into it.
+        vec3 albedo = mix(tex.rgb, uGroundTint, vFar * 0.85);
+        vec3 color = shade(albedo, vPos, n, mix(vAo, 1.0, vFar), 0.3, 0.0);
       #endif
-      outColor = vec4(fog(color, vDepth), a);
+      outColor = vec4(fog(color, vDepth), 1.0);
     }
   `;
   const make = (defines) => new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     defines,
-    uniforms: { ...lightingUniforms(shadow), uTex: { value: texture } },
+    uniforms: {
+      ...lightingUniforms(shadow), uTex: { value: texture },
+      uHullLayer: { value: layerOf('leaves_hull') }, uGroundTint: { value: new THREE.Vector3(...averageColor('grass_top')) },
+    },
     vertexShader,
     fragmentShader,
     side: THREE.DoubleSide,
-    alphaToCoverage: true,
   });
   const materials = [make({ GRASS: '' }), make({ LEAVES: '' })];
 

@@ -93,8 +93,12 @@ export const LIGHTING_GLSL = /* glsl */ `
     return mix(color, uFogColor, f);
   }
 
-  // Alpha-to-coverage: sharpen a texture's alpha to a crisp edge about one pixel wide.
-  float cutoutAlpha(float a) {
-    return clamp((a - 0.5) / max(fwidth(a), 1e-4) + 0.5, 0.0, 1.0);
+  // Cutouts (glass, grass, leaves) are plain alpha tests: a pixel is either
+  // fully drawn or not. Not alpha-to-coverage: on many drivers (NVIDIA and
+  // D3D, which Chrome uses on Windows) it dithers partial coverage, which
+  // shows up as dots of whatever is behind, often sky, all over foliage.
+  // The hand-made mipmaps (textureArray.js) keep distant foliage full.
+  bool cutout(float a) {
+    return a < 0.5;
   }
 `;

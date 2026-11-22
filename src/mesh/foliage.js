@@ -15,7 +15,8 @@
  * canopy shades like one soft volume.
  *
  * Output per vertex: position (metres), normal, uvl (u, v, texture layer),
- * wind (how far it sways: 0 at a plant's root, 1 at the tip) and ao. Groups:
+ * wind (how far it sways: 0 at a plant's root, 1 at the tip), ao, and seed
+ * (0..1, one per grass clump: the distance at which it fades out). Groups:
  * { start, count, materialIndex } with 0 = grass/flowers, 1 = leaves.
  */
 
@@ -44,17 +45,18 @@ export function hash4(x, y, z, k) {
 }
 
 class Stream {
-  constructor() { this.pos = []; this.nrm = []; this.uvl = []; this.wind = []; this.ao = []; }
-  vertex(x, y, z, n, u, v, layer, wind, ao) {
+  constructor() { this.pos = []; this.nrm = []; this.uvl = []; this.wind = []; this.ao = []; this.seed = []; }
+  vertex(x, y, z, n, u, v, layer, wind, ao, seed = 0) {
     this.pos.push(x, y, z);
     this.nrm.push(n[0], n[1], n[2]);
     this.uvl.push(u, v, layer);
     this.wind.push(wind);
     this.ao.push(ao);
+    this.seed.push(seed);
   }
   /** Quad a-b-c-d (each [x, y, z, u, v, wind, ao]) as two triangles. */
-  quad(a, b, c, d, n, layer) {
-    for (const p of [a, b, c, a, c, d]) this.vertex(p[0], p[1], p[2], n, p[3], p[4], layer, p[5], p[6]);
+  quad(a, b, c, d, n, layer, seed = 0) {
+    for (const p of [a, b, c, a, c, d]) this.vertex(p[0], p[1], p[2], n, p[3], p[4], layer, p[5], p[6], seed);
   }
 }
 
@@ -72,7 +74,7 @@ export function meshFoliage(p, scale = 1) {
   const out = {
     position: new Float32Array(total * 3), normal: new Float32Array(total * 3),
     uvl: new Float32Array(total * 3), wind: new Float32Array(total), ao: new Float32Array(total),
-    groups: [], triangles: total / 3,
+    seed: new Float32Array(total), groups: [], triangles: total / 3,
   };
   let at = 0;
   [cross, leaves].forEach((s, materialIndex) => {
@@ -83,6 +85,7 @@ export function meshFoliage(p, scale = 1) {
     out.uvl.set(s.uvl, at * 3);
     out.wind.set(s.wind, at);
     out.ao.set(s.ao, at);
+    out.seed.set(s.seed, at);
     out.groups.push({ start: at, count: n, materialIndex });
     at += n;
   });
@@ -120,7 +123,7 @@ function crossPlants(p, scale, out) {
         const def = PLANTS[id];
         const layer = LAYER[id];
         for (let c = 0; c < def.clumps; c++) {
-          const r = (s) => hash4(gx, gy, gz, c * 8 + s);
+          const r = (s) => hash4(gx, gy, gz, c * 16 + s);
           const px = gx + 0.12 + 0.76 * r(0), pz = gz + 0.12 + 0.76 * r(1);
           // On the tangent plane through the crossing, kept within the voxel's reach.
           let h = h0 - (n[0] * (px - gx - 0.5) + n[2] * (pz - gz - 0.5)) / n[1];
@@ -130,6 +133,7 @@ function crossPlants(p, scale, out) {
           const a = r(4) * Math.PI;
           const lean = [(r(5) - 0.5) * 0.25 * H, (r(6) - 0.5) * 0.25 * H];
           const flip = r(7) < 0.5;
+          const seed = r(9) * 0.999;
           for (let q = 0; q < 2; q++) {
             const ang = a + q * Math.PI / 2;
             const dx = Math.cos(ang) * W / 2, dz = Math.sin(ang) * W / 2;
@@ -141,7 +145,7 @@ function crossPlants(p, scale, out) {
               v(px + dx + lean[0], h + H, pz + dz + lean[1], u1, 1, 1, 1),
               v(px - dx + lean[0], h + H, pz - dz + lean[1], u0, 1, 1, 1),
               // Ground normal: tufts shade like the ground they grow from.
-              n[1] > 0.999 ? up : n, layer,
+              n[1] > 0.999 ? up : n, layer, seed,
             );
           }
         }
@@ -214,8 +218,8 @@ function canopy(p, scale, out) {
     // Darker where there's more canopy just outside, and underneath.
     const outside = field(qx + nx * 1.5, qy + ny * 1.5, qz + nz * 1.5);
     const ao = (1 - Math.min(0.5, outside * 1.2)) * (0.72 + 0.28 * (ny * 0.5 + 0.5));
-    // Pull the shell in a little: the cards make the outline.
-    const inset = 0.25;
+    // Pull the shell well in: it's the dim inside of the crown, the cards make the outline.
+    const inset = 0.3;
     const s = vAo.length;
     vPos.push(qx - nx * inset, qy - ny * inset, qz - nz * inset);
     vNrm.push(nx, ny, nz);
@@ -246,23 +250,23 @@ function canopy(p, scale, out) {
             const s = quad[j] * 3;
             const x = world(vPos[s], 0), y = world(vPos[s + 1], 1), z = world(vPos[s + 2], 2);
             nv[0] = vNrm[s]; nv[1] = vNrm[s + 1]; nv[2] = vNrm[s + 2];
-            // Planar UVs along the normal's main axis, one tile per metre.
-            const ax = Math.abs(nv[0]), ay = Math.abs(nv[1]), az = Math.abs(nv[2]);
-            const [uu, vv] = ay >= ax && ay >= az ? [x, z] : ax >= az ? [z, y] : [x, y];
-            out.vertex(x, y, z, nv, uu, vv, HULL_LAYER, 0.12, vAo[quad[j]]);
+            // No UVs: the shader maps the core triplanar from its position
+            // (a projection per vertex would smear across triangles whose
+            // corners chose different ones). It doesn't sway, so it doesn't swim.
+            out.vertex(x, y, z, nv, 0, 0, HULL_LAYER, 0, vAo[quad[j]]);
           }
         }
       }
 
-  // Leaf cards over the hull: one or two per hull vertex, owned by the chunk
-  // that owns the cell's minimum corner (so neighbours don't double up).
-  const CARD = 0.95 / scale; // card size, voxels
+  // Leaf cards over the hull: on about half the hull vertices, owned by the
+  // chunk that owns the cell's minimum corner (so neighbours don't double up).
+  const CARD = 1.1 / scale; // card size, voxels
   for (let s = 0; s < vAo.length; s++) {
     const cx = vCell[s * 3], cy = vCell[s * 3 + 1], cz = vCell[s * 3 + 2];
     if (cx < PAD || cy < PAD || cz < PAD || cx >= PAD + size || cy >= PAD + size || cz >= PAD + size) continue;
     const gx = ox + cx - PAD, gy = oy + cy - PAD, gz = oz + cz - PAD;
     const n = [vNrm[s * 3], vNrm[s * 3 + 1], vNrm[s * 3 + 2]];
-    const count = hash4(gx, gy, gz, 90) < 0.5 ? 2 : 1;
+    const count = hash4(gx, gy, gz, 90) < 0.55 ? 1 : 0;
     for (let c = 0; c < count; c++) {
       const r = (k) => hash4(gx, gy, gz, 100 + c * 16 + k);
       // Card facing: the hull normal, tipped a random amount.

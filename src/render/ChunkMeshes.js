@@ -71,7 +71,7 @@ export class ChunkMeshes {
       this.version[index]++;
       worker.postMessage(
         { type: 'mesh', index, version: this.version[index], ...padded },
-        [padded.mat.buffer, padded.shape.buffer, padded.et.buffer, padded.en.buffer, ...(padded.plant ? [padded.plant.buffer] : [])],
+        [padded.mat.buffer, padded.shape.buffer, padded.off.buffer, padded.cut.buffer, padded.et.buffer, padded.en.buffer, ...(padded.plant ? [padded.plant.buffer] : [])],
       );
     }
   }
@@ -90,6 +90,7 @@ export class ChunkMeshes {
       g.setAttribute('normal', new THREE.BufferAttribute(solid.normal, 3));
       g.setAttribute('material', new THREE.BufferAttribute(solid.material, 1));
       g.setAttribute('ao', new THREE.BufferAttribute(solid.ao, 1));
+      g.setAttribute('local', new THREE.BufferAttribute(solid.local, 4));
       for (const grp of solid.groups) g.addGroup(grp.start, grp.count, grp.pass);
       g.computeBoundingSphere();
       g.computeBoundingBox();
@@ -104,6 +105,7 @@ export class ChunkMeshes {
       g.setAttribute('uvl', new THREE.BufferAttribute(foliage.uvl, 3));
       g.setAttribute('wind', new THREE.BufferAttribute(foliage.wind, 1));
       g.setAttribute('ao', new THREE.BufferAttribute(foliage.ao, 1));
+      g.setAttribute('seed', new THREE.BufferAttribute(foliage.seed, 1));
       for (const grp of foliage.groups) g.addGroup(grp.start, grp.count, grp.materialIndex);
       g.computeBoundingSphere();
       g.computeBoundingBox();

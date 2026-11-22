@@ -110,6 +110,23 @@ export class World {
     if (mat && c.plant) c.plant[i] = 0;
   }
 
+  /** Was voxel (x, y, z)'s +axis edge opened by an edit (a cut surface)? */
+  getCut(x, y, z, axis) {
+    if (!this.inBounds(x, y, z)) return false;
+    const c = this.chunkAt(x, y, z);
+    return !!c.cut && ((c.cut[c.index(x & this.mask, y & this.mask, z & this.mask)] >> axis) & 1) === 1;
+  }
+
+  /** Mark (or clear) voxel (x, y, z)'s +axis edge as cut. Doesn't mark meshes dirty. */
+  setCut(x, y, z, axis, on = true) {
+    if (!this.inBounds(x, y, z)) return;
+    const c = this.chunkAt(x, y, z);
+    if (!on && !c.cut) return;
+    c.ensureCuts();
+    const i = c.index(x & this.mask, y & this.mask, z & this.mask);
+    c.cut[i] = on ? c.cut[i] | (1 << axis) : c.cut[i] & ~(1 << axis);
+  }
+
   /** Plant id in voxel (x, y, z) (0 = none). */
   getPlant(x, y, z) {
     if (!this.inBounds(x, y, z)) return 0;
@@ -199,6 +216,8 @@ export class World {
     const N = s + 2 * PAD;
     const mat = new Uint8Array(N * N * N);
     const shape = new Uint8Array(N * N * N);
+    const off = new Uint8Array(N * N * N); // building voxels: offset in their piece (bit 0 x, 1 y, 2 z)
+    const cut = new Uint8Array(N * N * N); // cut edges (bit per axis, see Chunk)
     const et = new Uint8Array(N * N * N * 3);
     const en = new Uint8Array(N * N * N * 6);
     const ox = cx * s, oy = cy * s, oz = cz * s;
@@ -221,6 +240,14 @@ export class World {
           const m = this.getMat(gx, gy, gz);
           mat[i] = m;
           shape[i] = this.getShape(gx, gy, gz);
+          if (shape[i]) {
+            const c = this.chunkAt(gx, gy, gz);
+            off[i] = c.shape[c.index(gx & this.mask, gy & this.mask, gz & this.mask)] >> 5;
+          }
+          if (this.inBounds(gx, gy, gz)) {
+            const c = this.chunkAt(gx, gy, gz);
+            if (c.cut) cut[i] = c.cut[c.index(gx & this.mask, gy & this.mask, gz & this.mask)];
+          }
           if (m) solid++;
           if (shape[i]) pieces++;
           if (plant && (plant[i] = this.getPlant(gx, gy, gz))) plants++;
@@ -242,6 +269,6 @@ export class World {
         }
     const uniform = pieces === 0 && plants === 0 && (solid === 0 || solid === N * N * N);
     if (!plants) plant = null;
-    return { mat, shape, et, en, plant, size: s, origin: [ox, oy, oz], uniform };
+    return { mat, shape, off, cut, et, en, plant, size: s, origin: [ox, oy, oz], uniform };
   }
 }

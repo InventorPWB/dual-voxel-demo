@@ -18,8 +18,8 @@ self.onmessage = (e) => {
     self.postMessage(
       { type: 'mesh', index: msg.index, version: msg.version, ms: performance.now() - t0, solid, foliage },
       [
-        solid.position.buffer, solid.normal.buffer, solid.material.buffer, solid.ao.buffer,
-        foliage.position.buffer, foliage.normal.buffer, foliage.uvl.buffer, foliage.wind.buffer, foliage.ao.buffer,
+        solid.position.buffer, solid.normal.buffer, solid.material.buffer, solid.ao.buffer, solid.local.buffer,
+        foliage.position.buffer, foliage.normal.buffer, foliage.uvl.buffer, foliage.wind.buffer, foliage.ao.buffer, foliage.seed.buffer,
       ],
     );
   }

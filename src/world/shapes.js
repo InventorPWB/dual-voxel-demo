@@ -229,6 +229,13 @@ function octantPolys(cx, cy, cz) {
   return polys;
 }
 
+/** Kind of surface a state belongs to, for texturing: 1 box or wedge, 2 round (pillar), 3 sphere. */
+export function shapeKind(state) {
+  if (state >= 10 && state < 14) return 2;
+  if (state >= 14 && state < 22) return 3;
+  return 1;
+}
+
 /** Is local point (x, y, z) (each 0..1 within the voxel) inside shape state `state`? */
 export function stateContains(state, x, y, z) {
   if (state === CUBE) return true;
