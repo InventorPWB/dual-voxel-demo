@@ -252,7 +252,7 @@ export class Interaction {
     const cells = [];
     for (let z = o[2]; z < o[2] + L[2]; z++)
       for (let y = o[1]; y < o[1] + L[1]; y++)
-        for (let x = o[0]; x < o[0] + L[0]; x++) if (this.world.getPlant(x, y, z) === PLANT.LEAVES) cells.push([x, y, z]);
+        for (let x = o[0]; x < o[0] + L[0]; x++) if (PLANT_KIND[this.world.getPlant(x, y, z)] >= 2) cells.push([x, y, z]);
     return { cells, leaves: true };
   }
 
@@ -394,7 +394,7 @@ export class Interaction {
       for (let z = Math.floor(c[2] - r); z <= Math.floor(c[2] + r); z++)
         for (let y = Math.floor(c[1] - r); y <= Math.floor(c[1] + r); y++)
           for (let x = Math.floor(c[0] - r); x <= Math.floor(c[0] + r); x++)
-            if (Math.hypot(x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]) <= r && w.getPlant(x, y, z) === PLANT.LEAVES) w.setPlant(x, y, z, 0);
+            if (Math.hypot(x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]) <= r && PLANT_KIND[w.getPlant(x, y, z)] >= 2) w.setPlant(x, y, z, 0);
       w.markDirtyBox(Math.floor(c[0] - r), Math.floor(c[1] - r), Math.floor(c[2] - r), Math.floor(c[0] + r), Math.floor(c[1] + r), Math.floor(c[2] + r));
       return;
     }

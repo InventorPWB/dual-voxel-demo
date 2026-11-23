@@ -24,6 +24,37 @@ const SWAY_GLSL = /* glsl */ `
   }
 `;
 
+/** Leaf cards carry their facing (`axis`); twigs, the other leaf-pass geometry, have none. */
+const CARD_GLSL = /* glsl */ `
+  in vec3 axis;
+  bool isCard() {
+    return dot(axis, axis) > 0.5;
+  }
+`;
+
+/**
+ * Whether to keep this fragment of a leaf card. Cards turned edge-on to you
+ * drop their leaves as they turn, one whole leaf at a time in a scattered order
+ * fixed per leaf (the rank layer gives each leaf of the texture its own
+ * random rank), instead of smearing into streaks or being cut by a moving
+ * edge. `plane` is the drawn triangle's plane.
+ * `near` (0..1) thins cards right in front of the camera the same way, so
+ * inside a crown you look through the leaves at arm's length, not at a
+ * screenful of one card.
+ * Needs uTex (the texture array) declared before it.
+ */
+const CARD_FADE_GLSL = /* glsl */ `
+  uniform float uRankLayer;
+  bool keepCard(vec3 plane, vec3 toViewer, vec2 uv, float near) {
+    float f = abs(dot(normalize(plane), toViewer));
+    float shown = smoothstep(0.06, 0.4, f) * near;
+    if (shown >= 1.0) return true;
+    // Full-size level: ranks are per leaf, not to be blurred (and this may
+    // run in a branch, where implicit mip selection isn't defined).
+    return textureLod(uTex, vec3(uv, uRankLayer), 0.0).r <= shown;
+  }
+`;
+
 /**
  * Materials for the foliage meshes (src/mesh/foliage.js), by group:
  * [grass/flowers, leaves]. Alpha-tested cutout cards, drawn from
@@ -40,8 +71,12 @@ export function createFoliageMaterials(shadow) {
     precision highp sampler2DArray;
     uniform sampler2DArray uTex;
   `;
+  const leafUniforms = { uRankLayer: { value: layerOf('leaves_rank') } };
   const vertexShader = /* glsl */ `
     ${SWAY_GLSL}
+    #ifdef LEAVES
+      ${CARD_GLSL}
+    #endif
     in vec3 uvl;
     in float wind;
     in float ao;
@@ -52,8 +87,14 @@ export function createFoliageMaterials(shadow) {
     out float vAo;
     out float vDepth;
     out float vFar;
+    out float vIsCard;
     void main() {
       float vFade;
+      #ifdef LEAVES
+        vIsCard = isCard() ? 1.0 : 0.0;
+      #else
+        vIsCard = 0.0;
+      #endif
       vec3 p = position + sway(position, wind);
       vPos = p;
       vNormal = normal;
@@ -73,6 +114,7 @@ export function createFoliageMaterials(shadow) {
       vDepth = -mv.z;
       gl_Position = projectionMatrix * mv;
       // Faded out: collapse the card so it costs nothing to rasterise.
+      // (Leaves always have vFade = 1 and seeds below it.)
       if (seed >= vFade) gl_Position = vec4(0.0, 0.0, 2.0, 1.0);
     }
   `;
@@ -85,27 +127,28 @@ export function createFoliageMaterials(shadow) {
     in float vAo;
     in float vDepth;
     in float vFar;
-    uniform float uHullLayer;
+    in float vIsCard;
     uniform vec3 uGroundTint;
+    ${CARD_FADE_GLSL}
     layout(location = 0) out vec4 outColor;
     void main() {
       vec3 n = normalize(vNormal);
       vec4 tex;
       #ifdef LEAVES
-        if (abs(vUvl.z - uHullLayer) < 0.5) {
-          // The crown's core: triplanar from world position, one tile per metre.
-          vec3 w = pow(abs(n), vec3(4.0));
-          w /= w.x + w.y + w.z;
-          tex = texture(uTex, vec3(vPos.zy, uHullLayer)) * w.x
-              + texture(uTex, vec3(vPos.xz, uHullLayer)) * w.y
-              + texture(uTex, vec3(vPos.xy, uHullLayer)) * w.z;
-        } else tex = texture(uTex, vUvl);
+        // Card's plane (derivatives taken here, outside any branch).
+        vec3 plane = cross(dFdx(vPos), dFdy(vPos));
+        tex = texture(uTex, vUvl);
+        if (vIsCard > 0.5) {
+          float near = smoothstep(0.25, 1.1, distance(cameraPosition, vPos));
+          if (!keepCard(plane, normalize(cameraPosition - vPos), vUvl.xy, near)) discard;
+        }
       #else
         tex = texture(uTex, vUvl);
       #endif
       if (cutout(tex.a)) discard;
       #ifdef LEAVES
-        vec3 color = shade(tex.rgb, vPos, n, vAo, 0.45, 1.0);
+        // Leaves wrap light and let the sun through; bark is lit as terrain wood is.
+        vec3 color = vIsCard > 0.5 ? shade(tex.rgb, vPos, n, vAo, 0.45, 1.0) : shade(tex.rgb, vPos, n, vAo, 0.2, 0.0);
       #else
         // Far away: the ground's own colour and light, so blades melt into it.
         vec3 albedo = mix(tex.rgb, uGroundTint, vFar * 0.85);
@@ -119,7 +162,7 @@ export function createFoliageMaterials(shadow) {
     defines,
     uniforms: {
       ...lightingUniforms(shadow), uTex: { value: texture },
-      uHullLayer: { value: layerOf('leaves_hull') }, uGroundTint: { value: new THREE.Vector3(...averageColor('grass_top')) },
+      ...leafUniforms, uGroundTint: { value: new THREE.Vector3(...averageColor('grass_top')) },
     },
     vertexShader,
     fragmentShader,
@@ -129,21 +172,34 @@ export function createFoliageMaterials(shadow) {
 
   const leafDepth = new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
-    uniforms: { uTex: { value: texture } },
+    uniforms: { uTex: { value: texture }, ...leafUniforms },
     vertexShader: /* glsl */ `
+      ${CARD_GLSL}
       in vec3 uvl;
       out vec3 vUvl;
+      out vec3 vPos;
+      out float vIsCard;
       void main() {
         vUvl = uvl;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+        vPos = position;
+        gl_Position = projectionMatrix * viewMatrix * vec4(vPos, 1.0);
+        vIsCard = isCard() ? 1.0 : 0.0;
       }
     `,
     fragmentShader: /* glsl */ `
       ${head}
+      ${CARD_FADE_GLSL}
       in vec3 vUvl;
+      in float vIsCard;
+      in vec3 vPos;
       layout(location = 0) out vec4 outColor;
       void main() {
+        vec3 plane = cross(dFdx(vPos), dFdy(vPos));
         if (texture(uTex, vUvl).a < 0.5) discard;
+        // Cards fade as the sun sees them, as they do for the camera
+        // (the sun camera is orthographic: towards it is its view's +z).
+        vec3 toSun = vec3(viewMatrix[0][2], viewMatrix[1][2], viewMatrix[2][2]);
+        if (vIsCard > 0.5 && !keepCard(plane, toSun, vUvl.xy, 1.0)) discard;
         outColor = vec4(1.0);
       }
     `,

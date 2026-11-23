@@ -9,31 +9,28 @@
  * two crossed cards, jittered by a hash of the world position, so re-meshing
  * after an edit nearby puts every tuft back exactly where it was.
  *
- * Leaves are drawn as a whole canopy: a smooth hull around the leaf voxels
- * (surface nets over a softened occupancy field), with leaf cards scattered
- * over it for a ragged outline. Hull normals are the field's gradient, so the
- * canopy shades like one soft volume.
+ * Leaves are leaf cards through and over the leaf voxels, shaded with a
+ * softened leaf field's gradient so each clump shades like one soft volume
+ * (see canopy). Twigs and branches are thin bark rods (see twigs).
  *
  * Output per vertex: position (metres), normal, uvl (u, v, texture layer),
- * wind (how far it sways: 0 at a plant's root, 1 at the tip), ao, and seed
- * (0..1, one per grass clump: the distance at which it fades out). Groups:
- * { start, count, materialIndex } with 0 = grass/flowers, 1 = leaves.
+ * wind (how far it sways: 0 at a plant's root, 1 at the tip), ao, seed (0..1:
+ * for a grass clump the distance at which it fades out), and for leaf cards
+ * center (the card's centre, metres; the vertex itself elsewhere) and axis
+ * (the card's facing; zero elsewhere, which is how the shader tells bark
+ * from leaves). Groups:
+ * { start, count, materialIndex } with 0 = grass/flowers, 1 = leaves and twigs.
  */
 
 import { unpackNormal } from '../world/normals.js';
 import { faceKey } from '../world/shapes.js';
-import { PLANTS, PLANT_KIND } from '../world/plants.js';
+import { PLANTS, PLANT_KIND, TWIG_RADIUS, TWIG_PARENT, DIRS26 } from '../world/plants.js';
 import { TEXTURE_NAMES } from '../render/textures.js';
 import { PAD } from './dualContour.js';
 
-const AX = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
-const LAYER = PLANTS.map((p) => (p.texture ? TEXTURE_NAMES.indexOf(p.texture) : 0));
-const HULL_LAYER = TEXTURE_NAMES.indexOf('leaves_hull');
+const UP = [0, 1, 0];
+const LAYER = Array.from(PLANTS, (p) => (p && p.texture ? TEXTURE_NAMES.indexOf(p.texture) : 0));
 const CARD_LAYER = TEXTURE_NAMES.indexOf('leaves');
-
-// Corner k of a cell is offset (k & 1, (k >> 1) & 1, (k >> 2) & 1).
-const CELL_EDGES = [];
-for (let a = 0; a < 8; a++) for (const bit of [1, 2, 4]) if (!(a & bit)) CELL_EDGES.push(a, a | bit);
 
 /** Hash of integer world coordinates and a salt, in [0, 1). */
 export function hash4(x, y, z, k) {
@@ -45,36 +42,54 @@ export function hash4(x, y, z, k) {
 }
 
 class Stream {
-  constructor() { this.pos = []; this.nrm = []; this.uvl = []; this.wind = []; this.ao = []; this.seed = []; }
-  vertex(x, y, z, n, u, v, layer, wind, ao, seed = 0) {
+  constructor() { this.pos = []; this.nrm = []; this.uvl = []; this.wind = []; this.ao = []; this.seed = []; this.center = []; this.axis = []; }
+  /** `card`: { center, axis } for a leaf card's vertices. */
+  vertex(x, y, z, n, u, v, layer, wind, ao, seed = 0, card = null) {
     this.pos.push(x, y, z);
     this.nrm.push(n[0], n[1], n[2]);
     this.uvl.push(u, v, layer);
     this.wind.push(wind);
     this.ao.push(ao);
     this.seed.push(seed);
+    if (card) {
+      this.center.push(card.center[0], card.center[1], card.center[2]);
+      this.axis.push(card.axis[0], card.axis[1], card.axis[2]);
+    } else {
+      this.center.push(x, y, z);
+      this.axis.push(0, 0, 0);
+    }
   }
-  /** Quad a-b-c-d (each [x, y, z, u, v, wind, ao]) as two triangles. */
-  quad(a, b, c, d, n, layer, seed = 0) {
-    for (const p of [a, b, c, a, c, d]) this.vertex(p[0], p[1], p[2], n, p[3], p[4], layer, p[5], p[6], seed);
+  /** Triangle a-b-c (each [x, y, z, u, v, wind, ao], and optionally its own normal). */
+  tri(a, b, c, n, layer) {
+    for (const p of [a, b, c]) this.vertex(p[0], p[1], p[2], p[7] || n, p[3], p[4], layer, p[5], p[6]);
+  }
+  /** Quad a-b-c-d (each [x, y, z, u, v, wind, ao], and optionally its own normal) as two triangles. */
+  quad(a, b, c, d, n, layer, seed = 0, card = null) {
+    for (const p of [a, b, c, a, c, d]) this.vertex(p[0], p[1], p[2], p[7] || n, p[3], p[4], layer, p[5], p[6], seed, card);
   }
 }
 
+export const DEFAULT_FOLIAGE_OPTIONS = { interiorCards: true };
+
 /**
- * @param {object} p      padded chunk from World.buildPadded (needs `plant`)
- * @param {number} scale  metres per voxel
+ * @param {object} p        padded chunk from World.buildPadded (needs `plant`)
+ * @param {number} scale    metres per voxel
+ * @param {object} options  { interiorCards: sparse cards through the inside of
+ *                          each crown, seen through its gaps and from within }
  */
-export function meshFoliage(p, scale = 1) {
+export function meshFoliage(p, scale = 1, options = DEFAULT_FOLIAGE_OPTIONS) {
   const cross = new Stream(), leaves = new Stream();
   if (p.plant) {
     crossPlants(p, scale, cross);
-    canopy(p, scale, leaves);
+    const field = leafField(p);
+    if (field) canopy(p, scale, leaves, field, options);
+    twigs(p, scale, leaves, field);
   }
   const total = cross.ao.length + leaves.ao.length;
   const out = {
     position: new Float32Array(total * 3), normal: new Float32Array(total * 3),
     uvl: new Float32Array(total * 3), wind: new Float32Array(total), ao: new Float32Array(total),
-    seed: new Float32Array(total), groups: [], triangles: total / 3,
+    seed: new Float32Array(total), center: new Float32Array(total * 3), axis: new Float32Array(total * 3), groups: [], triangles: total / 3,
   };
   let at = 0;
   [cross, leaves].forEach((s, materialIndex) => {
@@ -86,6 +101,8 @@ export function meshFoliage(p, scale = 1) {
     out.wind.set(s.wind, at);
     out.ao.set(s.ao, at);
     out.seed.set(s.seed, at);
+    out.center.set(s.center, at * 3);
+    out.axis.set(s.axis, at * 3);
     out.groups.push({ start: at, count: n, materialIndex });
     at += n;
   });
@@ -152,21 +169,20 @@ function crossPlants(p, scale, out) {
       }
 }
 
-// -------------------------------------------------------------------- canopy
+// ------------------------------------------------------------- leaf field
 
-/** Iso level of the softened leaf field the hull follows. */
-const ISO = 0.35;
-
-function canopy(p, scale, out) {
-  const { plant, size, origin } = p;
+/**
+ * The padded chunk's leaf voxels as a 0/1 grid, plus a softened field (part
+ * the voxel itself, part its 3×3×3 neighbourhood) for smooth normals and AO.
+ * Null if there are no leaves.
+ */
+function leafField(p) {
+  const { plant, size } = p;
   const N = size + 2 * PAD, NN = N * N;
-  const [ox, oy, oz] = origin;
   const LEAF = new Uint8Array(N * N * N);
   let any = false;
   for (let i = 0; i < LEAF.length; i++) if (PLANT_KIND[plant[i]] === 2) { LEAF[i] = 1; any = true; }
-  if (!any) return;
-
-  // Softened field: part the voxel itself, part its 3×3×3 neighbourhood.
+  if (!any) return null;
   const F = new Float32Array(N * N * N);
   for (let z = 1; z < N - 1; z++)
     for (let y = 1; y < N - 1; y++)
@@ -176,6 +192,7 @@ function canopy(p, scale, out) {
         for (let dz = -1; dz <= 1; dz++) for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) s += LEAF[i + dx + N * dy + NN * dz];
         F[i] = 0.4 * LEAF[i] + 0.6 * s / 27;
       }
+  /** Trilinear sample; coordinates are padded indices of voxel centres. */
   const field = (qx, qy, qz) => {
     const m = N - 1.0001;
     qx = Math.max(0, Math.min(m, qx)); qy = Math.max(0, Math.min(m, qy)); qz = Math.max(0, Math.min(m, qz));
@@ -186,110 +203,372 @@ function canopy(p, scale, out) {
     const c0 = c00 + (c10 - c00) * fy, c1 = c01 + (c11 - c01) * fy;
     return c0 + (c1 - c0) * fz;
   };
-
-  // One vertex per cell the hull passes through (cells span 8 voxel centres).
-  const C = size + 1, base = PAD - 1;
-  const slot = new Int32Array(C * C * C).fill(-1);
-  const vPos = [], vNrm = [], vAo = [], vCell = [];
-  const cell = (px, py, pz) => {
-    const key = (px - base) + C * ((py - base) + C * (pz - base));
-    if (slot[key] >= 0) return slot[key];
-    let sx = 0, sy = 0, sz = 0, cnt = 0;
-    for (let e = 0; e < CELL_EDGES.length; e += 2) {
-      const a = CELL_EDGES[e], b = CELL_EDGES[e + 1];
-      const ia = (px + (a & 1)) + N * (py + ((a >> 1) & 1)) + NN * (pz + ((a >> 2) & 1));
-      const ib = (px + (b & 1)) + N * (py + ((b >> 1) & 1)) + NN * (pz + ((b >> 2) & 1));
-      if (LEAF[ia] === LEAF[ib]) continue;
-      const fa = F[ia], fb = F[ib];
-      const t = Math.max(0.15, Math.min(0.85, Math.abs(fa - fb) > 1e-6 ? (fa - ISO) / (fa - fb) : 0.5));
-      const d = b - a;
-      sx += (a & 1) + (d === 1 ? t : 0);
-      sy += ((a >> 1) & 1) + (d === 2 ? t : 0);
-      sz += ((a >> 2) & 1) + (d === 4 ? t : 0);
-      cnt++;
-    }
-    const qx = px + sx / cnt, qy = py + sy / cnt, qz = pz + sz / cnt;
-    // Outward normal: down the field's gradient.
+  /** Outward normal (down the field's gradient) into n; returns the AO there. */
+  const shadeAt = (qx, qy, qz, n) => {
     let nx = field(qx - 1, qy, qz) - field(qx + 1, qy, qz);
     let ny = field(qx, qy - 1, qz) - field(qx, qy + 1, qz);
     let nz = field(qx, qy, qz - 1) - field(qx, qy, qz + 1);
-    const l = Math.hypot(nx, ny, nz) || 1;
-    nx /= l; ny /= l; nz /= l;
+    const l = Math.hypot(nx, ny, nz);
+    if (l < 1e-6) { nx = 0; ny = 1; nz = 0; } else { nx /= l; ny /= l; nz /= l; }
+    n[0] = nx; n[1] = ny; n[2] = nz;
     // Darker where there's more canopy just outside, and underneath.
     const outside = field(qx + nx * 1.5, qy + ny * 1.5, qz + nz * 1.5);
-    const ao = (1 - Math.min(0.5, outside * 1.2)) * (0.72 + 0.28 * (ny * 0.5 + 0.5));
-    // Pull the shell well in: it's the dim inside of the crown, the cards make the outline.
-    const inset = 0.3;
-    const s = vAo.length;
-    vPos.push(qx - nx * inset, qy - ny * inset, qz - nz * inset);
-    vNrm.push(nx, ny, nz);
-    vAo.push(ao);
-    vCell.push(px, py, pz);
-    slot[key] = s;
-    return s;
+    return (1 - Math.min(0.5, outside * 1.2)) * (0.72 + 0.28 * (ny * 0.5 + 0.5));
   };
-  const world = (q, k) => (q + [ox, oy, oz][k] - PAD + 0.5) * scale;
+  return { LEAF, F, N, NN, field, shadeAt };
+}
 
-  const quad = [0, 0, 0, 0];
-  const nv = [0, 0, 0];
+/**
+ * One leaf card centred on c (padded voxel-centre coordinates) with half-size
+ * `half` voxels, facing `facing` tipped up to `tilt` at random and turned in
+ * its plane by a quarter turn or more, give or take `spin` radians (a square
+ * card stays roughly square to its face's neighbours, so they overlap
+ * evenly); `r(k)` gives this card's random numbers. `shadeN` is its
+ * shading normal. Its centre and facing go along with it (for the shader's
+ * edge-on fade, and tests).
+ */
+function leafCard(out, c, facing, shadeN, half, ao, r, world, tilt, wobble = Math.PI) {
+  let ax = facing[0] + (r(0) - 0.5) * 2 * tilt, ay = facing[1] + (r(1) - 0.5) * 2 * tilt, az = facing[2] + (r(2) - 0.5) * 2 * tilt;
+  const al = Math.hypot(ax, ay, az) || 1;
+  ax /= al; ay /= al; az /= al;
+  // Tangent frame around it, spun randomly.
+  const ref = Math.abs(ay) < 0.9 ? [0, 1, 0] : [1, 0, 0];
+  let tx = ref[1] * az - ref[2] * ay, ty = ref[2] * ax - ref[0] * az, tz = ref[0] * ay - ref[1] * ax;
+  const tl = Math.hypot(tx, ty, tz);
+  tx /= tl; ty /= tl; tz /= tl;
+  let bx = ay * tz - az * ty, by = az * tx - ax * tz, bz = ax * ty - ay * tx;
+  const spin = Math.floor(r(3) * 4) * Math.PI / 2 + (r(11) - 0.5) * 2 * wobble, cs = Math.cos(spin), sn = Math.sin(spin);
+  [tx, ty, tz, bx, by, bz] = [tx * cs + bx * sn, ty * cs + by * sn, tz * cs + bz * sn, bx * cs - tx * sn, by * cs - ty * sn, bz * cs - tz * sn];
+  const tag = { center: [world(c[0], 0), world(c[1], 1), world(c[2], 2)], axis: [ax, ay, az] };
+  const shade = ao * (0.9 + 0.2 * r(9));
+  const corner = (su, sv) => {
+    const q = (k) => world(c[k] + ([tx, ty, tz][k] * su + [bx, by, bz][k] * sv) * half, k);
+    return [q(0), q(1), q(2), (su + 1) / 2, (sv + 1) / 2, 1, shade];
+  };
+  out.quad(corner(-1, -1), corner(1, -1), corner(1, 1), corner(-1, 1), shadeN, CARD_LAYER, 0, tag);
+}
+
+/**
+ * Of the candidate voxels (padded indices with their world coordinates), the
+ * one with the lowest hash in each 2×2×2 block. Blocks line up with chunks
+ * (their size is even), so every candidate of a block is in one chunk.
+ */
+function onePerBlock(candidates, salt) {
+  const best = new Map();
+  for (const c of candidates) {
+    const [, gx, gy, gz] = c;
+    const key = (gx >> 1) + 65536 * ((gy >> 1) + 65536 * (gz >> 1));
+    const h = hash4(gx, gy, gz, salt);
+    const b = best.get(key);
+    if (!b || h < b[0]) best.set(key, [h, c]);
+  }
+  return [...best.values()].map((b) => b[1]);
+}
+
+// -------------------------------------------------------------------- canopy
+
+/** Leaf card size (metres; each varies from 90% to 120% of it), on 0.5 m voxels. */
+const CARD_SIZE = 0.7;
+/** Cards per open leaf voxel. */
+const CARDS_PER_VOXEL = 2;
+
+/**
+ * Leaf cards, and nothing else: no shell, so you can see into a crown.
+ *
+ * Every open leaf voxel (one with a face against air rather than more
+ * leaves, twigs or anything solid) holds two cards, each a bit wider than
+ * the voxel, centred inside it give or take a quarter voxel: one turned
+ * every which way about the outward direction, one across it, so from any
+ * side one of them is turned your way. So the leaves roughly fill
+ * the space each voxel takes up: a placed 1 m block is a clump of leaves the
+ * size of the block, a wall is a leafy wall with the odd chink of light
+ * through it, and breaking voxels out takes their leaves with them. Their
+ * different angles keep the voxel grid from showing.
+ *
+ * Cards turned edge-on to you drop their leaves as they go (keepCard), so
+ * there are no streaks; the other cards around fill in.
+ *
+ * Inside (interiorCards): one card per 2×2×2 block of closed voxels, at any
+ * angle and darker, so the inside of a crown is leafy when seen through a
+ * gap or from within.
+ *
+ * Cards shade with the leaf field's gradient (outwards from the leaves as a
+ * whole), so a mass of leaves shades as one soft volume, not card by card.
+ */
+function canopy(p, scale, out, field, { interiorCards = false } = {}) {
+  const { size, origin, plant, mat } = p;
+  const { LEAF, N, NN, shadeAt } = field;
+  const [ox, oy, oz] = origin;
+  const world = (q, k) => (q + [ox, oy, oz][k] - PAD + 0.5) * scale;
+  const half = CARD_SIZE / scale / 2; // voxels
+  const step = [1, -1, N, -N, NN, -NN];
+  const n = [0, 0, 0];
+  const closed = [];
   for (let lz = 0; lz < size; lz++)
     for (let ly = 0; ly < size; ly++)
       for (let lx = 0; lx < size; lx++) {
         const px = lx + PAD, py = ly + PAD, pz = lz + PAD;
-        const ia = px + N * py + NN * pz;
-        for (let axis = 0; axis < 3; axis++) {
-          const d = AX[axis];
-          const ib = ia + d[0] + N * d[1] + NN * d[2];
-          if (LEAF[ia] === LEAF[ib]) continue;
-          const u = AX[(axis + 1) % 3], v = AX[(axis + 2) % 3];
-          quad[0] = cell(px - u[0] - v[0], py - u[1] - v[1], pz - u[2] - v[2]);
-          quad[1] = cell(px - v[0], py - v[1], pz - v[2]);
-          quad[2] = cell(px, py, pz);
-          quad[3] = cell(px - u[0], py - u[1], pz - u[2]);
-          for (const j of [0, 1, 2, 0, 2, 3]) {
-            const s = quad[j] * 3;
-            const x = world(vPos[s], 0), y = world(vPos[s + 1], 1), z = world(vPos[s + 2], 2);
-            nv[0] = vNrm[s]; nv[1] = vNrm[s + 1]; nv[2] = vNrm[s + 2];
-            // No UVs: the shader maps the core triplanar from its position
-            // (a projection per vertex would smear across triangles whose
-            // corners chose different ones). It doesn't sway, so it doesn't swim.
-            out.vertex(x, y, z, nv, 0, 0, HULL_LAYER, 0, vAo[quad[j]]);
+        const i = px + N * py + NN * pz;
+        if (!LEAF[i]) continue;
+        const gx = ox + lx, gy = oy + ly, gz = oz + lz;
+        const open = step.some((d) => !LEAF[i + d] && !mat[i + d] && PLANT_KIND[plant[i + d]] !== 3);
+        if (!open) { closed.push([i, gx, gy, gz]); continue; }
+        const ao = shadeAt(px, py, pz, n);
+        const facing = [n[0], n[1], n[2]];
+        for (let k = 0; k < CARDS_PER_VOXEL; k++) {
+          const r = (j) => hash4(gx, gy, gz, 100 + k * 16 + j);
+          // The first about the outward direction, the second across it, so
+          // from any side some card of the voxel is turned your way.
+          let f = facing;
+          if (k) {
+            const q = [r(12) - 0.5, r(13) - 0.5, r(14) - 0.5];
+            f = [facing[1] * q[2] - facing[2] * q[1], facing[2] * q[0] - facing[0] * q[2], facing[0] * q[1] - facing[1] * q[0]];
+            const l = Math.hypot(f[0], f[1], f[2]) || 1;
+            f = f.map((x) => x / l);
           }
+          const c = [px + (r(6) - 0.5) * 0.5 + facing[0] * 0.1, py + (r(7) - 0.5) * 0.5 + facing[1] * 0.1, pz + (r(8) - 0.5) * 0.5 + facing[2] * 0.1];
+          leafCard(out, c, f, facing, half * (0.9 + 0.3 * r(4)), ao, r, world, k ? 0.4 : 0.8);
         }
       }
+  if (interiorCards) {
+    for (const [i, gx, gy, gz] of onePerBlock(closed, 300)) {
+      const c0 = [i % N, ((i / N) | 0) % N, (i / NN) | 0];
+      const r = (k) => hash4(gx, gy, gz, 310 + k);
+      const c = [c0[0] + (r(6) - 0.5) * 0.8, c0[1] + (r(7) - 0.5) * 0.8, c0[2] + (r(8) - 0.5) * 0.8];
+      const ao = 0.75 * shadeAt(c[0], c[1], c[2], n);
+      // The field is flat in here, so its normal means little: shade as lit
+      // from above, and turn the card any way at all.
+      leafCard(out, c, UP, UP, half * (1.2 + 0.3 * r(4)), ao, r, world, 1.0);
+    }
+  }
+}
 
-  // Leaf cards over the hull: on about half the hull vertices, owned by the
-  // chunk that owns the cell's minimum corner (so neighbours don't double up).
-  const CARD = 1.1 / scale; // card size, voxels
-  for (let s = 0; s < vAo.length; s++) {
-    const cx = vCell[s * 3], cy = vCell[s * 3 + 1], cz = vCell[s * 3 + 2];
-    if (cx < PAD || cy < PAD || cz < PAD || cx >= PAD + size || cy >= PAD + size || cz >= PAD + size) continue;
-    const gx = ox + cx - PAD, gy = oy + cy - PAD, gz = oz + cz - PAD;
-    const n = [vNrm[s * 3], vNrm[s * 3 + 1], vNrm[s * 3 + 2]];
-    const count = hash4(gx, gy, gz, 90) < 0.55 ? 1 : 0;
-    for (let c = 0; c < count; c++) {
-      const r = (k) => hash4(gx, gy, gz, 100 + c * 16 + k);
-      // Card facing: the hull normal, tipped a random amount.
-      let ax = n[0] + (r(0) - 0.5) * 1.6, ay = n[1] + (r(1) - 0.5) * 1.6 + 0.2, az = n[2] + (r(2) - 0.5) * 1.6;
-      const al = Math.hypot(ax, ay, az) || 1;
-      ax /= al; ay /= al; az /= al;
-      // Tangent frame around it, spun randomly.
-      const ref = Math.abs(ay) < 0.9 ? [0, 1, 0] : [1, 0, 0];
-      let tx = ref[1] * az - ref[2] * ay, ty = ref[2] * ax - ref[0] * az, tz = ref[0] * ay - ref[1] * ax;
-      const tl = Math.hypot(tx, ty, tz);
-      tx /= tl; ty /= tl; tz /= tl;
-      let bx = ay * tz - az * ty, by = az * tx - ax * tz, bz = ax * ty - ay * tx;
-      const spin = r(3) * Math.PI * 2, cs = Math.cos(spin), sn = Math.sin(spin);
-      [tx, ty, tz, bx, by, bz] = [tx * cs + bx * sn, ty * cs + by * sn, tz * cs + bz * sn, bx * cs - tx * sn, by * cs - ty * sn, bz * cs - tz * sn];
-      const size2 = CARD * (0.8 + 0.45 * r(4)) / 2;
-      const push = 0.15 + 0.35 * r(5);
-      const jx = (r(6) - 0.5) * 0.6, jy = (r(7) - 0.5) * 0.6, jz = (r(8) - 0.5) * 0.6;
-      const px = vPos[s * 3] + n[0] * push + jx, py = vPos[s * 3 + 1] + n[1] * push + jy, pz = vPos[s * 3 + 2] + n[2] * push + jz;
-      const corner = (su, sv, u, v) => [
-        world(px + (tx * su + bx * sv) * size2, 0), world(py + (ty * su + by * sv) * size2, 1), world(pz + (tz * su + bz * sv) * size2, 2),
-        u, v, 1, vAo[s] * (0.9 + 0.2 * r(9)),
-      ];
-      out.quad(corner(-1, -1, 0, 0), corner(1, -1, 1, 0), corner(1, 1, 1, 1), corner(-1, 1, 0, 1), n, CARD_LAYER);
+// --------------------------------------------------------------------- twigs
+
+const ROD_SIDES = 8;
+/** How far (voxels) a tube growing out of wood runs back into it. */
+const ROOT_DEPTH = 1.6;
+const SNAP = DIRS26.map(([x, y, z]) => { const l = Math.hypot(x, y, z); return [x / l, y / l, z / l]; });
+/** Padded-index offset of each DIRS26 direction, for a padded chunk N voxels across. */
+const dirSteps = (N) => DIRS26.map(([dx, dy, dz]) => dx + N * dy + N * N * dz);
+
+/**
+ * A frame [u, w] square to unit direction t: +y turned onto t by the shortest
+ * rotation. It depends only on t and changes smoothly with it (except
+ * pointing straight down), so rings with nearly the same direction line up.
+ */
+function frame(t) {
+  const [x, y, z] = t, k = 1 + y;
+  if (k < 1e-6) return [[-1, 0, 0], [0, 0, 1]];
+  return [[y + (z * z) / k, -x, (-x * z) / k], [(-x * z) / k, -z, y + (x * x) / k]];
+}
+
+/**
+ * Twigs, branches and boughs. Each twig voxel knows the neighbour it grows
+ * from (see plants.js), so they form an exact tree, drawn as one continuous
+ * eight-sided bark tube along each chain of voxels, tapering with the kinds'
+ * radii. Where a tube grows out of wood (a trunk or limb) it carries
+ * straight on back into it, so it's joined on without a kink.
+ *
+ * Voxel centres alone make a staircase of 45° and 90° steps, so the tube
+ * runs through smoothed points instead: two rounds of moving each voxel
+ * towards the middle of its parent and its main child (its thickest), so a
+ * bough runs smoothly on through the forks where side shoots leave it.
+ * Consecutive pieces share the ring where they meet, square to the chain's
+ * direction there (from parent to main child), so bends have no gaps or
+ * creases; a side shoot's last ring just sinks into the thicker wood it
+ * joins. Normals are smooth round the tube, and the bark is tiled to the
+ * tube's girth and runs on along it.
+ *
+ * Everything here needs only voxels within three steps, all inside the
+ * padding, so neighbouring chunks agree on every shared ring.
+ *
+ * Owned by the chunk of the child voxel.
+ */
+function twigs(p, scale, out, field) {
+  const { plant, mat, size, origin } = p;
+  const N = size + 2 * PAD, NN = N * N;
+  const [ox, oy, oz] = origin;
+  const step = dirSteps(N);
+  const world = (q, k) => (q + [ox, oy, oz][k] - PAD + 0.5) * scale;
+  const coords = (i) => [i % N, ((i / N) | 0) % N, (i / NN) | 0];
+
+  // Twig voxels with their parent and children (a parent off the array's
+  // edge counts as none: it's three voxels from anything drawn here).
+  const parentOf = new Map(), children = new Map();
+  for (let z = 0; z < N; z++)
+    for (let y = 0; y < N; y++)
+      for (let x = 0; x < N; x++) {
+        const i = x + N * y + NN * z;
+        const d = TWIG_PARENT[plant[i]];
+        if (PLANT_KIND[plant[i]] !== 3) continue;
+        let par = -1;
+        if (d >= 0) {
+          const [dx, dy, dz] = DIRS26[d];
+          const qx = x + dx, qy = y + dy, qz = z + dz;
+          if (qx >= 0 && qy >= 0 && qz >= 0 && qx < N && qy < N && qz < N) par = i + step[d];
+        }
+        parentOf.set(i, par);
+        if (par >= 0) {
+          if (!children.has(par)) children.set(par, []);
+          children.get(par).push(i);
+        }
+      }
+  if (!parentOf.size) return;
+  // Each voxel's main child: its thickest (the first, of equals).
+  const main = new Map();
+  for (const [i, kids] of children) {
+    let best = kids[0];
+    for (const c of kids) if (TWIG_RADIUS[plant[c]] > TWIG_RADIUS[plant[best]]) best = c;
+    main.set(i, best);
+  }
+  const twig = (i) => i >= 0 && parentOf.has(i);
+
+  // Smoothed points along each chain.
+  // and radii, likewise smoothed, so the steps between the wood's sizes
+  // become an even taper.
+  let pts = new Map(), rad = new Map();
+  for (const i of parentOf.keys()) { pts.set(i, coords(i)); rad.set(i, TWIG_RADIUS[plant[i]]); }
+  const point = (i) => pts.get(i) || coords(i);
+  const radius = (i) => rad.get(i) ?? TWIG_RADIUS[plant[i]];
+  for (let round = 0; round < 2; round++) {
+    const next = new Map(), nextR = new Map();
+    for (const [i, par] of parentOf) {
+      const here = point(i);
+      if (!twig(par) || !main.has(i)) { next.set(i, here); nextR.set(i, radius(i)); continue; }
+      const a = point(par), b = point(main.get(i));
+      next.set(i, [0, 1, 2].map((k) => 0.5 * here[k] + 0.25 * (a[k] + b[k])));
+      nextR.set(i, 0.5 * radius(i) + 0.25 * (radius(par) + radius(main.get(i))));
+    }
+    pts = next;
+    rad = nextR;
+  }
+  const unit = (d) => {
+    const l = Math.hypot(d[0], d[1], d[2]);
+    return l > 1e-6 ? [d[0] / l, d[1] / l, d[2] / l] : null;
+  };
+  // Where the wood is from a twig voxel growing out of it: the mean
+  // direction to the solid voxels within two steps (nearer ones counting
+  // more), so a tube's root heads into the wood's middle, not just into
+  // the voxel it was joined to.
+  const woodDir = new Map();
+  const intoWood = (i) => {
+    if (woodDir.has(i)) return woodDir.get(i);
+    const [x, y, z] = coords(i);
+    const d = [0, 0, 0];
+    for (let dz = -2; dz <= 2; dz++)
+      for (let dy = -2; dy <= 2; dy++)
+        for (let dx = -2; dx <= 2; dx++) {
+          const qx = x + dx, qy = y + dy, qz = z + dz;
+          if (!(dx || dy || dz) || qx < 0 || qy < 0 || qz < 0 || qx >= N || qy >= N || qz >= N || !mat[qx + N * qy + NN * qz]) continue;
+          const w = 1 / (dx * dx + dy * dy + dz * dz);
+          d[0] += dx * w; d[1] += dy * w; d[2] += dz * w;
+        }
+    const r = unit(d) || unit(DIRS26[TWIG_PARENT[plant[i]]]);
+    woodDir.set(i, r);
+    return r;
+  };
+  // The chain's direction through voxel i (towards its parent), or null at
+  // a root or tip. Where it grows out of wood, halfway between the way it
+  // comes from (two voxels along, so it isn't held to 45° steps) and the
+  // way into the wood, so the bend there is mitred too.
+  const along = (i) => {
+    const par = parentOf.get(i);
+    if (par < 0 || !main.has(i)) return null;
+    const c = main.get(i);
+    if (mat[par]) {
+      const from = unit(coords(i).map((q, k) => q - coords(main.has(c) ? main.get(c) : c)[k]));
+      const into = intoWood(i);
+      return (from && unit(from.map((q, k) => q + into[k]))) || into;
+    }
+    const a = coords(par), b = coords(c);
+    return unit([a[0] - b[0], a[1] - b[1], a[2] - b[2]]);
+  };
+
+  // Bark is tiled once a metre, as on terrain wood: round each ring a whole
+  // number of times, and along the tube by distance along the nearest of
+  // the 26 directions to its own, so rings shared by two pieces agree and
+  // the bark runs on unbroken until the tube turns past 22°.
+  const ring = (c, t, r) => {
+    const [u, w] = frame(t);
+    const tiles = Math.max(1, Math.round(2 * Math.PI * r));
+    const at = [world(c[0], 0), world(c[1], 1), world(c[2], 2)];
+    let axis = 0, best = -2;
+    for (let k = 0; k < SNAP.length; k++) {
+      const q = SNAP[k], dq = q[0] * t[0] + q[1] * t[1] + q[2] * t[2];
+      if (dq > best) { best = dq; axis = k; }
+    }
+    const q = SNAP[axis];
+    const v = at[0] * q[0] + at[1] * q[1] + at[2] * q[2];
+    const verts = [];
+    for (let k = 0; k <= ROD_SIDES; k++) {
+      const ang = (k / ROD_SIDES) * Math.PI * 2, cs = Math.cos(ang), sn = Math.sin(ang);
+      const e = [cs * u[0] + sn * w[0], cs * u[1] + sn * w[1], cs * u[2] + sn * w[2]];
+      verts.push({ p: [at[0] + e[0] * r, at[1] + e[1] * r, at[2] + e[2] * r], e, u: (k / ROD_SIDES) * tiles });
+    }
+    return { verts, v, axis };
+  };
+  // How far a tube growing out of wood can run back into it: to just short
+  // of where it would come out again (through a thin limb, at a side
+  // branch's steep angle), at most ROOT_DEPTH.
+  const solidAt = (q) => {
+    const x = Math.round(q[0]), y = Math.round(q[1]), z = Math.round(q[2]);
+    return x >= 0 && y >= 0 && z >= 0 && x < N && y < N && z < N && !!mat[x + N * y + NN * z];
+  };
+  const rootDepth = (a, dir) => {
+    let inside = -1;
+    for (let s = 0.25; s <= ROOT_DEPTH + 0.5; s += 0.25) {
+      const solid = solidAt([a[0] + dir[0] * s, a[1] + dir[1] * s, a[2] + dir[2] * s]);
+      if (solid && inside < 0) inside = s;
+      if (!solid && inside >= 0) return Math.max(inside + 0.25, Math.min(ROOT_DEPTH, s - 0.5));
+    }
+    return ROOT_DEPTH;
+  };
+  const n = [0, 0, 0];
+  // Only a little darker inside the leaves, so it matches the terrain wood it grows from.
+  const aoAt = (q) => (field ? 1 - 0.35 * (1 - field.shadeAt(q[0], q[1], q[2], n)) : 1);
+  for (const [i, par] of parentOf) {
+    if (par < 0) continue;
+    const [x, y, z] = coords(i);
+    if (x < PAD || y < PAD || z < PAD || x >= PAD + size || y >= PAD + size || z >= PAD + size) continue;
+    const id = plant[i];
+    const wood = !!mat[par];
+    if (!wood && !twig(par)) continue; // its parent was broken off
+    const a = point(i);
+    const root = wood && intoWood(i);
+    // Out of wood: carry straight on back into it, rather than bending to
+    // the wood voxel's centre, which may be off to one side.
+    const b = root ? [0, 1, 2].map((k) => a[k] + root[k] * rootDepth(a, root)) : wood ? coords(par) : point(par);
+    const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    const len = Math.hypot(d[0], d[1], d[2]);
+    if (len < 1e-6) continue;
+    const dir = [d[0] / len, d[1] / len, d[2] / len];
+    const ta = along(i) || dir;
+    const tb = root || (!wood && main.get(par) === i && along(par)) || dir;
+    // Into wood: tapering away inside it. Into a thicker stem it leaves from
+    // the side: as thick as itself, sunk in that stem's middle.
+    const ra = radius(i), rb = wood ? ra * 0.5 : main.get(par) === i ? radius(par) : Math.min(ra, radius(par));
+    const A = ring(a, ta, ra), B = ring(b, tb, rb);
+    const lenM = len * scale;
+    let vb = B.v;
+    if (A.axis !== B.axis || Math.abs(vb - A.v - lenM) > 0.5 * lenM) vb = A.v + lenM;
+    const ao = aoAt([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2]);
+    const corner = (q, vv) => [q.p[0], q.p[1], q.p[2], q.u, vv, 0, ao, q.e];
+    for (let k = 0; k < ROD_SIDES; k++) {
+      out.quad(corner(A.verts[k], A.v), corner(A.verts[k + 1], A.v), corner(B.verts[k + 1], vb), corner(B.verts[k], vb),
+        A.verts[k].e, LAYER[id]);
+    }
+    // Close the ends no other piece shares, so you never see into the tube:
+    // where it sinks into wood, a flat end; at a tip, a short point.
+    if (wood) {
+      const c = [world(b[0], 0), world(b[1], 1), world(b[2], 2), 0.5, vb, 0, ao, tb];
+      for (let k = 0; k < ROD_SIDES; k++) out.tri(c, corner(B.verts[k + 1], vb), corner(B.verts[k], vb), tb, LAYER[id]);
+    }
+    if (!children.has(i)) {
+      const tip = [0, 1, 2].map((k) => a[k] - dir[k] * (ra / scale) * 1.5);
+      const back = [-dir[0], -dir[1], -dir[2]];
+      const c = [world(tip[0], 0), world(tip[1], 1), world(tip[2], 2), 0.5, A.v - ra * 1.5, 0, ao, back];
+      for (let k = 0; k < ROD_SIDES; k++) out.tri(c, corner(A.verts[k], A.v), corner(A.verts[k + 1], A.v), back, LAYER[id]);
     }
   }
 }

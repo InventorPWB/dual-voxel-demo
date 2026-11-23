@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { World, VOXEL } from '../src/world/World.js';
 import { MAT, CRISP, PASS_OPAQUE, PASS_CUTOUT, PASS_TRANSLUCENT } from '../src/world/materials.js';
-import { PLANT, supportsPlant, settlePlants } from '../src/world/plants.js';
+import { PLANT, PLANTS, PLANT_KIND, TWIG_PARENT, TWIG_RADIUS, DIRS26, supportsPlant, settlePlants } from '../src/world/plants.js';
 import { placeShape, sculptSphere, removeShape, removeSpecks, breakAt } from '../src/world/edits.js';
 import { SHAPE, placement } from '../src/world/shapes.js';
 import { growGrass, growTree, rng } from '../src/world/trees.js';
@@ -111,6 +111,83 @@ describe('plant layer', () => {
     expect([...key(after)].sort()).toEqual([...key(before)].sort());
   });
 
+  it('scatters cards through the inside of a crown when asked, only well inside it', () => {
+    const w = new World(1, 2, 1, 16);
+    for (let z = 2; z < 14; z++) for (let y = 18; y < 30; y++) for (let x = 2; x < 14; x++) w.setPlant(x, y, z, PLANT.LEAVES);
+    const cardsIn = (f, lo, hi) => {
+      let n = 0;
+      for (let v = 0; v < f.triangles * 3; v += 6) {
+        if (!f.axis[v * 3] && !f.axis[v * 3 + 1] && !f.axis[v * 3 + 2]) continue;
+        const c = [0, 1, 2].map((k) => f.center[v * 3 + k] / VOXEL);
+        if (c.every((x, k) => x > lo[k] && x < hi[k])) n++;
+      }
+      return n;
+    };
+    const lo = [5, 21, 5], hi = [11, 27, 11]; // well inside the 12³ block
+    const without = meshFoliage(w.buildPadded(0, 1, 0), VOXEL, {});
+    const withIn = meshFoliage(w.buildPadded(0, 1, 0), VOXEL, { interiorCards: true });
+    expect(cardsIn(without, lo, hi)).toBe(0);
+    expect(cardsIn(withIn, lo, hi)).toBeGreaterThan(5);
+  });
+
+  // Leaf cards of a mesh: { c: centre, n: facing, u, v: half-axes } (metres), from each card's first triangle.
+  const leafCards = (f) => {
+    const out = [];
+    const at = (v) => [0, 1, 2].map((k) => f.position[v * 3 + k]);
+    for (let v = 0; v < f.triangles * 3; v += 6) {
+      if (!f.axis[v * 3] && !f.axis[v * 3 + 1] && !f.axis[v * 3 + 2]) continue;
+      const a = at(v), b = at(v + 1), d = at(v + 5);
+      out.push({
+        c: [0, 1, 2].map((k) => f.center[v * 3 + k]), n: [0, 1, 2].map((k) => f.axis[v * 3 + k]),
+        u: b.map((x, k) => (x - a[k]) / 2), v: d.map((x, k) => (x - a[k]) / 2),
+      });
+    }
+    return out;
+  };
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+
+  it('fills a placed 1 m block of leaves with angled cards, roughly within it', () => {
+    const w = new World(1, 2, 1, 16);
+    for (let z = 8; z < 10; z++) for (let y = 20; y < 22; y++) for (let x = 8; x < 10; x++) w.setPlant(x, y, z, PLANT.LEAVES);
+    const cards = leafCards(meshFoliage(w.buildPadded(0, 1, 0), VOXEL));
+    // 2×2×2 voxels, all open: two cards each.
+    expect(cards.length).toBe(16);
+    const facings = new Set();
+    for (const { c, n } of cards) {
+      // Centred within the block, give or take a third of a voxel.
+      for (const [k, lo] of [[0, 8], [1, 20], [2, 8]]) {
+        expect(c[k] / VOXEL).toBeGreaterThan(lo - 0.35);
+        expect(c[k] / VOXEL).toBeLessThan(lo + 2.35);
+      }
+      facings.add(n.map((x) => Math.round(x * 2)).join());
+    }
+    // Turned all sorts of ways, not lined up with the grid.
+    expect(facings.size).toBeGreaterThan(8);
+  });
+
+  it('covers a flat wall of leaves mostly, with a few chinks of light', () => {
+    const w = new World(1, 2, 1, 16);
+    // A 3 m × 2 m wall, 1 m thick.
+    for (let z = 8; z < 10; z++) for (let y = 18; y < 22; y++) for (let x = 2; x < 8; x++) w.setPlant(x, y, z, PLANT.LEAVES);
+    const cards = leafCards(meshFoliage(w.buildPadded(0, 1, 0), VOXEL));
+    // Look straight through it along z, away from its rim: is the ray
+    // stopped by the solid middle (the inner 80%) of some card?
+    let hit = 0, all = 0;
+    for (let y = 18.5; y < 21.6; y += 0.1)
+      for (let x = 2.5; x < 7.6; x += 0.1) {
+        all++;
+        const p = [x * VOXEL, y * VOXEL, 0];
+        if (cards.some(({ c, n, u, v }) => {
+          if (Math.abs(n[2]) < 0.2) return false; // nearly edge-on: dropped
+          const t = (dot(c, n) - dot(p, n)) / n[2];
+          const d = [p[0] - c[0], p[1] - c[1], t - c[2]];
+          return Math.abs(dot(d, u) / dot(u, u)) < 0.8 && Math.abs(dot(d, v) / dot(v, v)) < 0.8;
+        })) hit++;
+      }
+    expect(hit / all).toBeGreaterThan(0.9);
+    expect(hit / all).toBeLessThan(1);
+  });
+
   it('keeps an all-air chunk with leaves for meshing', () => {
     const w = new World(1, 2, 1, 16);
     w.setPlant(8, 24, 8, PLANT.LEAVES);
@@ -135,6 +212,120 @@ describe('trees', () => {
             expect(w.isSolid(x, y, z)).toBe(false);
           }
     expect(leaves).toBeGreaterThan(200);
+  });
+
+  it('carries the limbs on as branches and twigs in the plant layer, drawn as bark rods', () => {
+    const w = flatWorld(3, 16);
+    growTree(w, 24, 24, rng(5));
+    let twigs = 0, branches = 0, boughs = 0;
+    for (let z = 0; z < w.sz; z++)
+      for (let y = 0; y < w.sy; y++)
+        for (let x = 0; x < w.sx; x++) {
+          const p = w.getPlant(x, y, z);
+          if (PLANTS[p]?.name === 'Twig') twigs++;
+          if (PLANTS[p]?.name === 'Branch') branches++;
+          if (PLANTS[p]?.name === 'Bough') boughs++;
+          if (p) expect(w.isSolid(x, y, z)).toBe(false);
+        }
+    // Wood of every size, from boughs down to twigs.
+    expect(twigs).toBeGreaterThan(10);
+    expect(branches).toBeGreaterThan(10);
+    expect(boughs).toBeGreaterThan(0);
+    // The foliage mesh has bark (no facing) as well as leaf cards.
+    let bark = 0, cards = 0;
+    for (let cz = 0; cz < w.nz; cz++)
+      for (let cy = 0; cy < w.ny; cy++)
+        for (let cx = 0; cx < w.nx; cx++) {
+          const p = w.buildPadded(cx, cy, cz);
+          if (p.uniform) continue;
+          const f = meshFoliage(p, VOXEL);
+          for (const g of f.groups) {
+            if (g.materialIndex !== 1) continue;
+            for (let v = g.start; v < g.start + g.count; v += 3) (f.axis[v * 3] || f.axis[v * 3 + 1] || f.axis[v * 3 + 2]) ? cards++ : bark++;
+          }
+        }
+    expect(bark).toBeGreaterThan(100);
+    expect(cards).toBeGreaterThan(500);
+  });
+
+  it('links every twig back to the wood, and every leaf to a twig', () => {
+    for (let seed = 1; seed <= 4; seed++) {
+      const w = flatWorld(3, 16);
+      growTree(w, 24, 24, rng(seed));
+      const twigs = [], leaves = [];
+      for (let z = 0; z < w.sz; z++)
+        for (let y = 0; y < w.sy; y++)
+          for (let x = 0; x < w.sx; x++) {
+            const p = w.getPlant(x, y, z);
+            if (PLANT_KIND[p] === 3) twigs.push([x, y, z]);
+            if (p === PLANT.LEAVES) leaves.push([x, y, z]);
+          }
+      // Follow each twig's parents: they end in wood, never in thin air or a loop.
+      for (const t of twigs) {
+        let v = t;
+        for (let steps = 0; ; steps++) {
+          expect(steps, `seed ${seed}`).toBeLessThan(200);
+          if (w.isSolid(...v)) break;
+          const d = TWIG_PARENT[w.getPlant(...v)];
+          expect(d, `seed ${seed}: twig at ${v} has no parent`).toBeGreaterThanOrEqual(0);
+          v = v.map((c, k) => c + DIRS26[d][k]);
+          expect(w.isSolid(...v) || PLANT_KIND[w.getPlant(...v)] === 3, `seed ${seed}: parent of ${t}`).toBe(true);
+        }
+      }
+      // Every leaf reaches a twig through leaves, face to face.
+      const key = (v) => v.join();
+      const seen = new Set(twigs.map(key));
+      const stack = twigs.slice();
+      while (stack.length) {
+        const v = stack.pop();
+        for (const d of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+          const u = v.map((c, k) => c + d[k]);
+          if (seen.has(key(u)) || w.getPlant(...u) !== PLANT.LEAVES) continue;
+          seen.add(key(u));
+          stack.push(u);
+        }
+      }
+      expect(leaves.filter((v) => !seen.has(key(v))), `seed ${seed}`).toEqual([]);
+      expect(leaves.length).toBeGreaterThan(1500);
+    }
+  });
+
+  it('sinks the root of every tube growing out of the wood into it, out of sight', () => {
+    // As the mesher does (foliage.js twigs): a tube growing out of wood runs
+    // back towards the wood around it, to just short of coming out again,
+    // and narrows to half as it goes; its end ring must be inside the wood.
+    for (let seed = 1; seed <= 10; seed++) {
+      const w = flatWorld(4, 16);
+      const debug = {};
+      growTree(w, 32, 32, rng(seed), debug);
+      const solid = (q) => w.isSolid(Math.floor(q[0]), Math.floor(q[1]), Math.floor(q[2]));
+      for (let z = 0; z < w.sz; z++)
+        for (let y = 0; y < w.sy; y++)
+          for (let x = 0; x < w.sx; x++) {
+            const p = w.getPlant(x, y, z);
+            const o = DIRS26[TWIG_PARENT[p]];
+            if (PLANT_KIND[p] !== 3 || !o || !w.isSolid(x + o[0], y + o[1], z + o[2])) continue;
+            let d = [0, 0, 0];
+            for (let dz = -2; dz <= 2; dz++)
+              for (let dy = -2; dy <= 2; dy++)
+                for (let dx = -2; dx <= 2; dx++) {
+                  if (!(dx || dy || dz) || !w.isSolid(x + dx, y + dy, z + dz)) continue;
+                  const k = 1 / (dx * dx + dy * dy + dz * dz);
+                  d = [d[0] + dx * k, d[1] + dy * k, d[2] + dz * k];
+                }
+            d = d.map((c) => c / Math.hypot(...d));
+            const a = [x + 0.5, y + 0.5, z + 0.5];
+            let depth = 1.6, inside = -1;
+            for (let s = 0.25; s <= 2.1; s += 0.25) {
+              const now = solid(a.map((c, k) => c + d[k] * s));
+              if (now && inside < 0) inside = s;
+              if (!now && inside >= 0) { depth = Math.max(inside + 0.25, Math.min(1.6, s - 0.5)); break; }
+            }
+            const b = a.map((c, k) => c + d[k] * depth);
+            const ring = (TWIG_RADIUS[p] * 0.5) / VOXEL;
+            expect(ring - debug.sdf(...b), `seed ${seed}: tube root at ${[x, y, z]}`).toBeLessThan(0.15);
+          }
+    }
   });
 
   it('draws wood cut open by an edit as end grain, at any angle, and the outside as bark', () => {

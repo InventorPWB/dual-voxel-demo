@@ -14,6 +14,7 @@ export const CONTROLS = [
   ['Paint', 'Shift + right mouse'],
   ['Choose item', '1–9 or mouse wheel'],
   ['Inventory', 'E'],
+  ['Settings', 'O'],
   ['Brush size', 'Alt + wheel'],
   ['Move the sun', '[ and ]'],
   ['Help', 'H'],
@@ -192,14 +193,14 @@ export class Hud {
 
   updateHint() {
     const playing = document.body.classList.contains('playing');
-    if (playing || this.inventoryOpen) {
+    if (playing || this.inventoryOpen || document.body.classList.contains('settings')) {
       this.hint.classList.add('hidden');
       return;
     }
     this.hint.classList.remove('hidden');
     this.hint.innerHTML = this.loadingText
       ? this.loadingText
-      : `Click to ${this.started ? 'resume' : 'play'} <span class="k">· H for controls</span>`;
+      : `Click to ${this.started ? 'resume' : 'play'} <span class="k">· H for controls · O for settings</span>`;
   }
 
   note(text) {

@@ -11,6 +11,7 @@ import { Player } from './player/Player.js';
 import { Interaction } from './items/interaction.js';
 import { defaultHotbar } from './items/items.js';
 import { Hud, Hotbar } from './ui/hud.js';
+import { Settings } from './ui/settings.js';
 
 // ---- scene ------------------------------------------------------------------
 
@@ -43,6 +44,24 @@ attachMipmaps(renderer);
 const chunkMeshes = new ChunkMeshes(world, scene, createChunkMaterials(shadow), createFoliageMaterials(shadow));
 const uTime = lightingUniforms(shadow).uTime;
 chunkMeshes.onChange = () => { shadow.dirty = true; };
+
+// ---- settings ------------------------------------------------------------------
+
+const settings = new Settings();
+function applySettings(key) {
+  const v = settings.values;
+  // Leaves inside crowns are meshed in: re-mesh when it changes (not on the
+  // first call; nothing's meshed yet).
+  const options = { interiorCards: v.leafInterior };
+  if (!meshedWith || options.interiorCards !== meshedWith.interiorCards) {
+    chunkMeshes.setFoliageOptions(options, !!key);
+    meshedWith = options;
+  }
+}
+let meshedWith = null;
+applySettings();
+settings.onChange = applySettings;
+
 const player = new Player(world, camera, () => chunkMeshes.list);
 const interaction = new Interaction({ world, scene, camera, chunkMeshes, player, hotbar });
 
@@ -89,16 +108,31 @@ function closeInventory() {
   lock();
 }
 
+function openSettings() {
+  if (hud.inventoryOpen) hud.setInventory(false);
+  settings.setOpen(true);
+  hud.updateHint();
+  if (document.pointerLockElement) document.exitPointerLock();
+}
+
+function closeSettings() {
+  settings.setOpen(false);
+  hud.updateHint();
+  lock();
+}
+
 // No pause menu: clicking the view captures the mouse; Esc releases it and a
 // small hint says how to resume.
 canvas.addEventListener('click', () => {
-  if (hud.inventoryOpen) closeInventory();
+  if (settings.open) closeSettings();
+  else if (hud.inventoryOpen) closeInventory();
   else if (!locked) lock();
 });
 
 document.addEventListener('pointerlockchange', () => {
   locked = document.pointerLockElement === canvas;
   if (locked && hud.inventoryOpen) hud.setInventory(false);
+  if (locked && settings.open) settings.setOpen(false);
   hud.setPaused(!locked);
   if (!locked) {
     keys.clear();
@@ -131,6 +165,14 @@ window.addEventListener(
 );
 
 window.addEventListener('keydown', (e) => {
+  if (settings.open) {
+    if ((e.code === 'KeyO' || e.code === 'Escape') && !e.repeat) closeSettings();
+    return;
+  }
+  if (e.code === 'KeyO' && !e.repeat) {
+    openSettings();
+    return;
+  }
   if (hud.inventoryOpen) {
     if ((e.code === 'KeyE' || e.code === 'Escape') && !e.repeat) closeInventory();
     else if (e.code.startsWith('Digit')) {
@@ -221,4 +263,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Handy for poking at the demo from the devtools console.
-if (import.meta.env.DEV) window.demo = { shadow, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };
+if (import.meta.env.DEV) window.demo = { settings, shadow, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };

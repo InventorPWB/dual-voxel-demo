@@ -36,13 +36,21 @@ export class ChunkMeshes {
 
     const count = Math.max(2, Math.min(4, (navigator.hardwareConcurrency || 4) - 1));
     this.idle = [];
+    this.workers = [];
     for (let i = 0; i < count; i++) {
       const worker = new Worker(new URL('../mesh/meshWorker.js', import.meta.url), { type: 'module' });
       worker.postMessage({ type: 'init', crisp: CRISP, scale: VOXEL });
       worker.onmessage = (e) => this.onResult(worker, e.data);
       this.idle.push(worker);
+      this.workers.push(worker);
     }
     this.workerCount = count;
+  }
+
+  /** Change how foliage is meshed (see meshFoliage's options); re-mesh everything unless `remesh` is false. */
+  setFoliageOptions(options, remesh = true) {
+    for (const w of this.workers) w.postMessage({ type: 'options', foliage: options });
+    if (remesh) this.world.markAllDirty();
   }
 
   get pending() {
@@ -106,6 +114,8 @@ export class ChunkMeshes {
       g.setAttribute('wind', new THREE.BufferAttribute(foliage.wind, 1));
       g.setAttribute('ao', new THREE.BufferAttribute(foliage.ao, 1));
       g.setAttribute('seed', new THREE.BufferAttribute(foliage.seed, 1));
+      g.setAttribute('center', new THREE.BufferAttribute(foliage.center, 3));
+      g.setAttribute('axis', new THREE.BufferAttribute(foliage.axis, 3));
       for (const grp of foliage.groups) g.addGroup(grp.start, grp.count, grp.materialIndex);
       g.computeBoundingSphere();
       g.computeBoundingBox();
