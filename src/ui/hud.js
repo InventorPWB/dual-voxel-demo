@@ -9,7 +9,7 @@ export const CONTROLS = [
   ['Jump / fly up', 'Space'],
   ['Sprint / fly down', 'Shift'],
   ['Toggle fly', 'F or double-tap Space'],
-  ['Break / dig', 'Left mouse'],
+  ['Break / dig / chop', 'Left mouse'],
   ['Place / use', 'Right mouse'],
   ['Paint', 'Shift + right mouse'],
   ['Choose item', '1–9 or mouse wheel'],

@@ -6,6 +6,7 @@ import { createFoliageMaterials } from './render/foliageMaterial.js';
 import { lightingUniforms } from './render/lighting.js';
 import { attachMipmaps } from './render/textureArray.js';
 import { SunShadow } from './render/SunShadow.js';
+import { Felling } from './render/Felling.js';
 import { ChunkMeshes } from './render/ChunkMeshes.js';
 import { Player } from './player/Player.js';
 import { Interaction } from './items/interaction.js';
@@ -62,8 +63,9 @@ let meshedWith = null;
 applySettings();
 settings.onChange = applySettings;
 
-const player = new Player(world, camera, () => chunkMeshes.list);
-const interaction = new Interaction({ world, scene, camera, chunkMeshes, player, hotbar });
+const player = new Player(world, camera, () => chunkMeshes.colliders);
+const felling = new Felling({ world, scene, chunkMeshes, shadow });
+const interaction = new Interaction({ world, scene, camera, chunkMeshes, player, hotbar, felling });
 
 const SPAWN_X = 46.5, SPAWN_Z = 40.5;
 
@@ -228,6 +230,7 @@ function frame(now) {
   }
   interaction.update(dt, locked, keys.has('ShiftLeft') || keys.has('ShiftRight'));
   chunkMeshes.update(player.pos);
+  felling.update(dt);
 
   // [ and ] swing the sun around the sky to show the shadows are live.
   const sunSpin = (keys.has('BracketRight') ? 1 : 0) - (keys.has('BracketLeft') ? 1 : 0);
@@ -235,7 +238,7 @@ function frame(now) {
     sunAzimuth += sunSpin * dt * 0.6;
     shadow.setDirection(sunDirection(sunAzimuth));
   }
-  shadow.update(chunkMeshes.list.concat(chunkMeshes.foliageList));
+  shadow.update(chunkMeshes.list.concat(chunkMeshes.foliageList, felling.meshes));
   uTime.value = now / 1000;
 
   if (!loaded && world.chunks.length && chunkMeshes.list.length && chunkMeshes.pending === 0) {
@@ -263,4 +266,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Handy for poking at the demo from the devtools console.
-if (import.meta.env.DEV) window.demo = { settings, shadow, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };
+if (import.meta.env.DEV) window.demo = { settings, shadow, world, player, interaction, felling, hotbar, hud, chunkMeshes, camera, scene, renderer };

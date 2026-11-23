@@ -14,7 +14,10 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
  * Per chunk:
  *  - a solid mesh (terrain, pieces, glass) with one group per render pass and
  *    a BVH: it's what the player collides with and aims at (`list`);
- *  - a foliage mesh (grass, flowers, leaves): drawn only, never collided with.
+ *  - a foliage mesh (grass, flowers, leaves, wood): drawn only;
+ *  - a wood collider: the triangles of wood thick enough to be solid, with
+ *    a BVH, not drawn: collided with and aimed at like the solid mesh
+ *    (`colliders`); `userData.cells` gives each triangle's voxel.
  *
  * @param solid    { materials, shadowMaterials } for the solid mesh's passes
  * @param foliage  { materials, shadowMaterials } for the foliage groups
@@ -28,6 +31,8 @@ export class ChunkMeshes {
     this.meshes = new Array(world.chunks.length).fill(null);
     this.foliage = new Array(world.chunks.length).fill(null);
     this.foliageList = [];
+    this.wood = new Array(world.chunks.length).fill(null);
+    this.woodList = [];
     this.inFlight = new Array(world.chunks.length).fill(false);
     this.version = new Array(world.chunks.length).fill(0);
     this.list = []; // live meshes, for raycasting
@@ -45,12 +50,19 @@ export class ChunkMeshes {
       this.workers.push(worker);
     }
     this.workerCount = count;
+    this.detached = new Map();
+    this.detachedId = 0;
   }
 
   /** Change how foliage is meshed (see meshFoliage's options); re-mesh everything unless `remesh` is false. */
   setFoliageOptions(options, remesh = true) {
     for (const w of this.workers) w.postMessage({ type: 'options', foliage: options });
     if (remesh) this.world.markAllDirty();
+  }
+
+  /** Everything solid: the solid meshes and the wood colliders. */
+  get colliders() {
+    return this.woodList.length ? this.list.concat(this.woodList) : this.list;
   }
 
   get pending() {
@@ -72,6 +84,7 @@ export class ChunkMeshes {
       if (padded.uniform) {
         this.setGeometry(index, null);
         this.setFoliage(index, null);
+        this.setWood(index, null);
         continue;
       }
       const worker = this.idle.pop();
@@ -84,7 +97,26 @@ export class ChunkMeshes {
     }
   }
 
+  /**
+   * Mesh a padded chunk that isn't part of the world (see Felling) on a
+   * worker: resolves to a foliage geometry, or null if there's nothing.
+   */
+  meshDetached(padded) {
+    const id = ++this.detachedId;
+    const worker = this.workers[id % this.workers.length];
+    return new Promise((resolve) => {
+      this.detached.set(id, resolve);
+      worker.postMessage({ type: 'mesh', index: -1, version: 0, detached: id, ...padded });
+    });
+  }
+
   onResult(worker, msg) {
+    if (msg.detached) {
+      const resolve = this.detached.get(msg.detached);
+      this.detached.delete(msg.detached);
+      resolve(msg.foliage.triangles ? foliageGeometry(msg.foliage) : null);
+      return;
+    }
     this.idle.push(worker);
     this.inFlight[msg.index] = false;
     this.lastMeshMs = msg.ms;
@@ -105,23 +137,39 @@ export class ChunkMeshes {
       g.computeBoundsTree();
       this.setGeometry(msg.index, g);
     }
-    if (foliage.triangles === 0) this.setFoliage(msg.index, null);
+    this.setFoliage(msg.index, foliage.triangles === 0 ? null : foliageGeometry(foliage));
+    if (foliage.wood.triangles === 0) this.setWood(msg.index, null);
     else {
       const g = new THREE.BufferGeometry();
-      g.setAttribute('position', new THREE.BufferAttribute(foliage.position, 3));
-      g.setAttribute('normal', new THREE.BufferAttribute(foliage.normal, 3));
-      g.setAttribute('uvl', new THREE.BufferAttribute(foliage.uvl, 3));
-      g.setAttribute('wind', new THREE.BufferAttribute(foliage.wind, 1));
-      g.setAttribute('ao', new THREE.BufferAttribute(foliage.ao, 1));
-      g.setAttribute('seed', new THREE.BufferAttribute(foliage.seed, 1));
-      g.setAttribute('center', new THREE.BufferAttribute(foliage.center, 3));
-      g.setAttribute('axis', new THREE.BufferAttribute(foliage.axis, 3));
-      for (const grp of foliage.groups) g.addGroup(grp.start, grp.count, grp.materialIndex);
+      g.setAttribute('position', new THREE.BufferAttribute(foliage.wood.position, 3));
       g.computeBoundingSphere();
       g.computeBoundingBox();
-      // Sway reaches a little beyond the resting geometry.
-      g.boundingSphere.radius += 0.3;
-      this.setFoliage(msg.index, g);
+      g.computeBoundsTree();
+      this.setWood(msg.index, g, foliage.wood.cell);
+    }
+  }
+
+  /** Wood collider of a chunk (never added to the scene). */
+  setWood(index, geometry, cells = null) {
+    const old = this.wood[index];
+    if (old) {
+      old.geometry.disposeBoundsTree();
+      old.geometry.dispose();
+    }
+    if (!geometry) {
+      if (old) {
+        this.wood[index] = null;
+        this.woodList = this.wood.filter(Boolean);
+      }
+      return;
+    }
+    const mesh = old || new THREE.Mesh(geometry);
+    mesh.geometry = geometry;
+    mesh.userData.cells = cells;
+    mesh.updateMatrixWorld();
+    if (!old) {
+      this.wood[index] = mesh;
+      this.woodList = this.wood.filter(Boolean);
     }
   }
 
@@ -194,4 +242,23 @@ export class ChunkMeshes {
 function dist2([cx, cy, cz], focus, s) {
   const dx = (cx + 0.5) * s - focus.x, dy = (cy + 0.5) * s - focus.y, dz = (cz + 0.5) * s - focus.z;
   return dx * dx + dy * dy + dz * dz;
+}
+
+/** Geometry of a meshFoliage result. */
+export function foliageGeometry(foliage) {
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(foliage.position, 3));
+  g.setAttribute('normal', new THREE.BufferAttribute(foliage.normal, 3));
+  g.setAttribute('uvl', new THREE.BufferAttribute(foliage.uvl, 3));
+  g.setAttribute('wind', new THREE.BufferAttribute(foliage.wind, 1));
+  g.setAttribute('ao', new THREE.BufferAttribute(foliage.ao, 1));
+  g.setAttribute('seed', new THREE.BufferAttribute(foliage.seed, 1));
+  g.setAttribute('center', new THREE.BufferAttribute(foliage.center, 3));
+  g.setAttribute('axis', new THREE.BufferAttribute(foliage.axis, 3));
+  for (const grp of foliage.groups) g.addGroup(grp.start, grp.count, grp.materialIndex);
+  g.computeBoundingSphere();
+  g.computeBoundingBox();
+  // Sway reaches a little beyond the resting geometry.
+  g.boundingSphere.radius += 0.3;
+  return g;
 }

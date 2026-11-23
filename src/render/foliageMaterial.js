@@ -147,7 +147,7 @@ export function createFoliageMaterials(shadow) {
       #endif
       if (cutout(tex.a)) discard;
       #ifdef LEAVES
-        // Leaves wrap light and let the sun through; bark is lit as terrain wood is.
+        // Leaves wrap light and let the sun through; bark is lit like terrain.
         vec3 color = vIsCard > 0.5 ? shade(tex.rgb, vPos, n, vAo, 0.45, 1.0) : shade(tex.rgb, vPos, n, vAo, 0.2, 0.0);
       #else
         // Far away: the ground's own colour and light, so blades melt into it.

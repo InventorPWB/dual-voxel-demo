@@ -1,7 +1,9 @@
 import { describe, it, expect } from 'vitest';
 import { World, VOXEL } from '../src/world/World.js';
 import { MAT, CRISP, PASS_OPAQUE, PASS_CUTOUT, PASS_TRANSLUCENT } from '../src/world/materials.js';
-import { PLANT, PLANTS, PLANT_KIND, TWIG_PARENT, TWIG_RADIUS, DIRS26, supportsPlant, settlePlants } from '../src/world/plants.js';
+import { PLANT, DIRS26, plantDef, isWood, isSolidWood, woodParent, woodRadius, woodCut, woodCutSide, supportsPlant, settlePlants } from '../src/world/plants.js';
+import { chop, severed, remove } from '../src/world/chop.js';
+import { TEXTURE_NAMES } from '../src/render/textures.js';
 import { placeShape, sculptSphere, removeShape, removeSpecks, breakAt } from '../src/world/edits.js';
 import { SHAPE, placement } from '../src/world/shapes.js';
 import { growGrass, growTree, rng } from '../src/world/trees.js';
@@ -197,85 +199,81 @@ describe('plant layer', () => {
 });
 
 describe('trees', () => {
-  it('grows a log trunk out of the ground with leaves only in empty voxels', () => {
-    const w = flatWorld(3, 16);
-    expect(growTree(w, 24, 24, () => 0.5)).toBe(true);
-    // Trunk: smooth Log terrain a couple of metres up the column.
-    expect(w.getMat(24, GROUND + 4, 24)).toBe(MAT.LOG);
-    expect(w.isTerrain(24, GROUND + 4, 24)).toBe(true);
-    let leaves = 0;
-    for (let z = 0; z < w.sz; z++)
-      for (let y = 0; y < w.sy; y++)
-        for (let x = 0; x < w.sx; x++)
-          if (w.getPlant(x, y, z) === PLANT.LEAVES) {
-            leaves++;
-            expect(w.isSolid(x, y, z)).toBe(false);
-          }
-    expect(leaves).toBeGreaterThan(200);
-  });
-
-  it('carries the limbs on as branches and twigs in the plant layer, drawn as bark rods', () => {
-    const w = flatWorld(3, 16);
-    growTree(w, 24, 24, rng(5));
-    let twigs = 0, branches = 0, boughs = 0;
+  /** Every plant in the world: { wood: [[x, y, z, id]], leaves: [[x, y, z]] }. */
+  const plants = (w) => {
+    const wood = [], leaves = [];
     for (let z = 0; z < w.sz; z++)
       for (let y = 0; y < w.sy; y++)
         for (let x = 0; x < w.sx; x++) {
           const p = w.getPlant(x, y, z);
-          if (PLANTS[p]?.name === 'Twig') twigs++;
-          if (PLANTS[p]?.name === 'Branch') branches++;
-          if (PLANTS[p]?.name === 'Bough') boughs++;
-          if (p) expect(w.isSolid(x, y, z)).toBe(false);
+          if (isWood(p)) wood.push([x, y, z, p]);
+          if (p === PLANT.LEAVES) leaves.push([x, y, z]);
         }
-    // Wood of every size, from boughs down to twigs.
-    expect(twigs).toBeGreaterThan(10);
-    expect(branches).toBeGreaterThan(10);
-    expect(boughs).toBeGreaterThan(0);
-    // The foliage mesh has bark (no facing) as well as leaf cards.
-    let bark = 0, cards = 0;
+    return { wood, leaves };
+  };
+  /** Follow wood voxel v's parents down: true if they end in solid ground. */
+  const grounded = (w, v) => {
+    for (let steps = 0; steps < 300; steps++) {
+      if (w.isSolid(...v)) return true;
+      const o = DIRS26[woodParent(w.getPlant(...v))];
+      if (!o || !isWood(w.getPlant(...v))) return false;
+      v = [v[0] + o[0], v[1] + o[1], v[2] + o[2]];
+    }
+    return false;
+  };
+  const meshTrees = (w) => {
+    const out = [];
     for (let cz = 0; cz < w.nz; cz++)
       for (let cy = 0; cy < w.ny; cy++)
         for (let cx = 0; cx < w.nx; cx++) {
           const p = w.buildPadded(cx, cy, cz);
-          if (p.uniform) continue;
-          const f = meshFoliage(p, VOXEL);
-          for (const g of f.groups) {
-            if (g.materialIndex !== 1) continue;
-            for (let v = g.start; v < g.start + g.count; v += 3) (f.axis[v * 3] || f.axis[v * 3 + 1] || f.axis[v * 3 + 2]) ? cards++ : bark++;
-          }
+          if (!p.uniform) out.push(meshFoliage(p, VOXEL));
         }
-    expect(bark).toBeGreaterThan(100);
-    expect(cards).toBeGreaterThan(500);
+    return out;
+  };
+  /** Trunk foot of the tree grown at column (x, z): the wood growing out of the ground nearest it. */
+  const foot = (w, x, z) => {
+    let best = null;
+    for (let vz = z - 3; vz <= z + 3; vz++)
+      for (let vx = x - 3; vx <= x + 3; vx++)
+        for (let y = 1; y < w.sy; y++) {
+          const o = DIRS26[woodParent(w.getPlant(vx, y, vz))];
+          if (!isWood(w.getPlant(vx, y, vz)) || !o || !w.isSolid(vx + o[0], y + o[1], vz + o[2])) continue;
+          if (!best || Math.hypot(vx - x, vz - z) < Math.hypot(best[0] - x, best[2] - z)) best = [vx, y, vz];
+        }
+    return best;
+  };
+
+  it('grows a tree of wood out of the ground, trunk to twig, with leaves only in empty voxels', () => {
+    const w = flatWorld(4, 16);
+    expect(growTree(w, 32, 32, rng(2))).toBe(true);
+    const { wood, leaves } = plants(w);
+    // All of it is plants: no terrain wood.
+    for (let y = GROUND; y < w.sy; y++) expect(w.isSolid(32, y, 32)).toBe(false);
+    // The trunk's foot grows from the ground under it, thick.
+    const f = foot(w, 32, 32);
+    expect(f[1]).toBe(GROUND);
+    expect(DIRS26[woodParent(w.getPlant(...f))][1]).toBe(-1);
+    expect(woodRadius(w.getPlant(...f))).toBeGreaterThan(0.2);
+    // Wood of every size, from trunk to twig.
+    const names = new Set(wood.map(([, , , id]) => plantDef(id).name));
+    expect([...names].sort()).toEqual(['Bough', 'Branch', 'Trunk', 'Twig']);
+    expect(leaves.length).toBeGreaterThan(1000);
+    for (const v of [...wood, ...leaves]) expect(w.isSolid(v[0], v[1], v[2])).toBe(false);
   });
 
-  it('links every twig back to the wood, and every leaf to a twig', () => {
-    for (let seed = 1; seed <= 4; seed++) {
-      const w = flatWorld(3, 16);
-      growTree(w, 24, 24, rng(seed));
-      const twigs = [], leaves = [];
-      for (let z = 0; z < w.sz; z++)
-        for (let y = 0; y < w.sy; y++)
-          for (let x = 0; x < w.sx; x++) {
-            const p = w.getPlant(x, y, z);
-            if (PLANT_KIND[p] === 3) twigs.push([x, y, z]);
-            if (p === PLANT.LEAVES) leaves.push([x, y, z]);
-          }
-      // Follow each twig's parents: they end in wood, never in thin air or a loop.
-      for (const t of twigs) {
-        let v = t;
-        for (let steps = 0; ; steps++) {
-          expect(steps, `seed ${seed}`).toBeLessThan(200);
-          if (w.isSolid(...v)) break;
-          const d = TWIG_PARENT[w.getPlant(...v)];
-          expect(d, `seed ${seed}: twig at ${v} has no parent`).toBeGreaterThanOrEqual(0);
-          v = v.map((c, k) => c + DIRS26[d][k]);
-          expect(w.isSolid(...v) || PLANT_KIND[w.getPlant(...v)] === 3, `seed ${seed}: parent of ${t}`).toBe(true);
-        }
-      }
-      // Every leaf reaches a twig through leaves, face to face.
+  it('links every piece of wood back to the ground, and every leaf to wood', () => {
+    for (let seed = 1; seed <= 6; seed++) {
+      const w = flatWorld(4, 16);
+      growTree(w, 32, 32, rng(seed));
+      const { wood, leaves } = plants(w);
+      for (const v of wood) expect(grounded(w, v.slice(0, 3)), `seed ${seed}: wood at ${v}`).toBe(true);
+      const set = severed(w, []);
+      expect(set.wood).toEqual([]);
+      // Every leaf reaches wood through leaves, face to face.
       const key = (v) => v.join();
-      const seen = new Set(twigs.map(key));
-      const stack = twigs.slice();
+      const seen = new Set(wood.map((v) => key(v.slice(0, 3))));
+      const stack = wood.map((v) => v.slice(0, 3));
       while (stack.length) {
         const v = stack.pop();
         for (const d of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
@@ -286,51 +284,101 @@ describe('trees', () => {
         }
       }
       expect(leaves.filter((v) => !seen.has(key(v))), `seed ${seed}`).toEqual([]);
-      expect(leaves.length).toBeGreaterThan(1500);
     }
   });
 
-  it('sinks the root of every tube growing out of the wood into it, out of sight', () => {
-    // As the mesher does (foliage.js twigs): a tube growing out of wood runs
-    // back towards the wood around it, to just short of coming out again,
-    // and narrows to half as it goes; its end ring must be inside the wood.
-    for (let seed = 1; seed <= 10; seed++) {
+  it('grows trees of different habits, sizes and girths', () => {
+    const heights = [], girths = [];
+    for (let seed = 1; seed <= 12; seed++) {
       const w = flatWorld(4, 16);
-      const debug = {};
-      growTree(w, 32, 32, rng(seed), debug);
-      const solid = (q) => w.isSolid(Math.floor(q[0]), Math.floor(q[1]), Math.floor(q[2]));
-      for (let z = 0; z < w.sz; z++)
-        for (let y = 0; y < w.sy; y++)
-          for (let x = 0; x < w.sx; x++) {
-            const p = w.getPlant(x, y, z);
-            const o = DIRS26[TWIG_PARENT[p]];
-            if (PLANT_KIND[p] !== 3 || !o || !w.isSolid(x + o[0], y + o[1], z + o[2])) continue;
-            let d = [0, 0, 0];
-            for (let dz = -2; dz <= 2; dz++)
-              for (let dy = -2; dy <= 2; dy++)
-                for (let dx = -2; dx <= 2; dx++) {
-                  if (!(dx || dy || dz) || !w.isSolid(x + dx, y + dy, z + dz)) continue;
-                  const k = 1 / (dx * dx + dy * dy + dz * dz);
-                  d = [d[0] + dx * k, d[1] + dy * k, d[2] + dz * k];
-                }
-            d = d.map((c) => c / Math.hypot(...d));
-            const a = [x + 0.5, y + 0.5, z + 0.5];
-            let depth = 1.6, inside = -1;
-            for (let s = 0.25; s <= 2.1; s += 0.25) {
-              const now = solid(a.map((c, k) => c + d[k] * s));
-              if (now && inside < 0) inside = s;
-              if (!now && inside >= 0) { depth = Math.max(inside + 0.25, Math.min(1.6, s - 0.5)); break; }
-            }
-            const b = a.map((c, k) => c + d[k] * depth);
-            const ring = (TWIG_RADIUS[p] * 0.5) / VOXEL;
-            expect(ring - debug.sdf(...b), `seed ${seed}: tube root at ${[x, y, z]}`).toBeLessThan(0.15);
-          }
+      growTree(w, 32, 32, rng(seed));
+      const { wood } = plants(w);
+      heights.push(Math.max(...wood.map((v) => v[1])) - GROUND);
+      girths.push(woodRadius(w.getPlant(...foot(w, 32, 32))));
     }
+    expect(Math.max(...heights) - Math.min(...heights)).toBeGreaterThan(6); // voxels: 3 m
+    expect(Math.max(...girths) / Math.min(...girths)).toBeGreaterThan(1.4);
   });
 
-  it('draws wood cut open by an edit as end grain, at any angle, and the outside as bark', () => {
+  it('draws wood as bark tubes, and makes the thick wood solid to bump into and aim at', () => {
+    const w = flatWorld(4, 16);
+    growTree(w, 32, 32, rng(5));
+    let bark = 0, cards = 0, solid = 0;
+    for (const f of meshTrees(w)) {
+      for (const g of f.groups) {
+        if (g.materialIndex !== 1) continue;
+        for (let v = g.start; v < g.start + g.count; v += 3) (f.axis[v * 3] || f.axis[v * 3 + 1] || f.axis[v * 3 + 2]) ? cards++ : bark++;
+      }
+      // Each solid triangle belongs to a voxel of solid wood.
+      for (let t = 0; t < f.wood.triangles; t++) {
+        const id = w.getPlant(f.wood.cell[t * 3], f.wood.cell[t * 3 + 1], f.wood.cell[t * 3 + 2]);
+        expect(isSolidWood(id)).toBe(true);
+        solid++;
+      }
+    }
+    expect(bark).toBeGreaterThan(1000);
+    expect(cards).toBeGreaterThan(500);
+    expect(solid).toBeGreaterThan(300);
+  });
+
+  it('chops wood an eighth at a time, drawing the notch as end grain, and fells all it carried', () => {
+    const w = flatWorld(4, 16);
+    growTree(w, 32, 32, rng(2));
+    const f = foot(w, 32, 32);
+    const cutLayer = TEXTURE_NAMES.indexOf('log_end');
+    const endGrain = () => meshTrees(w).reduce((n, m) => {
+      for (let v = 0; v < m.uvl.length / 3; v++) if (m.uvl[v * 3 + 2] === cutLayer) n++;
+      return n;
+    }, 0);
+    expect(endGrain()).toBe(0);
+    for (let k = 1; k < 8; k++) {
+      expect(chop(w, ...f, 2)).toBe(null);
+      expect(woodCut(w.getPlant(...f))).toBe(k);
+      expect(woodCutSide(w.getPlant(...f))).toBe(2);
+    }
+    expect(endGrain()).toBeGreaterThan(0);
+    // The eighth stroke goes through: the whole tree and its leaves are freed.
+    const before = plants(w);
+    const set = chop(w, ...f, 6);
+    // (The foot is all the tree grows from: roots and all grow from it.)
+    expect(set.wood.length).toBe(before.wood.length);
+    expect(set.leaves.length).toBe(before.leaves.length);
+    remove(w, set);
+    const after = plants(w);
+    expect(after.leaves.length).toBe(0);
+    for (const v of after.wood) expect(grounded(w, v.slice(0, 3))).toBe(true);
+  });
+
+  it('cutting off a branch takes what grows from it and its leaves, and leaves the rest of the tree whole', () => {
+    const w = flatWorld(4, 16);
+    growTree(w, 32, 32, rng(3));
+    const before = plants(w);
+    // A branch up in the crown, a few voxels above the fork.
+    const branch = before.wood.find(([, , , id]) => plantDef(id).name === 'Branch' && woodRadius(id) > 0.06);
+    const set = severed(w, [branch.slice(0, 3)]);
+    expect(set.wood.length).toBeGreaterThan(1);
+    expect(set.wood.length).toBeLessThan(before.wood.length / 2);
+    remove(w, set);
+    const after = plants(w);
+    expect(after.wood.length).toBe(before.wood.length - set.wood.length);
+    expect(after.leaves.length).toBe(before.leaves.length - set.leaves.length);
+    for (const v of after.wood) expect(grounded(w, v.slice(0, 3))).toBe(true);
+  });
+
+  it('a tree goes when the ground under its trunk is dug away', () => {
+    const w = flatWorld(4, 16);
+    growTree(w, 32, 32, rng(4));
+    expect(plants(w).wood.length).toBeGreaterThan(50);
+    sculptSphere(w, { x: 32.5, y: GROUND - 0.5, z: 32.5 }, 3, 'sub');
+    const { wood, leaves } = plants(w);
+    for (const v of wood) expect(grounded(w, v.slice(0, 3))).toBe(true);
+    expect(wood.filter((v) => Math.hypot(v[0] - 32, v[2] - 32) < 3 && v[1] > GROUND + 4)).toEqual([]);
+    expect(leaves.length).toBe(0);
+  });
+
+  it('draws terrain wood cut open by an edit as end grain, at any angle, and the outside as bark', () => {
     const w = flatWorld(3, 16);
-    growTree(w, 24, 24, rng(3));
+    sculptSphere(w, { x: 24.5, y: GROUND + 5, z: 24.5 }, 4, 'add', MAT.LOG);
     const count = () => {
       let log = 0, cut = 0, sideways = 0;
       for (const m of meshAll(w))
@@ -345,29 +393,18 @@ describe('trees', () => {
       return { log, cut, sideways };
     };
     expect(count().cut).toBe(0);
-    // Break a metre out of the trunk: the edges it opened above and below are cut.
+    // Break a metre out of it: the edges it opened above and below are cut.
     breakAt(w, 24, GROUND + 2, 24);
     expect(w.getCut(24, GROUND + 1, 24, 1)).toBe(true);
     expect(w.getCut(24, GROUND + 3, 24, 1)).toBe(true);
     expect(w.getMat(24, GROUND + 1, 24)).toBe(MAT.LOG); // the wood itself is unchanged
     expect(count().cut).toBeGreaterThan(0);
-    // Digging into the trunk's side from +x: that cut faces sideways, and is end grain too.
-    sculptSphere(w, { x: 26.6, y: GROUND + 6.5, z: 24.5 }, 1.6, 'sub');
+    // Digging into its side from +x: that cut faces sideways, and is end grain too.
+    sculptSphere(w, { x: 28.1, y: GROUND + 6.5, z: 24.5 }, 1.6, 'sub');
     const after = count();
     expect(after.sideways).toBeGreaterThan(0);
     // Most of the wood is untouched bark.
     expect(after.log).toBeGreaterThan(after.cut * 3);
-  });
-
-  it('meshes trunks and limbs closed, with no loose bits, at every size', () => {
-    for (let seed = 1; seed <= 6; seed++) {
-      const w = flatWorld(3, 16);
-      growTree(w, 24, 24, rng(seed));
-      expect(interiorOpenEdges(w), `seed ${seed}`).toEqual([]);
-      // Every log voxel connects to the ground through other log or ground voxels.
-      expect(removeSpecks(w, { x0: 0, y0: 1, z0: 0, x1: w.sx - 1, y1: w.sy - 1, z1: w.sz - 1, nx: w.sx, ny: w.sy - 1, nz: w.sz, empty: false, size: w.sx * (w.sy - 1) * w.sz,
-        contains: (x, y, z) => x >= 0 && y >= 1 && z >= 0 && x < w.sx && y < w.sy && z < w.sz, index: (x, y, z) => x + w.sx * ((y - 1) + (w.sy - 1) * z) }), `seed ${seed}`).toBe(0);
-    }
   });
 });
 

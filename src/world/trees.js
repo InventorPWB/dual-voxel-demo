@@ -1,15 +1,14 @@
 import { createNoise3D } from './noise.js';
-import { applyCSG } from './csg.js';
 import { MAT } from './materials.js';
-import { PLANT, PLANT_KIND, DIRS26, twigId, branchBase } from './plants.js';
+import { PLANT, DIRS26, isWood, woodId, woodSizeFor } from './plants.js';
 import { VOXEL } from './World.js';
 import { unpackNormal } from './normals.js';
 
 /**
  * Test vegetation for generated worlds: trees and a grass cover.
  *
- * A tree is ordinary world data: smooth Log terrain for the wood, and leaf
- * voxels in the plant layer for the crown. Nothing else remembers it.
+ * A tree is ordinary world data: wood and leaf voxels in the plant layer.
+ * Nothing else remembers it.
  */
 
 const e = [0, 0, 0];
@@ -42,18 +41,13 @@ export function rng(seed) {
   };
 }
 
-/** Smooth minimum of two distances: joins shapes with a rounded fillet of size k. */
-function smin(a, b, k) {
-  const h = Math.max(k - Math.abs(a - b), 0) / k;
-  return Math.min(a, b) - h * h * k * 0.25;
-}
-
 /**
  * Grow one tree with its foot at voxel column (x, z). Returns false if
  * there's no ground there.
  *
  * Like a broadleaf (oak, beech, ash), in one of three habits, each varied in
- * size (0.8-1.25×), lean and proportions:
+ * size (0.6-1.25×, from a young tree to a big one), girth, lean and
+ * proportions:
  *   spreading – the trunk forks low (2-4.5 m) into two or three stems of
  *               about equal size rising at an angle, sometimes with a low
  *               limb below the fork, and those carry the crown: broad and
@@ -66,14 +60,13 @@ function smin(a, b, k) {
  *               crown lopsided towards the lean.
  * Each stem puts out side branches in turn round it (by the golden angle, as
  * real shoots do), facing out from the crown, those do the same once more,
- * and the finest shoots carry the leaves. Every stem tapers from base to tip.
+ * and the finest shoots carry the leaves. Every stem tapers from base to
+ * tip, as thick as what it carries (see thickness, below).
  *
- * Wood at least RT thick is smooth Log terrain (an exact CSG union of
- * tapered capsules with rounded fillets), so it can be dug or chopped like
- * ground; terrain can't be drawn well any thinner, so thinner wood is in the
- * plant layer: boughs, branches and twigs of five thicknesses, each voxel
- * recording the voxel it grows from, which the mesher draws as one smooth
- * tapering tube joined into the wood it grows out of.
+ * All of it, trunk to twig, is wood voxels in the plant layer, each
+ * recording its size and the voxel it grows from (for the trunk's lowest,
+ * the ground), which the mesher draws as one smooth tapering bark tube,
+ * flaring into the ground at the trunk's foot.
  *
  * Leaves grow around the leafy shoots, so every leaf hangs off a twig: each
  * shoot and shoot tip spreads a leaf density around it, the crown as a whole
@@ -83,19 +76,18 @@ function smin(a, b, k) {
  * branches and sky. Lone spikes are trimmed, and any leaves cut off from the
  * twigs are dropped.
  *
- * `debug`, if given, gets the terrain wood's signed distance function (`sdf`,
- * in voxels, positive inside), for tests.
+ * `debug`, if given, gets the tree's stems ({ pts, rad, level, ... }), for tests.
  */
 export function growTree(world, x, z, random = Math.random, debug = null) {
   const g = groundAt(world, x, z);
   if (!g) return false;
   const V = VOXEL;
   const m = (v) => v / V; // metres to voxels
-  const s = 0.8 + 0.45 * random(); // overall size
+  const s = 0.6 + 0.65 * random(); // overall size
   const pick = random();
   const habit = pick < 0.45 ? 'spreading' : pick < 0.8 ? 'leader' : 'leaning';
-  const RT = m(0.3); // thinnest terrain wood
-  const rBase = m(0.33 + 0.07 * (s - 0.8) / 0.45), flare = m(0.3);
+  // Trunk radius at the foot: thicker for bigger trees, and varying.
+  const rBase = m((0.18 + 0.22 * (s - 0.6) / 0.65) * (0.85 + 0.3 * random()) + 0.05);
 
   const norm = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
   const add = (p, d, k) => [p[0] + d[0] * k, p[1] + d[1] * k, p[2] + d[2] * k];
@@ -253,106 +245,11 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
   // among the small branches, as on a real tree.
   const full = Math.log(trunk.rad[0] / rShoot), girth = Math.log(rBase / rShoot);
   for (const st of stems) st.rad = st.rad.map((r) => rShoot * Math.exp(girth * Math.max(0, Math.log(r / rShoot) / full) ** 0.6));
-  // A trunk that forks stays terrain wood right up to the fork (where the
-  // stems leaving it, nearly as thick, are tubes that form the fork).
-  const forked = kidsOf.get(trunk).some((st) => st.at >= 1);
-  if (forked) trunk.rad = trunk.rad.map((r) => Math.max(r, RT * 1.08));
+  if (debug) debug.stems = stems;
 
-  // The voxels a stem runs through, in order, with how far along it each is.
-  const voxelPath = (st) => {
-    const n = st.dirs.length, path = [];
-    for (let k = 0; k < n; k++) {
-      const a = st.pts[k], b = st.pts[k + 1];
-      const steps = Math.ceil(Math.max(Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]), Math.abs(b[2] - a[2])));
-      for (let i = k ? 1 : 0; i <= steps; i++) {
-        const u = steps ? i / steps : 0;
-        const v = [Math.floor(a[0] + (b[0] - a[0]) * u), Math.floor(a[1] + (b[1] - a[1]) * u), Math.floor(a[2] + (b[2] - a[2]) * u)];
-        const last = path[path.length - 1];
-        if (last && v[0] === last.v[0] && v[1] === last.v[1] && v[2] === last.v[2]) continue;
-        path.push({ v, t: (k + u) / n });
-      }
-    }
-    return path;
-  };
-
-  // ---- wood thick enough for terrain: the trunk (flaring into roots at the
-  // ground, along its own axis so there's no seam) and the bases of stems.
-  const capsule = ({ a, b, ra, rb }, px, py, pz) => {
-    const bx = b[0] - a[0], by = b[1] - a[1], bz = b[2] - a[2];
-    const t = Math.max(0, Math.min(1, ((px - a[0]) * bx + (py - a[1]) * by + (pz - a[2]) * bz) / (bx * bx + by * by + bz * bz)));
-    return { d: Math.hypot(px - a[0] - bx * t, py - a[1] - by * t, pz - a[2] - bz * t), r: ra + (rb - ra) * t };
-  };
-  const trunkSegs = [], segments = [];
-  const voxelCentre = (e) => [e.v[0] + 0.5, e.v[1] + 0.5, e.v[2] + 0.5];
-  for (const st of stems) {
-    const segs = st === trunk ? trunkSegs : segments;
-    const n = st.pts.length - 1;
-    // A side shoot of a stem that follows its tube's line starts on that line.
-    if (st.parent && st.parent.line) {
-      let best = st.parent.line[0];
-      for (const e of st.parent.line) if (Math.abs(e.t - st.at) < Math.abs(best.t - st.at)) best = e;
-      st.pts[0] = best.p;
-    }
-    if (st.rad[0] < RT) continue;
-    if (st.rad[n] >= RT) {
-      for (let k = 0; k < n; k++) segs.push({ a: st.pts[k], b: st.pts[k + 1], ra: st.rad[k], rb: st.rad[k + 1] });
-      if (st === trunk && forked) {
-        // Its rounded end stops just short of the fork, inside the stems
-        // rising from there, so no dome of wood shows in the crotch.
-        const last = segs[segs.length - 1];
-        last.b = add(last.b, st.dirs[n - 1], -0.6 * last.rb);
-      }
-      continue;
-    }
-    // It gets too thin for terrain partway, and a tube carries it on from
-    // there. The tube runs through its voxels' (smoothed) centres, which can
-    // be a quarter metre off the stem's own line, so the wood follows the
-    // tube's line instead, all the way from the stem's base, and ends in a
-    // short cone that tapers away inside the tube: the two line up, the
-    // tube's end sinks straight back into the wood, and side shoots set on
-    // this line (below) start from the middle of the wood.
-    let k = 0;
-    while (st.rad[k + 1] >= RT) k++;
-    const tCut = (k + (st.rad[k] - RT) / (st.rad[k] - st.rad[k + 1])) / n;
-    st.tWood = tCut;
-    const path = voxelPath(st);
-    let line = path.map(voxelCentre);
-    for (let round = 0; round < 2; round++)
-      line = line.map((p, j) => (j && j < line.length - 1 ? [0, 1, 2].map((q) => 0.5 * p[q] + 0.25 * (line[j - 1][q] + line[j + 1][q])) : p));
-    st.line = path.map((e, j) => ({ p: line[j], t: e.t }));
-    let j1 = 0;
-    for (let q = 1; q < path.length; q++) if (Math.abs(path[q].t - tCut) < Math.abs(path[j1].t - tCut)) j1 = q;
-    const rAt = (q) => Math.max(RT, sample(st, path[q].t).r);
-    segs.push({ a: st.pts[0], b: line[0], ra: st.rad[0], rb: rAt(0) });
-    for (let q = 0; q < j1; q++) segs.push({ a: line[q], b: line[q + 1], ra: rAt(q), rb: rAt(q + 1) });
-    const c0 = line[j1], c1 = line[Math.min(line.length - 1, j1 + 2)];
-    const ahead = Math.hypot(c1[0] - c0[0], c1[1] - c0[1], c1[2] - c0[2]) > 0.5 ? norm([c1[0] - c0[0], c1[1] - c0[1], c1[2] - c0[2]]) : st.dirs[k];
-    segs.push({ a: c0, b: add(c0, ahead, m(0.6)), ra: RT, rb: m(0.1) });
-  }
-  const fillet = m(0.3);
-  const sdf = (px, py, pz) => {
-    let d = Infinity;
-    for (const seg of trunkSegs) { const c = capsule(seg, px, py, pz); d = Math.min(d, c.d - c.r); }
-    d -= flare * Math.exp(-Math.max(0, py - g.height) / m(0.7));
-    for (const seg of segments) {
-      const k = capsule(seg, px, py, pz);
-      d = smin(d, k.d - k.r, fillet);
-    }
-    return -d;
-  };
-  let bx0 = Infinity, by0 = Infinity, bz0 = Infinity, bx1 = -Infinity, by1 = -Infinity, bz1 = -Infinity;
-  for (const { a, b } of [...trunkSegs, ...segments])
-    for (const p of [a, b]) {
-      bx0 = Math.min(bx0, p[0]); by0 = Math.min(by0, p[1]); bz0 = Math.min(bz0, p[2]);
-      bx1 = Math.max(bx1, p[0]); by1 = Math.max(by1, p[1]); bz1 = Math.max(bz1, p[2]);
-    }
-  const pad = Math.ceil(rBase + flare) + 2;
-  if (debug) { debug.sdf = sdf; debug.stems = stems; }
-  applyCSG(world, 'union', [Math.floor(bx0) - pad, Math.floor(by0) - 1, Math.floor(bz0) - pad, Math.ceil(bx1) + pad, Math.ceil(by1) + pad, Math.ceil(bz1) + pad],
-    sdf, { material: MAT.LOG, keep: true });
-
-  // ---- the thinner wood in the plant layer, thickest stems first, so a
-  // stem is laid down before the ones that join it.
+  // ---- the wood, in the plant layer, thickest stems first, so a stem is
+  // laid down before the ones that join it. Where it runs through ground
+  // there's none, and the voxel coming out of the ground grows from it.
   const twigVoxels = [];
   const leafy = []; // { a, b, r } capsules (voxels) the leaves fill around
   const leafTips = []; // { p, r } balls at shoot ends
@@ -378,41 +275,33 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
         if (!world.inBounds(v[0], v[1], v[2])) { prev = null; continue; }
         const t = (k + u) / n;
         line.push({ v, t });
-        if (t < (st.tWood || 0)) {
-          // Still terrain wood here: no tube, even where the stem's voxels
-          // poke out of it (they're off its line), just carry on from the wood.
-          prev = world.isSolid(v[0], v[1], v[2]) ? v : null;
-          continue;
-        }
         const here = world.getPlant(v[0], v[1], v[2]);
-        if (world.isSolid(v[0], v[1], v[2]) || PLANT_KIND[here] === 3) {
-          // Wood or another stem: carry on from it.
+        if (world.isSolid(v[0], v[1], v[2]) || isWood(here)) {
+          // Ground, or another stem: carry on from it.
           prev = v;
           if (!world.isSolid(...v)) placed.push(v);
           continue;
         }
         let step = prev ? [prev[0] - v[0], prev[1] - v[1], prev[2] - v[2]] : null;
-        const held = prev && (world.isSolid(prev[0], prev[1], prev[2]) || PLANT_KIND[world.getPlant(prev[0], prev[1], prev[2])] === 3);
+        const held = prev && (world.isSolid(prev[0], prev[1], prev[2]) || isWood(world.getPlant(prev[0], prev[1], prev[2])));
         if (!step || !held || Math.max(Math.abs(step[0]), Math.abs(step[1]), Math.abs(step[2])) !== 1) {
-          // Nothing to follow on from (the end of terrain wood that isn't
-          // quite solid here): join the nearest wood or twig around it, else
-          // leave it out.
-          // Of those, the one most nearly back along the stem.
+          // Nothing to follow on from: join the ground or wood around it
+          // most nearly back along the stem, else leave it out.
           step = null;
           let best = -Infinity;
           const back = st.dirs[k];
           for (const o of DIRS26) {
             const w = [v[0] + o[0], v[1] + o[1], v[2] + o[2]];
             if (!world.inBounds(...w)) continue;
-            const wood = world.isSolid(...w);
-            if (!wood && PLANT_KIND[world.getPlant(...w)] !== 3) continue;
-            const score = (wood ? 2 : 0) - (o[0] * back[0] + o[1] * back[1] + o[2] * back[2]) / Math.hypot(o[0], o[1], o[2]);
+            const ground = world.isSolid(...w);
+            if (!ground && !isWood(world.getPlant(...w))) continue;
+            const score = (ground ? 2 : 0) - (o[0] * back[0] + o[1] * back[1] + o[2] * back[2]) / Math.hypot(o[0], o[1], o[2]);
             if (score > best) { best = score; step = o; }
           }
           if (!step) continue;
         }
         const r = st.rad[k] + (st.rad[k + 1] - st.rad[k]) * u;
-        world.setPlant(v[0], v[1], v[2], twigId(branchBase(r * V), step));
+        world.setPlant(v[0], v[1], v[2], woodId(woodSizeFor(r * V), step));
         twigVoxels.push(v);
         placed.push(v);
         prev = v;
@@ -431,6 +320,11 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
   }
   const forkY = g.height + crownBase;
   // ---- leaves around the shoots and twigs, in empty voxels.
+  const toSegment = (a, b, px, py, pz) => {
+    const bx = b[0] - a[0], by = b[1] - a[1], bz = b[2] - a[2];
+    const t = Math.max(0, Math.min(1, ((px - a[0]) * bx + (py - a[1]) * by + (pz - a[2]) * bz) / (bx * bx + by * by + bz * bz)));
+    return Math.hypot(px - a[0] - bx * t, py - a[1] - by * t, pz - a[2] - bz * t);
+  };
   const noise = createNoise3D(Math.floor(random() * 1e9));
   let x0 = Infinity, x1 = -Infinity, cy0 = Infinity, cy1 = -Infinity, z0 = Infinity, z1 = -Infinity;
   const grow = (p, r) => {
@@ -465,7 +359,7 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
         // them), with broad lumps and a finer ragged edge from noise.
         let density = 0;
         const add = (q) => { if (q < 1) density += (1 - q) * (1 - q); };
-        for (const c of leafy) add((capsule({ a: c.a, b: c.b, ra: 0, rb: 0 }, px, py, pz).d / c.r) ** 2);
+        for (const c of leafy) add((toSegment(c.a, c.b, px, py, pz) / c.r) ** 2);
         for (const t of leafTips) add(((px - t.p[0]) ** 2 + ((py - t.p[1]) / 0.8) ** 2 + (pz - t.p[2]) ** 2) / (t.r * t.r));
         const q = ((px - env.c[0]) / env.r[0]) ** 2 + ((py - env.c[1]) / env.r[1]) ** 2 + ((pz - env.c[2]) / env.r[2]) ** 2;
         if (q < 1) density += 0.65 * (1 - q);
@@ -498,9 +392,8 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
   }
   for (const v of leaves) if (!reached.has(key(v))) world.setPlant(v[0], v[1], v[2], 0);
 
-  for (const v of twigVoxels) { grow(v, 1); }
-  world.markDirtyBox(Math.floor(Math.min(x0, bx0)) - pad, Math.floor(by0) - 1, Math.floor(Math.min(z0, bz0)) - pad,
-    Math.ceil(Math.max(x1, bx1)) + pad, Math.ceil(Math.max(cy1, by1)) + pad, Math.ceil(Math.max(z1, bz1)) + pad);
+  for (const v of twigVoxels) grow(v, 2);
+  world.markDirtyBox(Math.floor(x0), Math.floor(cy0), Math.floor(z0), Math.ceil(x1), Math.ceil(cy1), Math.ceil(z1));
   return true;
 }
 

@@ -5,7 +5,8 @@ import { placement, rotationForFacing, CUBE } from '../world/shapes.js';
 import {
   sculptSphere, smoothBrush, flattenBrush, placeShape, shapeSolidVoxels, breakCells, clearCells,
 } from '../world/edits.js';
-import { PLANTS, PLANT, PLANT_KIND, supportsPlant } from '../world/plants.js';
+import { PLANT, plantDef, plantKind, isWood, isSolidWood, woodRadius, supportsPlant } from '../world/plants.js';
+import { chop, chopTime, compass, severed, remove } from '../world/chop.js';
 import { meshChunk } from '../mesh/dualContour.js';
 import { averageColor } from '../render/textures.js';
 
@@ -33,8 +34,10 @@ const LEAF_COLOR = new THREE.Color(...averageColor('leaves'));
  * a ring showing the brush.
  */
 export class Interaction {
-  constructor({ world, scene, camera, chunkMeshes, player, hotbar }) {
+  constructor({ world, scene, camera, chunkMeshes, player, hotbar, felling = null }) {
     this.world = world;
+    this.felling = felling; // drops what an axe cuts through (see Felling); else it just goes
+    this.chopping = null; // { cell, t }: the axe's stroke under way
     this.camera = camera;
     this.chunkMeshes = chunkMeshes;
     this.player = player;
@@ -128,19 +131,31 @@ export class Interaction {
   // ---- targeting -----------------------------------------------------------
 
   /**
-   * What the crosshair is on: the nearest solid surface (chunk meshes), or a
-   * leaf voxel in front of it ({ leaf: [x, y, z] }, with the voxel face hit).
-   * Grass and flowers are looked through.
+   * What the crosshair is on: the nearest solid surface (chunk meshes, and
+   * thick wood: { wood: [x, y, z] }), or a leaf or twig voxel in front of it
+   * ({ leaf: [x, y, z] }, with the voxel face hit). Grass and flowers are
+   * looked through.
    */
   raycast(reach) {
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera({ x: 0, y: 0 }, this.camera);
     this.raycaster.far = reach;
-    const h = this.raycaster.intersectObjects(this.chunkMeshes.list, false)[0];
+    const h = this.raycaster.intersectObjects(this.chunkMeshes.colliders, false)[0];
     const leaf = this.leafRay(this.raycaster.ray, h ? h.distance : reach);
     if (leaf) return leaf;
     if (!h) return null;
-    return { point: h.point.clone(), normal: h.face.normal.clone() };
+    const cells = h.object.userData.cells;
+    const normal = h.face.normal.clone();
+    if (normal.dot(this.raycaster.ray.direction) > 0) normal.negate();
+    const hit = { point: h.point.clone(), normal };
+    if (cells) {
+      // (The BVH reorders the triangles by its index; each original triangle's
+      // three vertices are still its own, in order.)
+      const index = h.object.geometry.index;
+      const t = index ? Math.floor(index.array[h.faceIndex * 3] / 3) : h.faceIndex;
+      hit.wood = [cells[t * 3], cells[t * 3 + 1], cells[t * 3 + 2]];
+    }
+    return hit;
   }
 
   /** Voxel walk (Amanatides and Woo) along the ray for the first targetable plant within `far` metres. */
@@ -155,7 +170,8 @@ export class Interaction {
     let t = 0, axis = -1;
     while (t <= limit) {
       const id = this.world.getPlant(cell[0], cell[1], cell[2]);
-      if (id && PLANTS[id].targetable && axis >= 0) {
+      // (Thick wood is aimed at by its surface, in raycast.)
+      if (id && plantDef(id).targetable && !isSolidWood(id) && axis >= 0) {
         const normal = new THREE.Vector3();
         normal.setComponent(axis, -step[axis]);
         const point = new THREE.Vector3(o.x + d.x * t * VOXEL, o.y + d.y * t * VOXEL, o.z + d.z * t * VOXEL);
@@ -200,7 +216,7 @@ export class Interaction {
     q[k] += sign * 0.05;
     const origin = q.map((v, j) => Math.floor(v / L[j]) * L[j]);
     if (onGround) origin[1] = Math.round(p[1] / GROUND_LEVEL) * GROUND_LEVEL;
-    const overlaps = (t) => t.voxels.some(([x, y, z]) => w.isPiece(x, y, z));
+    const overlaps = (t) => t.voxels.some(([x, y, z]) => w.isPiece(x, y, z) || isSolidWood(w.getPlant(x, y, z)));
     let target = placement(item.shape, origin, rot, flip);
     if (overlaps(target)) {
       origin[k] += sign * L[k];
@@ -218,6 +234,7 @@ export class Interaction {
    */
   aimedVoxel() {
     if (this.hit.leaf) return this.hit.leaf;
+    if (this.hit.wood) return this.hit.wood;
     const { point, normal: n } = this.hit;
     const p = [point.x / VOXEL, point.y / VOXEL, point.z / VOXEL];
     const an = [Math.abs(n.x), Math.abs(n.y), Math.abs(n.z)];
@@ -241,10 +258,13 @@ export class Interaction {
    * What left mouse breaks: { cells, leaves }.
    *  - Pieces and ground break on the 1 m grid, whatever you hold: the whole
    *    piece within the metre cell you aim at (see edits.breakCells).
-   *  - Leaves break in the shape of the held item, on its grid: a 1 m item
-   *    clears the leaves of a whole metre, a small block one voxel.
+   *  - Leaves and twigs break in the shape of the held item, on its grid: a
+   *    1 m item clears a whole metre, a small block one voxel. A twig takes
+   *    whatever grows from it along.
+   *  - Thick wood takes an axe: nothing.
    */
   breakTarget(item) {
+    if (this.hit.wood) return { cells: [], leaves: true };
     const v = this.aimedVoxel();
     if (!this.hit.leaf) return { cells: breakCells(this.world, ...v), leaves: false };
     const L = item.shape ? item.shape.lattice : [1, 1, 1];
@@ -252,8 +272,28 @@ export class Interaction {
     const cells = [];
     for (let z = o[2]; z < o[2] + L[2]; z++)
       for (let y = o[1]; y < o[1] + L[1]; y++)
-        for (let x = o[0]; x < o[0] + L[0]; x++) if (PLANT_KIND[this.world.getPlant(x, y, z)] >= 2) cells.push([x, y, z]);
+        for (let x = o[0]; x < o[0] + L[0]; x++) if (this.breakable(this.world.getPlant(x, y, z))) cells.push([x, y, z]);
     return { cells, leaves: true };
+  }
+
+  /** Leaves and wood too thin to need an axe. */
+  breakable(id) {
+    return id === PLANT.LEAVES || (isWood(id) && !isSolidWood(id));
+  }
+
+  /** Clear leaf and twig voxels; twigs take whatever grows from them along. */
+  clearPlants(cells) {
+    const w = this.world;
+    const wood = cells.filter((c) => isWood(w.getPlant(...c)));
+    if (wood.length) remove(w, severed(w, wood));
+    let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+    for (const [x, y, z] of cells) {
+      if (w.getPlant(x, y, z) !== PLANT.LEAVES) continue;
+      w.setPlant(x, y, z, 0);
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y); z0 = Math.min(z0, z);
+      x1 = Math.max(x1, x); y1 = Math.max(y1, y); z1 = Math.max(z1, z);
+    }
+    if (x0 <= x1) w.markDirtyBox(x0, y0, z0, x1, y1, z1);
   }
 
   // ---- per frame -------------------------------------------------------------
@@ -265,6 +305,10 @@ export class Interaction {
     this.updateGizmos();
     if (!this.hit || !item) return;
 
+    if (item.id === 'axe') {
+      this.updateChop(dt);
+      return;
+    }
     if (item.kind !== 'tool') {
       if (this.lmb || this.rmb) {
         this.repeat -= dt;
@@ -301,17 +345,35 @@ export class Interaction {
   breakAction() {
     const { cells, leaves } = this.breakTarget(this.item);
     if (!cells.length) return;
-    if (!leaves) {
-      clearCells(this.world, cells);
-      return;
-    }
-    let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
-    for (const [x, y, z] of cells) {
-      this.world.setPlant(x, y, z, 0);
-      x0 = Math.min(x0, x); y0 = Math.min(y0, y); z0 = Math.min(z0, z);
-      x1 = Math.max(x1, x); y1 = Math.max(y1, y); z1 = Math.max(z1, z);
-    }
-    this.world.markDirtyBox(x0, y0, z0, x1, y1, z1);
+    if (!leaves) clearCells(this.world, cells);
+    else this.clearPlants(cells);
+  }
+
+  // ---- axe ------------------------------------------------------------------------
+
+  /**
+   * Holding left mouse with the axe on wood: a stroke every chopTime seconds
+   * (longer for thicker wood), each cutting an eighth deeper, on the side
+   * facing you (see chop.js). The eighth goes through, and what it frees falls.
+   */
+  updateChop(dt) {
+    const w = this.world;
+    const cell = this.hit?.wood || (this.hit?.leaf && isWood(w.getPlant(...this.hit.leaf)) ? this.hit.leaf : null);
+    if (!this.lmb || !cell) { this.chopping = null; return; }
+    if (!this.chopping || this.chopping.cell.some((c, k) => c !== cell[k])) this.chopping = { cell, t: 0 };
+    this.chopping.t += dt;
+    const per = chopTime(woodRadius(w.getPlant(...cell)));
+    if (this.chopping.t < per) return;
+    this.chopping.t -= per;
+    const p = this.player.pos;
+    const side = compass(p.x - (cell[0] + 0.5) * VOXEL, p.z - (cell[2] + 0.5) * VOXEL);
+    const set = chop(w, ...cell, side);
+    if (!set) return;
+    this.chopping = null;
+    // It falls away from you.
+    const away = [Math.cos((side * Math.PI) / 4), 0, Math.sin((side * Math.PI) / 4)].map((v) => -v);
+    if (this.felling) this.felling.fell(set, cell, away);
+    else remove(w, set);
   }
 
   buildAction(kind) {
@@ -363,7 +425,7 @@ export class Interaction {
           const y = Math.floor(c.y) + (dy % 2 ? (dy + 1) / 2 : -dy / 2);
           const here = w.getPlant(x, y, z);
           if (kind === 'remove') {
-            if (PLANT_KIND[here] === 1) { w.setPlant(x, y, z, 0); changed = true; break; }
+            if (plantKind(here) === 1) { w.setPlant(x, y, z, 0); changed = true; break; }
           } else if (supportsPlant(w, x, y, z, item.plant)) {
             if (!here) { w.setPlant(x, y, z, item.plant); changed = true; }
             break;
@@ -380,22 +442,25 @@ export class Interaction {
 
   // ---- tools ---------------------------------------------------------------------
 
-  /** Brushes never make terrain solid within half a voxel of the player. */
-  protect = (x, y, z) => this.player.intersectsVoxel(x, y, z, VOXEL * 0.5);
+  /** Brushes never make terrain solid within half a voxel of the player, or where there's solid wood. */
+  protect = (x, y, z) => this.player.intersectsVoxel(x, y, z, VOXEL * 0.5) || isSolidWood(this.world.getPlant(x, y, z));
 
   applyTool(item, dt) {
     const w = this.world;
     const r = this.radiusOf(item) / VOXEL; // voxels
     const { point, normal: n } = this.hit;
     const opts = { protect: this.protect };
-    // Digging tools also clear the leaves you aim at, within the brush.
+    // Digging tools also clear the leaves and twigs you aim at, within the
+    // brush; thick wood they leave alone (that takes an axe).
+    if (this.hit.wood) return;
     if (this.hit.leaf && this.lmb && (item.id === 'pickaxe' || item.id === 'shovel')) {
       const c = this.hit.leaf.map((v) => v + 0.5);
+      const cells = [];
       for (let z = Math.floor(c[2] - r); z <= Math.floor(c[2] + r); z++)
         for (let y = Math.floor(c[1] - r); y <= Math.floor(c[1] + r); y++)
           for (let x = Math.floor(c[0] - r); x <= Math.floor(c[0] + r); x++)
-            if (Math.hypot(x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]) <= r && PLANT_KIND[w.getPlant(x, y, z)] >= 2) w.setPlant(x, y, z, 0);
-      w.markDirtyBox(Math.floor(c[0] - r), Math.floor(c[1] - r), Math.floor(c[2] - r), Math.floor(c[0] + r), Math.floor(c[1] + r), Math.floor(c[2] + r));
+            if (Math.hypot(x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]) <= r && this.breakable(w.getPlant(x, y, z))) cells.push([x, y, z]);
+      this.clearPlants(cells);
       return;
     }
     if (item.id === 'pickaxe' || item.id === 'shovel') {
@@ -444,7 +509,7 @@ export class Interaction {
 
     const r = item.kind === 'plant' ? item.radius : this.radiusOf(item);
     const p = this.hit.point;
-    const color = { pickaxe: 0xff8a7c, shovel: this.rmb ? 0x7cff8a : 0xffb07c, trowel: 0x7cd8ff, level: 0xffd34d }[item.id] ?? 0x9be07a;
+    const color = { pickaxe: 0xff8a7c, shovel: this.rmb ? 0x7cff8a : 0xffb07c, trowel: 0x7cd8ff, level: 0xffd34d, axe: 0xffe08a }[item.id] ?? 0x9be07a;
     if (item.id === 'level') {
       const y = this.flattenY ?? Math.round(p.y);
       disc.position.set(p.x, y + 0.02, p.z);
@@ -456,7 +521,7 @@ export class Interaction {
       brush.position.copy(p);
       brush.scale.setScalar(r);
       brush.material.color.setHex(color);
-      brush.visible = item.kind === 'tool';
+      brush.visible = item.kind === 'tool' && item.id !== 'axe';
       ring.position.copy(p).addScaledVector(this.hit.normal, 0.03);
       ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), this.hit.normal);
     }

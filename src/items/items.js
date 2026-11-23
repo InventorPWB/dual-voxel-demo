@@ -6,16 +6,18 @@ import { PLANT } from '../world/plants.js';
  * Everything the player can hold. Same rule for every item, as in Minecraft:
  * left mouse breaks or digs, right mouse places or uses.
  *
- *  - Tools reshape the ground with smooth brushes.
+ *  - Tools reshape the ground with smooth brushes; the axe chops wood.
  *  - Building items are a material + a shape: right mouse places the shape,
  *    left mouse carves the same shape out, Shift + right mouse repaints.
  *  - Plant items fill the plant layer: Leaves places a 1 m block of leaf
  *    voxels like a building piece; Grass plants (or pulls up) grass under a
  *    small brush.
- * Whatever you hold, left mouse on a leaf you aim at removes it.
+ * Whatever you hold, left mouse on a leaf or twig you aim at removes it;
+ * thick wood takes the axe.
  */
 export const TOOLS = [
   { kind: 'tool', id: 'pickaxe', name: 'Pickaxe', use: 'Hold left mouse to dig', radius: 1.5 },
+  { kind: 'tool', id: 'axe', name: 'Axe', use: 'Hold left mouse on wood to chop it', radius: 0.25 },
   { kind: 'tool', id: 'shovel', name: 'Shovel', use: 'Left mouse digs · right mouse raises ground', radius: 2 },
   { kind: 'tool', id: 'trowel', name: 'Trowel', use: 'Hold to smooth', radius: 2 },
   { kind: 'tool', id: 'level', name: 'Level', use: 'Hold to flatten to the height you clicked', radius: 2.5 },
@@ -66,13 +68,13 @@ export const HOTBAR_SIZE = 9;
 export function defaultHotbar() {
   return [
     TOOL.pickaxe,
+    TOOL.axe,
     TOOL.shovel,
     TOOL.trowel,
     TOOL.level,
     buildItem(MAT.PLANKS, 'block'),
     buildItem(MAT.BRICK, 'slope'),
     buildItem(MAT.GLASS, 'block'),
-    buildItem(MAT.STAINED_GLASS, 'block'),
     PLANT_ITEM.leaves,
   ];
 }

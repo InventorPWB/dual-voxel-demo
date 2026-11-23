@@ -20,8 +20,8 @@ const AXES = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
  * CSG, see csg.js). Terrain never extends into a building voxel; it stops
  * exactly at its faces. Below the world is solid bedrock; beside and above, air.
  *
- * Empty voxels may hold a plant (grass, leaves, ...; see plants.js). Plants
- * are never solid; a voxel that becomes solid loses its plant.
+ * Empty voxels may hold a plant (grass, leaves, trees' wood; see plants.js).
+ * A voxel that becomes solid loses its plant.
  */
 export class World {
   constructor(nx = 8, ny = 4, nz = 8, size = CHUNK_SIZE) {
@@ -228,7 +228,7 @@ export class World {
         for (let dx = -1; dx <= 1 && !plant; dx++) {
           const nx = cx + dx, ny = cy + dy, nz = cz + dz;
           if (nx < 0 || ny < 0 || nz < 0 || nx >= this.nx || ny >= this.ny || nz >= this.nz) continue;
-          if (this.chunks[this.chunkIndex(nx, ny, nz)].plant) plant = new Uint8Array(N * N * N);
+          if (this.chunks[this.chunkIndex(nx, ny, nz)].plant) plant = new Uint16Array(N * N * N);
         }
     let plants = 0;
     const e = [0, 0, 0];

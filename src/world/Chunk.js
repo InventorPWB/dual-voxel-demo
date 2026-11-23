@@ -10,7 +10,7 @@
  *          differs at its ends), `t` is where along it (0..1, stored ×255) and
  *          `n` is the surface normal there (2 bytes, packed). Allocated only
  *          once the chunk has any surface.
- * plant – plant id per voxel (see plants.js; grass, leaves, ...), only in
+ * plant – plant id per voxel (16 bits; see plants.js: grass, leaves, wood), only in
  *         empty voxels. Allocated only once the chunk has a plant.
  * cut   – per voxel, bits 0-2: its +x, +y, +z edges were opened by an edit
  *         (wood on one end, a voxel that was removed on the other), so the
@@ -25,7 +25,7 @@ export class Chunk {
     this.shape = new Uint8Array(size * size * size);
     this.t = null; // Uint8Array(n * 3)
     this.n = null; // Uint8Array(n * 6)
-    this.plant = null; // Uint8Array(n)
+    this.plant = null; // Uint16Array(n)
     this.cut = null; // Uint8Array(n)
   }
 
@@ -46,6 +46,6 @@ export class Chunk {
   }
 
   ensurePlants() {
-    if (!this.plant) this.plant = new Uint8Array(this.mat.length);
+    if (!this.plant) this.plant = new Uint16Array(this.mat.length);
   }
 }
