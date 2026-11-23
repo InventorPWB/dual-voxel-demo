@@ -1,161 +1,194 @@
 import * as THREE from 'three';
 import { MATERIALS } from '../world/materials.js';
-import { TEX_SIZE, texturePixels } from './textures.js';
+import { textureArray } from './textureArray.js';
+import { LIGHTING_GLSL, lightingUniforms } from './lighting.js';
+import { DEPTH_PARAMS, HIDDEN } from './SunShadow.js';
 
-export const SKY_COLOR = 0xa9cdee;
+export { SKY_COLOR, SUN_AZIMUTH, SUN_ELEVATION, sunDirection } from './lighting.js';
 
-/** Direction towards the sun at the start (azimuth and elevation in radians). */
-export const SUN_AZIMUTH = Math.atan2(0.35, 0.45);
-export const SUN_ELEVATION = 0.95;
+const SURFACE_GLSL = /* glsl */ `
+  // Triplanar pixel-art texturing, one tile per metre in world space, so
+  // brick and plank patterns line up across neighbouring shapes.
+  vec4 triplanar(vec3 pos, vec3 n, int mat) {
+    vec3 w = pow(abs(n), vec3(8.0));
+    w /= (w.x + w.y + w.z);
+    vec3 L = uLayers[mat];
+    // Nudge sample points off exact grid faces so nearest filtering is stable.
+    vec3 p = pos - n * 0.001;
+    vec4 cx = texture(uTex, vec3(p.z, p.y, L.y));
+    vec4 cy = texture(uTex, vec3(p.x, p.z, n.y >= 0.0 ? L.x : L.z));
+    vec4 cz = texture(uTex, vec3(p.x, p.y, L.y));
+    return cx * w.x + cy * w.y + cz * w.z;
+  }
 
-export function sunDirection(azimuth, elevation = SUN_ELEVATION, out = new THREE.Vector3()) {
-  const c = Math.cos(elevation);
-  return out.set(Math.cos(azimuth) * c, Math.sin(elevation), Math.sin(azimuth) * c);
-}
+  // One texture over a whole building piece, following its shape. local.xyz:
+  // the point within the piece (0..1 per axis); local.w: 1 box or wedge,
+  // 2 round (pillar), 3 sphere. Also draws the material's frame, if any,
+  // along the piece's outline (a square on boxes, a circle on pillar caps).
+  vec4 pieceTexture(vec3 n, vec4 local, int mat) {
+    vec3 l = local.xyz;
+    int kind = int(local.w + 0.5);
+    vec3 L = uLayers[mat];
+    vec3 a = abs(n);
+    bool vertical = a.y >= a.x && a.y >= a.z;
+    float capLayer = n.y >= 0.0 ? L.x : L.z;
+    vec2 uv;
+    float layer, edge;
+    if (kind == 2 && !vertical) {
+      // Round side: wrapped round the pillar's axis, about 1 tile per metre.
+      float turn = atan(l.z - 0.5, l.x - 0.5) / 6.2831853 + 0.5;
+      uv = vec2(turn * 3.0, l.y);
+      layer = L.y;
+      edge = min(l.y, 1.0 - l.y);
+    } else if (kind == 2) {
+      uv = l.xz;
+      layer = capLayer;
+      edge = 0.5 - length(l.xz - 0.5);
+    } else {
+      uv = vertical ? l.xz : a.x >= a.z ? l.zy : l.xy;
+      layer = vertical ? capLayer : L.y;
+      edge = kind == 3 ? 1.0 : min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    }
+    vec4 c = texture(uTex, vec3(uv, layer));
+    vec4 frame = uFrame[mat];
+    if (frame.a > 0.0 && edge < 0.045) c = frame;
+    return c;
+  }
+
+  vec4 surface(vec3 pos, vec3 n, vec4 local, int mat) {
+    if (local.w > 0.5 && uPieceMap[mat] > 0.5) return pieceTexture(n, local, mat);
+    return triplanar(pos, n, mat);
+  }
+`;
 
 /**
- * The one material for the voxel world: triplanar-mapped pixel-art textures
- * from a texture array (one tile per metre in world space, so brick and plank
- * patterns line up across neighbouring shapes), wrap-Lambert sun with
- * real-time shadows from `shadow` (a SunShadow), hemisphere ambient, baked AO
- * and fog. Blocks, shaped pieces and smooth terrain all share it, so they all
- * cast and receive shadows the same way.
+ * Materials for the solid chunk meshes, one per render pass (the mesher's
+ * groups): [opaque, cutout, translucent]. All share one shader and the
+ * shared lighting, so blocks, shaped pieces, smooth terrain and glass sit in
+ * the same light and cast and receive the same shadows.
+ *  - cutout (glass): alpha-tested, front faces only
+ *    (like Minecraft: you don't see a block's far side through it);
+ *  - translucent (stained glass): blended, no depth writes, front faces only.
+ * Also returns matching depth-only materials for the sun's shadow map:
+ * glass frames cast shadows, stained glass casts none.
  */
-export function createTerrainMaterial(shadow) {
-  // Build the texture array: one layer per distinct texture name.
-  const names = [];
-  const layerOf = (n) => {
-    let i = names.indexOf(n);
-    if (i < 0) { names.push(n); i = names.length - 1; }
-    return i;
-  };
+export function createChunkMaterials(shadow) {
+  const { texture, layerOf } = textureArray();
   const layers = MATERIALS.map((m) =>
     m.id === 0 ? new THREE.Vector3() : new THREE.Vector3(layerOf(m.top), layerOf(m.side), layerOf(m.bottom)),
   );
+  const frames = MATERIALS.map((m) => new THREE.Vector4(...(m.frame || [0, 0, 0, 0])));
+  const pieceMap = MATERIALS.map((m) => (m.mapping === 'piece' ? 1 : 0));
+  const shared = {
+    uTex: { value: texture }, uLayers: { value: layers }, uFrame: { value: frames }, uPieceMap: { value: pieceMap },
+  };
+  const head = /* glsl */ `
+    precision highp sampler2DArray;
+    uniform sampler2DArray uTex;
+    uniform vec3 uLayers[${layers.length}];
+    uniform vec4 uFrame[${layers.length}];
+    uniform float uPieceMap[${layers.length}];
+  `;
 
-  const S = TEX_SIZE;
-  const data = new Uint8Array(S * S * 4 * names.length);
-  names.forEach((name, layer) => {
-    const px = texturePixels(name);
-    // Flip rows so image "up" maps to +v (world up on side faces).
-    for (let y = 0; y < S; y++) {
-      const src = y * S * 4;
-      const dst = layer * S * S * 4 + (S - 1 - y) * S * 4;
-      data.set(px.subarray(src, src + S * 4), dst);
+  const vertexShader = /* glsl */ `
+    in float material;
+    in float ao;
+    in vec4 local;
+    out vec3 vPos;
+    out vec3 vNormal;
+    out vec4 vLocal;
+    flat out int vMat;
+    out float vAo;
+    out float vDepth;
+    void main() {
+      vPos = position;
+      vLocal = local;
+      vNormal = normal;
+      vMat = int(material + 0.5);
+      vAo = ao;
+      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vDepth = -mv.z;
+      gl_Position = projectionMatrix * mv;
     }
-  });
-  const tex = new THREE.DataArrayTexture(data, S, S, names.length);
-  tex.format = THREE.RGBAFormat;
-  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.magFilter = THREE.NearestFilter;
-  tex.minFilter = THREE.NearestMipmapLinearFilter;
-  tex.generateMipmaps = true;
-  tex.anisotropy = 4;
-  tex.needsUpdate = true;
+  `;
 
-  const raw = (hex) => new THREE.Color().setHex(hex, THREE.LinearSRGBColorSpace);
+  const fragmentShader = /* glsl */ `
+    ${head}
+    ${LIGHTING_GLSL}
+    ${SURFACE_GLSL}
+    in vec3 vPos;
+    in vec3 vNormal;
+    in vec4 vLocal;
+    flat in int vMat;
+    in float vAo;
+    in float vDepth;
+    layout(location = 0) out vec4 outColor;
 
-  const params = {
+    void main() {
+      vec3 n = normalize(vNormal);
+      vec4 tex = surface(vPos, n, vLocal, vMat);
+      vec3 color = fog(shade(tex.rgb, vPos, n, vAo, 0.2, 0.0), vDepth);
+      #if defined(CUTOUT)
+        if (cutout(tex.a)) discard;
+        outColor = vec4(color, 1.0);
+      #elif defined(TRANSLUCENT)
+        outColor = vec4(color, tex.a);
+      #else
+        outColor = vec4(color, 1.0);
+      #endif
+    }
+  `;
+
+  const make = (defines, extra) => new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
-    uniforms: {
-      uTex: { value: tex },
-      uLayers: { value: layers },
-      uSunDir: { value: shadow.direction },
-      uShadowMap: { value: shadow.texture },
-      uShadowMatrix: { value: shadow.matrix },
-      uShadowTexel: { value: shadow.texel }, // (uv per texel, metres per texel)
-      uSunColor: { value: raw(0xfff1d6) },
-      uSkyColor: { value: raw(0xc4dcf5) },
-      uGroundColor: { value: raw(0x6b5a48) },
-      uFogColor: { value: raw(SKY_COLOR) },
-      uFogDensity: { value: 0.0085 },
-    },
+    defines,
+    uniforms: { ...lightingUniforms(shadow), ...shared },
+    vertexShader,
+    fragmentShader,
+    ...extra,
+  });
+
+  const materials = [
+    make({}, {}),
+    make({ CUTOUT: '' }, {}),
+    make({ TRANSLUCENT: '' }, { transparent: true, depthWrite: false }),
+  ];
+
+  // Shadow casters: opaque as plain depth; glass alpha-tested so only its frame casts.
+  const cutoutDepth = new THREE.ShaderMaterial({
+    glslVersion: THREE.GLSL3,
+    uniforms: shared,
     vertexShader: /* glsl */ `
       in float material;
-      in float ao;
+      in vec4 local;
       out vec3 vPos;
       out vec3 vNormal;
+      out vec4 vLocal;
       flat out int vMat;
-      out float vAo;
-      out float vDepth;
       void main() {
         vPos = position;
         vNormal = normal;
+        vLocal = local;
         vMat = int(material + 0.5);
-        vAo = ao;
-        vec4 mv = modelViewMatrix * vec4(position, 1.0);
-        vDepth = -mv.z;
-        gl_Position = projectionMatrix * mv;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }
     `,
     fragmentShader: /* glsl */ `
-      precision highp sampler2DArray;
-      uniform sampler2DArray uTex;
-      uniform vec3 uLayers[${layers.length}];
-      uniform vec3 uSunDir;
-      uniform vec3 uSunColor;
-      uniform vec3 uSkyColor;
-      uniform vec3 uGroundColor;
-      uniform vec3 uFogColor;
-      uniform float uFogDensity;
-      uniform highp sampler2DShadow uShadowMap;
-      uniform mat4 uShadowMatrix;
-      uniform vec2 uShadowTexel;
+      ${head}
+      ${SURFACE_GLSL}
       in vec3 vPos;
       in vec3 vNormal;
+      in vec4 vLocal;
       flat in int vMat;
-      in float vAo;
-      in float vDepth;
       layout(location = 0) out vec4 outColor;
-
-      // Sun visibility: 0 = fully shadowed, 1 = lit.
-      float sunShadow(vec3 n, float ndl) {
-        // Normal offset, larger on grazing surfaces, keeps a surface from
-        // shadowing itself (acne) without detaching shadows from their casters.
-        float slope = 1.0 - clamp(ndl, 0.0, 1.0);
-        vec3 wp = vPos + n * uShadowTexel.y * (1.0 + 2.5 * slope);
-        vec3 sc = (uShadowMatrix * vec4(wp, 1.0)).xyz;
-        if (sc.x <= 0.0 || sc.x >= 1.0 || sc.y <= 0.0 || sc.y >= 1.0 || sc.z >= 1.0) return 1.0;
-        sc.z -= 0.0002;
-        // 3×3 taps of hardware 2×2 PCF: a smooth 4×4 tent, soft but still crisp at contact.
-        float s = 0.0;
-        float d = uShadowTexel.x;
-        for (int y = -1; y <= 1; y++)
-          for (int x = -1; x <= 1; x++)
-            s += texture(uShadowMap, vec3(sc.xy + vec2(x, y) * d, sc.z));
-        return s / 9.0;
-      }
-
       void main() {
-        vec3 n = normalize(vNormal);
-        vec3 w = pow(abs(n), vec3(8.0));
-        w /= (w.x + w.y + w.z);
-        vec3 L = uLayers[vMat];
-        // Nudge sample points off exact grid faces so nearest filtering is stable.
-        vec3 p = vPos - n * 0.001;
-        vec3 cx = texture(uTex, vec3(p.z, p.y, L.y)).rgb;
-        vec3 cy = texture(uTex, vec3(p.x, p.z, n.y >= 0.0 ? L.x : L.z)).rgb;
-        vec3 cz = texture(uTex, vec3(p.x, p.y, L.y)).rgb;
-        vec3 albedo = cx * w.x + cy * w.y + cz * w.z;
-
-        // Half-Lambert-ish wrap keeps slopes facing away from the sun from going muddy.
-        float ndl = dot(n, uSunDir);
-        float sun = clamp(ndl * 0.8 + 0.2, 0.0, 1.0);
-        // Faces turned away from the sun are in their own shadow, so the wrap
-        // light fades out towards the terminator instead of meeting a hard
-        // shadow edge there. Only look the map up where it can matter.
-        float facing = smoothstep(-0.15, 0.25, ndl);
-        float vis = facing > 0.0 ? min(facing, sunShadow(n, ndl)) : 0.0;
-        vec3 hemi = mix(uGroundColor, uSkyColor, n.y * 0.5 + 0.5);
-        // Shadowed areas keep a little cool sky fill so they read as shade, not as holes.
-        vec3 light = hemi * 0.62 + uSunColor * sun * vis * 0.72 + uSkyColor * (1.0 - vis) * sun * 0.06;
-        vec3 color = albedo * light * vAo;
-
-        float f = 1.0 - exp(-pow(vDepth * uFogDensity, 2.0));
-        outColor = vec4(mix(color, uFogColor, f), 1.0);
+        if (surface(vPos, normalize(vNormal), vLocal, vMat).a < 0.5) discard;
+        outColor = vec4(1.0);
       }
     `,
-  };
+    ...DEPTH_PARAMS,
+  });
+  const shadowMaterials = [new THREE.MeshBasicMaterial(DEPTH_PARAMS), cutoutDepth, HIDDEN];
 
-  return new THREE.ShaderMaterial(params);
+  return { materials, shadowMaterials };
 }

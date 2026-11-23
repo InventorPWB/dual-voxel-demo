@@ -1,6 +1,6 @@
 import { MATERIALS, MAT } from './materials.js';
 import { applyCSG } from './csg.js';
-import { CUBE } from './shapes.js';
+import { settlePlants } from './plants.js';
 
 /**
  * World edit rules shared by every tool.
@@ -11,6 +11,8 @@ import { CUBE } from './shapes.js';
  *    re-fits the surface. They never touch building pieces.
  *  - Nothing ever becomes solid inside the player (pass `protect`).
  * After terrain edits, tiny disconnected bits left floating are dissolved.
+ * Floor plants go with whatever they stood on (settlePlants); wood needs
+ * no support (see chop.js).
  */
 
 /** Disconnected pieces this many voxels or smaller are removed after brush edits. */
@@ -98,6 +100,7 @@ export function removeSpecks(world, r) {
 
 function cleanup(world, box) {
   removeSpecks(world, region(world, box[0] - 2, box[1] - 2, box[2] - 2, box[3] + 2, box[4] + 2, box[5] + 2));
+  settlePlants(world, [box[0] - 3, box[1] - 3, box[2] - 3, box[3] + 3, box[4] + 3, box[5] + 3]);
 }
 
 // ----------------------------------------------------------------- brushes
@@ -244,23 +247,36 @@ function falloff(t) {
 
 // ------------------------------------------------------------------ shapes
 
+/**
+ * Add a metre of natural ground (`material`) as terrain: a cube on the 1 m
+ * grid with corner `o` (voxels), rounded off so it runs into the ground
+ * around it, which keeps its own material. The counterpart of breaking ground,
+ * which takes out a metre cell (see breakCells).
+ */
+export function placeTerrain(world, o, material, opts = {}) {
+  const c = [o[0] + 1, o[1] + 1, o[2] + 1], h = 1, round = 0.45;
+  const sdf = (x, y, z) => {
+    const q = [Math.abs(x - c[0]) - (h - round), Math.abs(y - c[1]) - (h - round), Math.abs(z - c[2]) - (h - round)];
+    const out = Math.hypot(Math.max(q[0], 0), Math.max(q[1], 0), Math.max(q[2], 0));
+    return -(out + Math.min(Math.max(q[0], q[1], q[2]), 0) - round);
+  };
+  const box = [o[0] - 1, o[1] - 1, o[2] - 1, o[0] + 2, o[1] + 2, o[2] + 2];
+  const res = applyCSG(world, 'union', box, sdf, { material, keep: true, protect: opts.protect });
+  if (res.touched) cleanup(world, box);
+  return res.changed;
+}
+
 /** Voxels a placed shape fills, as [x, y, z]. */
 export function shapeSolidVoxels(world, p) {
   return p.voxels.filter(([x, y, z]) => world.inBounds(x, y, z)).map(([x, y, z]) => [x, y, z]);
 }
 
-/** How far a foundation may reach down to the ground under a piece, in voxels. */
-const FOUNDATION = 2;
-
 /**
  * Place a building piece (see shapes.js `placement`) in `material`. Its
  * voxels replace whatever was there; terrain around it now ends on its faces.
- * With `foundation`, gaps of up to a metre between its bottom and the ground
- * are filled with cubes of the same material, so it never floats above
- * uneven ground.
+ * Nothing else is filled in: a piece over a dip in the ground leaves the gap.
  */
-export function placeShape(world, p, material, { foundation = false } = {}) {
-  const inPiece = new Set(p.voxels.map(([x, y, z]) => `${x},${y},${z}`));
+export function placeShape(world, p, material) {
   let n = 0;
   const [ox, oy, oz] = p.origin;
   for (const [x, y, z, state] of p.voxels) {
@@ -268,48 +284,92 @@ export function placeShape(world, p, material, { foundation = false } = {}) {
     world.setVoxel(x, y, z, material, state, [x - ox, y - oy, z - oz]);
     n++;
   }
-  if (foundation) {
-    for (const [x, y, z] of p.voxels) {
-      if (inPiece.has(`${x},${y - 1},${z}`)) continue; // not a bottom voxel
-      let depth = 0;
-      while (depth < FOUNDATION && y - 1 - depth >= 1 && !world.isSolid(x, y - 1 - depth, z)) depth++;
-      if (depth === 0 || depth >= FOUNDATION && !world.isSolid(x, y - 1 - depth, z)) continue; // resting, or nothing below
-      for (let k = 1; k <= depth; k++) world.setVoxel(x, y - k, z, material, CUBE);
-    }
-  }
-  world.markDirtyBox(ox - 1, oy - FOUNDATION - 1, oz - 1, ox + p.size[0], oy + p.size[1], oz + p.size[2]);
+  world.markDirtyBox(ox - 1, oy - 1, oz - 1, ox + p.size[0], oy + p.size[1], oz + p.size[2]);
+  // A piece with a rounded or sloped top can't carry the plants above it.
+  settlePlants(world, [ox, oy, oz, ox + p.size[0] - 1, oy + p.size[1], oz + p.size[2] - 1]);
   return n;
 }
 
+/** Corner (voxel) of the 1 m grid cell holding voxel (x, y, z). */
+export const meterCell = (x, y, z) => [x & ~1, y & ~1, z & ~1];
+
 /**
- * Clear a box of voxels (a piece's cell, or a cell of ground), pieces and
- * terrain alike. Terrain left around it gets flat faces on the box's sides.
+ * What breaking voxel (x, y, z) removes, on the 1 m grid. Within the metre
+ * cell that holds it:
+ *  - a building piece: every voxel of the same piece (same material, placed
+ *    from the same corner). So a 1 m block, slope or pillar goes whole, while
+ *    two slabs sharing a metre, or eight small blocks, go one at a time;
+ *  - smooth terrain: all the terrain in the cell.
+ * Returns [[x, y, z], ...] (empty if the voxel is empty).
  */
-export function clearBox(world, x0, y0, z0, x1, y1, z1) {
-  let n = 0;
-  for (let z = z0; z <= z1; z++)
-    for (let y = Math.max(1, y0); y <= y1; y++)
-      for (let x = x0; x <= x1; x++) {
-        if (!world.isSolid(x, y, z)) continue;
-        world.setVoxel(x, y, z, 0, 0);
-        n++;
-      }
-  if (!n) return 0;
-  const inBox = (x, y, z) => x >= x0 && x <= x1 && y >= Math.max(1, y0) && y <= y1 && z >= z0 && z <= z1;
-  // Terrain that now borders the hole: a flat face on the cell boundary.
-  for (let z = z0 - 1; z <= z1 + 1; z++)
-    for (let y = Math.max(1, y0 - 1); y <= y1 + 1; y++)
-      for (let x = x0 - 1; x <= x1 + 1; x++) {
-        if (!world.isTerrain(x, y, z)) continue;
-        for (let a = 0; a < 3; a++) {
-          const [dx, dy, dz] = AXES[a];
-          if (inBox(x + dx, y + dy, z + dz)) world.setEdge(x, y, z, a, 0.5, dx, dy, dz);
-          if (inBox(x - dx, y - dy, z - dz)) world.setEdge(x - dx, y - dy, z - dz, a, 0.5, -dx, -dy, -dz);
+export function breakCells(world, x, y, z) {
+  if (!world.isSolid(x, y, z) || y < 1) return [];
+  const [cx, cy, cz] = meterCell(x, y, z);
+  const out = [];
+  if (world.isPiece(x, y, z)) {
+    const mat = world.getMat(x, y, z);
+    const o = world.getPieceOffset(x, y, z);
+    const corner = [x - o[0], y - o[1], z - o[2]];
+    for (let dz = 0; dz < 2; dz++)
+      for (let dy = 0; dy < 2; dy++)
+        for (let dx = 0; dx < 2; dx++) {
+          const vx = cx + dx, vy = cy + dy, vz = cz + dz;
+          if (!world.isPiece(vx, vy, vz) || world.getMat(vx, vy, vz) !== mat) continue;
+          const q = world.getPieceOffset(vx, vy, vz);
+          if (vx - q[0] === corner[0] && vy - q[1] === corner[1] && vz - q[2] === corner[2]) out.push([vx, vy, vz]);
         }
-      }
+  } else {
+    for (let dz = 0; dz < 2; dz++)
+      for (let dy = 0; dy < 2; dy++)
+        for (let dx = 0; dx < 2; dx++)
+          if (cy + dy >= 1 && world.isTerrain(cx + dx, cy + dy, cz + dz)) out.push([cx + dx, cy + dy, cz + dz]);
+  }
+  return out;
+}
+
+/**
+ * Clear a set of voxels ([[x, y, z], ...]), pieces and terrain alike.
+ * Terrain left beside a cleared voxel gets a flat face on the shared side.
+ */
+export function clearCells(world, cells) {
+  const key = (x, y, z) => `${x},${y},${z}`;
+  const gone = new Set();
+  let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+  for (const [x, y, z] of cells) {
+    if (y < 1 || !world.isSolid(x, y, z)) continue;
+    world.setVoxel(x, y, z, 0, 0);
+    gone.add(key(x, y, z));
+    x0 = Math.min(x0, x); y0 = Math.min(y0, y); z0 = Math.min(z0, z);
+    x1 = Math.max(x1, x); y1 = Math.max(y1, y); z1 = Math.max(z1, z);
+  }
+  if (!gone.size) return 0;
+  // Terrain that now borders the hole: a flat face on the cell boundary.
+  for (const k of gone) {
+    const [x, y, z] = k.split(',').map(Number);
+    for (let a = 0; a < 3; a++) {
+      const [dx, dy, dz] = AXES[a];
+      if (world.isTerrain(x - dx, y - dy, z - dz)) world.setEdge(x - dx, y - dy, z - dz, a, 0.5, dx, dy, dz);
+      if (world.isTerrain(x + dx, y + dy, z + dz)) world.setEdge(x, y, z, a, 0.5, -dx, -dy, -dz);
+    }
+  }
   world.markDirtyBox(x0 - 1, y0 - 1, z0 - 1, x1 + 1, y1 + 1, z1 + 1);
   removeSpecks(world, region(world, x0 - 3, y0 - 3, z0 - 3, x1 + 3, y1 + 3, z1 + 3));
-  return n;
+  settlePlants(world, [x0 - 3, y0 - 3, z0 - 3, x1 + 3, y1 + 4, z1 + 3]);
+  return gone.size;
+}
+
+/** Break what's at voxel (x, y, z) on the 1 m grid (see breakCells). Returns voxels removed. */
+export function breakAt(world, x, y, z) {
+  return clearCells(world, breakCells(world, x, y, z));
+}
+
+/** Clear a box of voxels, pieces and terrain alike (inclusive bounds). */
+export function clearBox(world, x0, y0, z0, x1, y1, z1) {
+  const cells = [];
+  for (let z = z0; z <= z1; z++)
+    for (let y = Math.max(1, y0); y <= y1; y++)
+      for (let x = x0; x <= x1; x++) cells.push([x, y, z]);
+  return clearCells(world, cells);
 }
 
 /** Remove what's in a placed shape's footprint (its whole cell). */

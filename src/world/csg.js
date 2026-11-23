@@ -15,6 +15,7 @@
 
 const AXES = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 const scratch = [0, 0, 0];
+
 const nrm = [0, 0, 0];
 
 /** Outward unit normal of an SDF at p (negative gradient), by central differences. */
@@ -94,6 +95,7 @@ export function applyCSG(world, op, box, sdf, options = {}) {
 
   // 1. Solidity and material.
   let changed = 0, touched = false;
+  const removed = [];
   for (let z = z0; z <= z1; z++)
     for (let y = y0; y <= y1; y++)
       for (let x = x0; x <= x1; x++) {
@@ -107,10 +109,12 @@ export function applyCSG(world, op, box, sdf, options = {}) {
           }
         } else if (was && !now) {
           world.setMat(x, y, z, 0);
+          removed.push(x, y, z);
           touched = true;
         }
         if (was !== now) changed++;
       }
+
 
   // 2. Edges with at least one end in the box.
   const s = scratch;

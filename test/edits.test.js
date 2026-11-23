@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { VOXEL } from '../src/world/World.js';
 import { MAT } from '../src/world/materials.js';
-import { sculptSphere, smoothBrush, flattenBrush, placeShape, removeShape, shapeSolidVoxels, SPECK_MAX_VOXELS } from '../src/world/edits.js';
+import { sculptSphere, smoothBrush, flattenBrush, placeShape, removeShape, shapeSolidVoxels, breakCells, breakAt, SPECK_MAX_VOXELS } from '../src/world/edits.js';
 import { SHAPE, SHAPES, placement } from '../src/world/shapes.js';
 import { flatWorld, slopedWorld, meshAll, triangles, centroid, faceNormal, interiorOpenEdges, openEdges, holes, parts, GROUND } from './helpers.js';
 
@@ -109,14 +109,11 @@ describe('shapes on natural (off-grid) ground', () => {
     expect(tris.length).toBeGreaterThan(100);
   });
 
-  it('gives a piece on uneven ground a foundation down to it', () => {
+  it('fills nothing in under a piece on uneven ground', () => {
     const w2 = slopedWorld(0.27);
     // Bottom at voxel 14; the ground under it lies between about 12.3 and 12.9.
-    placeShape(w2, placement(SHAPE.block, [10, 14, 22]), MAT.BRICK, { foundation: true });
-    for (const [x, z] of [[10, 22], [11, 23]]) {
-      expect(w2.isPiece(x, 13, z)).toBe(true);
-      expect(w2.isSolid(x, 12, z)).toBe(true);
-    }
+    placeShape(w2, placement(SHAPE.block, [10, 14, 22]), MAT.BRICK);
+    for (const [x, z] of [[10, 22], [11, 23]]) expect(w2.isSolid(x, 13, z)).toBe(false);
   });
 });
 
@@ -148,6 +145,39 @@ describe('shapes', () => {
     }
   });
 
+  it('breaks a whole 1 m piece, whichever of its voxels you aim at', () => {
+    const w = flatWorld();
+    placeShape(w, placement(SHAPE.slope, [10, GROUND, 10], 1), MAT.BRICK);
+    const filled = placement(SHAPE.slope, [10, GROUND, 10], 1).voxels.length;
+    expect(breakCells(w, 11, GROUND + 1, 11)).toHaveLength(filled);
+    breakAt(w, 10, GROUND, 10);
+    for (let z = 10; z < 12; z++) for (let y = GROUND; y < GROUND + 2; y++) for (let x = 10; x < 12; x++) expect(w.isSolid(x, y, z)).toBe(false);
+  });
+
+  it('breaks one of two slabs sharing a metre, and one small block at a time', () => {
+    const w = flatWorld();
+    placeShape(w, placement(SHAPE.slab, [10, GROUND, 10]), MAT.BRICK);
+    placeShape(w, placement(SHAPE.slab, [10, GROUND + 1, 10]), MAT.BRICK);
+    breakAt(w, 11, GROUND + 1, 11);
+    expect(w.isSolid(10, GROUND + 1, 10)).toBe(false);
+    expect(w.isSolid(11, GROUND, 11)).toBe(true);
+    placeShape(w, placement(SHAPE.small, [14, GROUND, 10]), MAT.BRICK);
+    placeShape(w, placement(SHAPE.small, [15, GROUND, 10]), MAT.BRICK);
+    breakAt(w, 15, GROUND, 10);
+    expect(w.isSolid(14, GROUND, 10)).toBe(true);
+    expect(w.isSolid(15, GROUND, 10)).toBe(false);
+  });
+
+  it('breaks a metre of ground at a time, leaving pieces in it alone', () => {
+    const w = flatWorld();
+    placeShape(w, placement(SHAPE.small, [10, GROUND - 1, 10]), MAT.BRICK);
+    breakAt(w, 11, GROUND - 1, 11);
+    expect(w.isSolid(11, GROUND - 2, 11)).toBe(false);
+    expect(w.isSolid(10, GROUND - 1, 10)).toBe(true);
+    expect(w.isSolid(12, GROUND - 1, 10)).toBe(true);
+    expect(interiorOpenEdges(w)).toEqual([]);
+  });
+
   it('a slope turns to rise away from the player', () => {
     const facing = [[0, 1], [1, 0], [0, -1], [-1, 0]];
     for (let rot = 0; rot < 4; rot++) {
@@ -172,7 +202,8 @@ describe('shapes', () => {
       const s = SHAPES[Math.floor(rnd() * SHAPES.length)];
       const p = placement(s, [2 + Math.floor(rnd() * 26), GROUND - 2 + Math.floor(rnd() * 8), 2 + Math.floor(rnd() * 26)], Math.floor(rnd() * 4), rnd() < 0.15);
       if (rnd() < 0.3) removeShape(w, p);
-      else placeShape(w, p, 1 + Math.floor(rnd() * 8), { foundation: rnd() < 0.5 });
+      else placeShape(w, p, 1 + Math.floor(rnd() * 8));
+      if (rnd() < 0.2) breakAt(w, 2 + Math.floor(rnd() * 26), GROUND - 2 + Math.floor(rnd() * 8), 2 + Math.floor(rnd() * 26));
     }
     // Terrain is one closed surface (ending exactly on piece faces); pieces have no holes.
     const { terrain, pieces } = parts(meshAll(w));

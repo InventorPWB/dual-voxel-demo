@@ -89,6 +89,30 @@ body.inventory #hotbar { pointer-events: auto; }
 body.inventory #hotbar .slot { cursor: pointer; }
 body.inventory #view { cursor: default; }
 
+/* Settings: a GUI screen like the inventory. */
+#settings {
+  position: fixed; left: 50%; top: 46%; transform: translate(-50%, -50%);
+  padding: 16px 18px 18px; width: 380px; max-height: calc(100vh - 140px); overflow: auto;
+  background: rgba(18, 20, 26, 0.82);
+}
+#settings h3 { margin: 0; font-size: 16px; }
+#settings .sub { margin: 4px 0 6px; font-size: 12px; color: var(--muted); }
+#settings .setting { padding: 10px 0; border-top: 1px solid var(--border); }
+#settings .label { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
+#settings .label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 2px; }
+#settings .hint { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.4; }
+#settings .choices { display: flex; gap: 4px; }
+#settings .choices button {
+  flex: 1; padding: 6px 10px; font: inherit; font-size: 13px; color: var(--text); cursor: pointer;
+  background: rgba(255, 255, 255, 0.06); border: 1px solid var(--border); border-radius: 7px;
+}
+#settings .choices button:hover { background: rgba(255, 255, 255, 0.14); }
+#settings .choices button.on { background: rgba(255, 255, 255, 0.22); border-color: rgba(255, 255, 255, 0.6); }
+#settings .range { display: flex; align-items: center; gap: 10px; }
+#settings .range input { flex: 1; }
+#settings .range span { width: 40px; text-align: right; font-size: 13px; font-variant-numeric: tabular-nums; }
+body.settings #view { cursor: default; }
+
 #toast {
   position: absolute; left: 50%; top: 22%; transform: translateX(-50%);
   padding: 8px 16px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border);

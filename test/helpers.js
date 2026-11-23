@@ -82,14 +82,15 @@ export function interiorOpenEdges(world, meshes = meshAll(world)) {
   return openEdges(meshes).filter(([x, y, z]) => x > 0.6 && z > 0.6 && x < X - 0.6 && z < Z - 0.6 && y < Y - 0.6);
 }
 
-/** Split meshes into their terrain and building-piece parts (each should be a closed surface). */
+/** Split meshes into their terrain and building-piece parts (each should be a closed surface), across all render passes. */
 export function parts(meshes) {
   const terrain = [], pieces = [];
-  for (const m of meshes) {
-    const k = m.terrainVertices * 3;
-    terrain.push({ position: m.position.subarray(0, k), normal: m.normal.subarray(0, k), material: m.material.subarray(0, k / 3) });
-    pieces.push({ position: m.position.subarray(k), normal: m.normal.subarray(k), material: m.material.subarray(k / 3) });
-  }
+  const slice = (m, a, b) => ({ position: m.position.subarray(a * 3, b * 3), normal: m.normal.subarray(a * 3, b * 3), material: m.material.subarray(a, b) });
+  for (const m of meshes)
+    for (const g of m.groups) {
+      terrain.push(slice(m, g.start, g.start + g.terrain));
+      pieces.push(slice(m, g.start + g.terrain, g.start + g.count));
+    }
   return { terrain, pieces };
 }
 

@@ -1,13 +1,17 @@
 import * as THREE from 'three';
 import { World, VOXEL } from './world/World.js';
 import { generateWorld, surfaceHeight } from './world/generate.js';
-import { createTerrainMaterial, SKY_COLOR, SUN_AZIMUTH, sunDirection } from './render/terrainMaterial.js';
+import { createChunkMaterials, SKY_COLOR, SUN_AZIMUTH, sunDirection } from './render/terrainMaterial.js';
+import { createFoliageMaterials } from './render/foliageMaterial.js';
+import { lightingUniforms } from './render/lighting.js';
+import { attachMipmaps } from './render/textureArray.js';
 import { SunShadow } from './render/SunShadow.js';
 import { ChunkMeshes } from './render/ChunkMeshes.js';
 import { Player } from './player/Player.js';
 import { Interaction } from './items/interaction.js';
 import { defaultHotbar } from './items/items.js';
 import { Hud, Hotbar } from './ui/hud.js';
+import { Settings } from './ui/settings.js';
 
 // ---- scene ------------------------------------------------------------------
 
@@ -36,13 +40,35 @@ const world = new World(8, 4, 8); // 128 × 64 × 128 m in 0.5 m voxels (16 m ch
 const shadow = new SunShadow(renderer, scene);
 let sunAzimuth = SUN_AZIMUTH;
 shadow.setDirection(sunDirection(sunAzimuth));
-const chunkMeshes = new ChunkMeshes(world, scene, createTerrainMaterial(shadow));
+attachMipmaps(renderer);
+const chunkMeshes = new ChunkMeshes(world, scene, createChunkMaterials(shadow), createFoliageMaterials(shadow));
+const uTime = lightingUniforms(shadow).uTime;
 chunkMeshes.onChange = () => { shadow.dirty = true; };
-const player = new Player(world, camera, () => chunkMeshes.list);
+
+// ---- settings ------------------------------------------------------------------
+
+const settings = new Settings();
+function applySettings(key) {
+  const v = settings.values;
+  // Leaves inside crowns are meshed in: re-mesh when it changes (not on the
+  // first call; nothing's meshed yet).
+  const options = { interiorCards: v.leafInterior };
+  if (!meshedWith || options.interiorCards !== meshedWith.interiorCards) {
+    chunkMeshes.setFoliageOptions(options, !!key);
+    meshedWith = options;
+  }
+}
+let meshedWith = null;
+applySettings();
+settings.onChange = applySettings;
+
+const player = new Player(world, camera, () => chunkMeshes.colliders);
 const interaction = new Interaction({ world, scene, camera, chunkMeshes, player, hotbar });
 
+const SPAWN_X = 46.5, SPAWN_Z = 40.5;
+
 function spawn() {
-  const x = 46.5, z = 40.5;
+  const x = SPAWN_X, z = SPAWN_Z;
   player.spawn(x, surfaceHeight(world, x, z) + 0.05, z);
   // Face the mountain.
   const dx = world.sx * VOXEL * 0.66 - x, dz = world.sz * VOXEL * 0.6 - z;
@@ -54,7 +80,7 @@ player.onFallOut = spawn;
 
 let loaded = false;
 setTimeout(() => {
-  generateWorld(world);
+  generateWorld(world, 1337, { avoid: [{ x: SPAWN_X, z: SPAWN_Z, r: 10 }] });
   spawn();
   hud.setLoading('Meshing chunks…');
 }, 30);
@@ -82,16 +108,31 @@ function closeInventory() {
   lock();
 }
 
+function openSettings() {
+  if (hud.inventoryOpen) hud.setInventory(false);
+  settings.setOpen(true);
+  hud.updateHint();
+  if (document.pointerLockElement) document.exitPointerLock();
+}
+
+function closeSettings() {
+  settings.setOpen(false);
+  hud.updateHint();
+  lock();
+}
+
 // No pause menu: clicking the view captures the mouse; Esc releases it and a
 // small hint says how to resume.
 canvas.addEventListener('click', () => {
-  if (hud.inventoryOpen) closeInventory();
+  if (settings.open) closeSettings();
+  else if (hud.inventoryOpen) closeInventory();
   else if (!locked) lock();
 });
 
 document.addEventListener('pointerlockchange', () => {
   locked = document.pointerLockElement === canvas;
   if (locked && hud.inventoryOpen) hud.setInventory(false);
+  if (locked && settings.open) settings.setOpen(false);
   hud.setPaused(!locked);
   if (!locked) {
     keys.clear();
@@ -124,6 +165,14 @@ window.addEventListener(
 );
 
 window.addEventListener('keydown', (e) => {
+  if (settings.open) {
+    if ((e.code === 'KeyO' || e.code === 'Escape') && !e.repeat) closeSettings();
+    return;
+  }
+  if (e.code === 'KeyO' && !e.repeat) {
+    openSettings();
+    return;
+  }
   if (hud.inventoryOpen) {
     if ((e.code === 'KeyE' || e.code === 'Escape') && !e.repeat) closeInventory();
     else if (e.code.startsWith('Digit')) {
@@ -186,7 +235,8 @@ function frame(now) {
     sunAzimuth += sunSpin * dt * 0.6;
     shadow.setDirection(sunDirection(sunAzimuth));
   }
-  shadow.update(chunkMeshes.list);
+  shadow.update(chunkMeshes.list.concat(chunkMeshes.foliageList));
+  uTime.value = now / 1000;
 
   if (!loaded && world.chunks.length && chunkMeshes.list.length && chunkMeshes.pending === 0) {
     loaded = true;
@@ -201,7 +251,7 @@ function frame(now) {
     const p = player.pos;
     hud.setStats(
       `FPS        ${fps.toFixed(0)}\n` +
-      `Triangles  ${chunkMeshes.triangleCount().toLocaleString()}\n` +
+      `Triangles  ${chunkMeshes.triangleCount().toLocaleString()} solid, ${chunkMeshes.foliageTriangleCount().toLocaleString()} foliage\n` +
       `Chunks     ${chunkMeshes.list.length} meshed, ${chunkMeshes.pending} pending\n` +
       `Last mesh  ${chunkMeshes.lastMeshMs.toFixed(1)} ms (${chunkMeshes.workerCount} workers)\n` +
       `Position   ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
@@ -213,4 +263,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Handy for poking at the demo from the devtools console.
-if (import.meta.env.DEV) window.demo = { shadow, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };
+if (import.meta.env.DEV) window.demo = { settings, shadow, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };

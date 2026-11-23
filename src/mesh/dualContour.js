@@ -13,14 +13,29 @@
  * gets a quad joining the four cells around it. Natural materials are
  * softened a little: vertices move partway toward the crossings' average.
  *
+ * Terrain quads take the material of their solid voxel, or its cut form
+ * (Cut Log) where an edit opened that edge (World/Chunk `cut`).
+ *
  * Shading: terrain uses the average of a cell's crossing normals; pieces
- * their own face normals. AO samples how solid the space just outside is.
+ * their own face normals. AO samples how much opaque material is just outside.
+ *
+ * Texturing: piece vertices also carry `local`: where they sit within the
+ * whole piece they belong to (0..1 per axis; xyz) and its kind of shape (w:
+ * 1 box or wedge, 2 round, 3 sphere; 0 for terrain). Materials mapped per
+ * piece (logs, glass) use it, so rings centre on a log and a glass frame
+ * follows the piece's outline.
+ *
+ * Render passes: every triangle goes to its material's pass (opaque, cutout,
+ * translucent; see materials.js), output in that order as `groups`. A piece
+ * face is only hidden by a neighbour that's opaque or of the same material,
+ * so stone behind glass is still drawn, and glass-to-glass faces merge.
  *
  * Chunks are meshed from a copy padded by PAD voxels, so seams match.
  */
 
 import { unpackNormal } from '../world/normals.js';
-import { stateGeometry, faceHidden, DIRS } from '../world/shapes.js';
+import { stateGeometry, faceHidden, DIRS, shapeKind } from '../world/shapes.js';
+import { PASS, OPAQUE } from '../world/materials.js';
 
 /** Voxels of border each side of a chunk needed to mesh it. */
 export const PAD = 3;
@@ -39,16 +54,17 @@ const BIT_AXIS = { 1: 0, 2: 1, 4: 2 };
  */
 export function meshChunk(p, crisp, scale = 1) {
   const { mat, shape, et, en, size, origin } = p;
+  const offs = p.off || new Uint8Array(mat.length);
   const N = size + 2 * PAD;
   const NN = N * N;
   const [ox, oy, oz] = origin;
   const off = (d) => d[0] + N * d[1] + NN * d[2];
 
-  // Solidity (anything) as 0/255, for AO; and which voxels are smooth terrain.
+  // Opaque solidity as 0/255, for AO; and which voxels are smooth terrain.
   const occ = new Uint8Array(mat.length);
   const ter = new Uint8Array(mat.length);
   for (let i = 0; i < mat.length; i++) {
-    occ[i] = mat[i] ? 255 : 0;
+    occ[i] = OPAQUE[mat[i]] ? 255 : 0;
     ter[i] = mat[i] && !shape[i] ? 1 : 0;
   }
 
@@ -173,7 +189,8 @@ export function meshChunk(p, crisp, scale = 1) {
     return slot;
   }
 
-  const tPos = [], tNrm = [], tMat = [], tAo = [];
+  // One output stream per render pass; terrain first, then pieces.
+  const streams = [0, 1, 2].map(() => ({ pos: [], nrm: [], mat: [], ao: [], local: [], terrain: 0 }));
   const quad = [0, 0, 0, 0];
 
   for (let lz = 0; lz < size; lz++)
@@ -194,7 +211,9 @@ export function meshChunk(p, crisp, scale = 1) {
           quad[2] = cell(px, py, pz);
           quad[3] = cell(px - u[0], py - u[1], pz - u[2]);
 
+          // Each quad is one crossed edge.
           const m = mat[sa ? ia : ib];
+          const o = streams[PASS[m]];
           const dir = sa ? 1 : -1;
           const p0 = quad[0] * 3, p1 = quad[1] * 3, p2 = quad[2] * 3, p3 = quad[3] * 3;
           const d1x = cPos[p2] - cPos[p0], d1y = cPos[p2 + 1] - cPos[p0 + 1], d1z = cPos[p2 + 2] - cPos[p0 + 2];
@@ -217,19 +236,20 @@ export function meshChunk(p, crisp, scale = 1) {
             }
             for (let j = t; j < t + 3; j++) {
               const s = quad[order[j]];
-              tPos.push(cPos[s * 3], cPos[s * 3 + 1], cPos[s * 3 + 2]);
+              o.pos.push(cPos[s * 3], cPos[s * 3 + 1], cPos[s * 3 + 2]);
               const nx = cNrm[s * 3], ny = cNrm[s * 3 + 1], nz = cNrm[s * 3 + 2];
-              if (crease && (gx || gy || gz) && nx * gx + ny * gy + nz * gz < CREASE_COS) tNrm.push(gx, gy, gz);
-              else tNrm.push(nx, ny, nz);
-              tMat.push(m);
-              tAo.push(cAo[s]);
+              if (crease && (gx || gy || gz) && nx * gx + ny * gy + nz * gz < CREASE_COS) o.nrm.push(gx, gy, gz);
+              else o.nrm.push(nx, ny, nz);
+              o.mat.push(m);
+              o.ao.push(cAo[s]);
+              o.local.push(0, 0, 0, 0);
             }
           }
         }
       }
 
   // ---- building pieces: exact geometry per shape state
-  const terrainVertices = tPos.length / 3;
+  for (const o of streams) o.terrain = o.ao.length;
   const dirOff = DIRS.map(off);
   for (let lz = 0; lz < size; lz++)
     for (let ly = 0; ly < size; ly++)
@@ -239,29 +259,66 @@ export function meshChunk(p, crisp, scale = 1) {
         const st = shape[i];
         if (!st) continue;
         const m = mat[i];
+        const o = streams[PASS[m]];
         const g = stateGeometry(st);
+        // The piece this voxel belongs to: its corner (padded coords) and size per axis.
+        const ob = offs[i];
+        const corner = [px - (ob & 1), py - ((ob >> 1) & 1), pz - ((ob >> 2) & 1)];
+        const extent = [1, 1, 1];
+        for (let a = 0; a < 3; a++) {
+          if ((ob >> a) & 1) { extent[a] = 2; continue; }
+          // Does any voxel of the same piece sit one step further along this axis?
+          for (let k = 0; k < 8 && extent[a] === 1; k++) {
+            if (!((k >> a) & 1)) continue;
+            const j = corner[0] + (k & 1) + N * (corner[1] + ((k >> 1) & 1)) + NN * (corner[2] + ((k >> 2) & 1));
+            if (!shape[j] || mat[j] !== m) continue;
+            const q = offs[j];
+            if ((q & 7) === (k & 7)) extent[a] = 2;
+          }
+        }
+        const kind = shapeKind(st);
+        const bx = px - corner[0], by = py - corner[1], bz = pz - corner[2];
         for (const f of g.faces) {
-          if (f.dir >= 0 && faceHidden(st, f.dir, shape[i + dirOff[f.dir]])) continue;
+          if (f.dir >= 0) {
+            const j = i + dirOff[f.dir];
+            if (faceHidden(st, f.dir, shape[j]) && (OPAQUE[mat[j]] || mat[j] === m)) continue;
+          }
           for (let k = 0; k < f.pos.length; k += 3) {
             const vx = f.pos[k], vy = f.pos[k + 1], vz = f.pos[k + 2];
             const nx = f.nrm[k], ny = f.nrm[k + 1], nz = f.nrm[k + 2];
-            tPos.push((ox + lx + vx) * scale, (oy + ly + vy) * scale, (oz + lz + vz) * scale);
-            tNrm.push(nx, ny, nz);
-            tMat.push(m);
+            o.pos.push((ox + lx + vx) * scale, (oy + ly + vy) * scale, (oz + lz + vz) * scale);
+            o.nrm.push(nx, ny, nz);
+            o.mat.push(m);
+            o.local.push((bx + vx) / extent[0], (by + vy) / extent[1], (bz + vz) / extent[2], kind);
             // Padded sample coordinates of the vertex (sample P sits at the voxel's centre).
             const qx = px + vx - 0.5, qy = py + vy - 0.5, qz = pz + vz - 0.5;
             const occl = (field(occ, qx + nx * 0.6, qy + ny * 0.6, qz + nz * 0.6) + field(occ, qx + nx * 1.5, qy + ny * 1.5, qz + nz * 1.5)) / 2;
-            tAo.push(1 - Math.min(0.5, occl * 1.0));
+            o.ao.push(1 - Math.min(0.5, occl * 1.0));
           }
         }
       }
 
+  // Concatenate the passes: groups are vertex ranges (start, count) per pass.
+  const total = streams.reduce((n, o) => n + o.ao.length, 0);
+  const position = new Float32Array(total * 3), normal = new Float32Array(total * 3);
+  const material = new Float32Array(total), ao = new Float32Array(total), local = new Float32Array(total * 4);
+  const groups = [];
+  let at = 0;
+  streams.forEach((o, pass) => {
+    const n = o.ao.length;
+    if (!n) return;
+    position.set(o.pos, at * 3);
+    normal.set(o.nrm, at * 3);
+    material.set(o.mat, at);
+    ao.set(o.ao, at);
+    local.set(o.local, at * 4);
+    groups.push({ start: at, count: n, pass, terrain: o.terrain });
+    at += n;
+  });
   return {
-    position: new Float32Array(tPos),
-    normal: new Float32Array(tNrm),
-    material: new Float32Array(tMat),
-    ao: new Float32Array(tAo),
-    terrainVertices,
-    triangles: tPos.length / 9,
+    position, normal, material, ao, local, groups,
+    /** Terrain vertices at the start of the opaque pass. */
+    terrainVertices: streams[0].terrain,
+    triangles: total / 3,
   };
 }

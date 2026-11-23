@@ -1,10 +1,13 @@
 import * as THREE from 'three';
 import { World, VOXEL } from '../world/World.js';
 import { MATERIALS, MAT } from '../world/materials.js';
-import { placement, rotationForFacing } from '../world/shapes.js';
+import { placement, rotationForFacing, CUBE } from '../world/shapes.js';
 import {
-  sculptSphere, smoothBrush, flattenBrush, placeShape, removeShape, shapeSolidVoxels,
+  sculptSphere, smoothBrush, flattenBrush, placeShape, placeTerrain, shapeSolidVoxels, breakCells, clearCells,
 } from '../world/edits.js';
+import { PLANT, DIRS26, plantDef, plantKind, isWood, isSolidWood, isBranch, isLoose, woodRadius, woodCut, woodId, woodParent, withParent, supportsPlant } from '../world/plants.js';
+import { chop, chopTime, compass, remove, woodChildren } from '../world/chop.js';
+import { SHAPE } from '../world/shapes.js';
 import { meshChunk } from '../mesh/dualContour.js';
 import { averageColor } from '../render/textures.js';
 
@@ -24,6 +27,8 @@ const materialColor = (id) => {
   if (!tint.has(id)) tint.set(id, new THREE.Color(...averageColor(MATERIALS[id].top)));
   return tint.get(id);
 };
+const LEAF_COLOR = new THREE.Color(...averageColor('leaves'));
+const BARK_COLOR = new THREE.Color(...averageColor('bark'));
 
 /**
  * What the held item does in the world. The only things drawn in the world
@@ -33,6 +38,7 @@ const materialColor = (id) => {
 export class Interaction {
   constructor({ world, scene, camera, chunkMeshes, player, hotbar }) {
     this.world = world;
+    this.chopping = null; // { cell, t }: the axe's stroke under way
     this.camera = camera;
     this.chunkMeshes = chunkMeshes;
     this.player = player;
@@ -102,8 +108,8 @@ export class Interaction {
     if (button === 2) this.rmb = true;
     const item = this.item;
     if (!item) return;
-    if (item.kind === 'build') {
-      this.buildAction(button === 0 ? 'remove' : this.shift ? 'paint' : 'place');
+    if (item.kind !== 'tool') {
+      this.itemAction(button === 0);
       this.repeat = REPEAT_DELAY;
     } else {
       // Level to whole metres, so a levelled pad lines up with the build grid.
@@ -125,26 +131,72 @@ export class Interaction {
 
   // ---- targeting -----------------------------------------------------------
 
+  /**
+   * What the crosshair is on: the nearest solid surface (chunk meshes, and
+   * thick wood: { wood: [x, y, z] }), or a leaf or twig voxel in front of it
+   * ({ leaf: [x, y, z] }, with the voxel face hit). Grass and flowers are
+   * looked through.
+   */
   raycast(reach) {
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera({ x: 0, y: 0 }, this.camera);
     this.raycaster.far = reach;
-    const h = this.raycaster.intersectObjects(this.chunkMeshes.list, false)[0];
+    const h = this.raycaster.intersectObjects(this.chunkMeshes.colliders, false)[0];
+    const leaf = this.leafRay(this.raycaster.ray, h ? h.distance : reach);
+    if (leaf) return leaf;
     if (!h) return null;
-    return { point: h.point.clone(), normal: h.face.normal.clone() };
+    const cells = h.object.userData.cells;
+    const normal = h.face.normal.clone();
+    if (normal.dot(this.raycaster.ray.direction) > 0) normal.negate();
+    const hit = { point: h.point.clone(), normal };
+    if (cells) {
+      // (The BVH reorders the triangles by its index; each original triangle's
+      // three vertices are still its own, in order.)
+      const index = h.object.geometry.index;
+      const t = index ? Math.floor(index.array[h.faceIndex * 3] / 3) : h.faceIndex;
+      hit.wood = [cells[t * 3], cells[t * 3 + 1], cells[t * 3 + 2]];
+    }
+    return hit;
+  }
+
+  /** Voxel walk (Amanatides and Woo) along the ray for the first targetable plant within `far` metres. */
+  leafRay(ray, far) {
+    const o = ray.origin, d = ray.direction;
+    const p = [o.x / VOXEL, o.y / VOXEL, o.z / VOXEL], dir = [d.x, d.y, d.z];
+    const cell = p.map(Math.floor);
+    const step = dir.map((v) => (v > 0 ? 1 : -1));
+    const tDelta = dir.map((v) => (v ? Math.abs(1 / v) : Infinity));
+    const tMax = dir.map((v, k) => (v ? ((v > 0 ? cell[k] + 1 - p[k] : p[k] - cell[k]) / Math.abs(v)) : Infinity));
+    const limit = far / VOXEL;
+    let t = 0, axis = -1;
+    while (t <= limit) {
+      const id = this.world.getPlant(cell[0], cell[1], cell[2]);
+      // (Thick wood is aimed at by its surface, in raycast.)
+      if (id && plantDef(id).targetable && !isSolidWood(id) && axis >= 0) {
+        const normal = new THREE.Vector3();
+        normal.setComponent(axis, -step[axis]);
+        const point = new THREE.Vector3(o.x + d.x * t * VOXEL, o.y + d.y * t * VOXEL, o.z + d.z * t * VOXEL);
+        return { point, normal, leaf: cell.slice() };
+      }
+      axis = tMax[0] < tMax[1] ? (tMax[0] < tMax[2] ? 0 : 2) : tMax[1] < tMax[2] ? 1 : 2;
+      t = tMax[axis];
+      cell[axis] += step[axis];
+      tMax[axis] += tDelta[axis];
+    }
+    return null;
   }
 
   /**
-   * Where the held shape goes, Minecraft-style.
-   *  - Along the face you aim at, it sits flush against it (placing) or
-   *    reaches into it from the face (removing).
-   *  - Across the face, it snaps to the item's build grid (1 m for 1 m
-   *    pieces, 0.5 m for slabs and small blocks), lined up with the piece
-   *    you aim at, or with the world grid when you aim at terrain.
-   *  - On natural ground, pieces go to the nearest whole-metre level, so
-   *    neighbours share a height; a gap under one is filled by a foundation.
+   * Where the held shape goes, Minecraft-style, always on the world's build
+   * grid (1 m for 1 m pieces, 0.5 m steps for slabs and small blocks):
+   *  - it goes in the grid cell just beyond the face you aim at;
+   *  - if that cell is partly taken by a piece already there (say a block on
+   *    top of a half-height slab), it moves one more step out;
+   *  - on natural ground it sits at the nearest whole-metre level, so
+   *    neighbours share a height. Nothing is filled in underneath.
+   * `blocked` is set if it still overlaps a piece.
    */
-  shapeTarget(item, mode) {
+  shapeTarget(item) {
     const { point, normal: n } = this.hit;
     const w = this.world;
     const p = [point.x / VOXEL, point.y / VOXEL, point.z / VOXEL];
@@ -156,37 +208,95 @@ export class Interaction {
     const rot = item.shape.oriented ? rotationForFacing(dir.x, dir.z) : 0;
     const flip = !!item.shape.oriented && k === 1 && sign < 0;
     const L = item.shape.lattice;
-    const size = placement(item.shape, [0, 0, 0], rot, flip).size;
 
-    // The voxel behind the surface you're aiming at.
-    const behind = p.map((v, j) => Math.floor(j === k ? v - sign * 0.05 : v));
-    const onPiece = w.isPiece(...behind);
-    const onGround = !onPiece && w.isTerrain(...behind);
+    const behind = this.aimedVoxel();
+    const onGround = !this.hit.leaf && !w.isPiece(...behind) && w.isTerrain(...behind) && k === 1 && sign > 0;
 
-    // Across the face, snap to the grid of the piece you're aiming at (its
-    // corner, as stored in its voxels), or to the world grid on terrain.
-    const pieceCorner = onPiece ? behind.map((v, j) => v - w.getPieceOffset(...behind)[j]) : [0, 0, 0];
-    const origin = [0, 0, 0];
-    for (let j = 0; j < 3; j++) {
-      if (j === k) continue;
-      const anchor = pieceCorner[j];
-      origin[j] = anchor + Math.floor((p[j] - anchor) / L[j]) * L[j];
+    // The grid cell holding a point just outside the face.
+    const q = p.slice();
+    q[k] += sign * 0.05;
+    const origin = q.map((v, j) => Math.floor(v / L[j]) * L[j]);
+    if (onGround) origin[1] = Math.round(p[1] / GROUND_LEVEL) * GROUND_LEVEL;
+    const overlaps = (t) => t.voxels.some(([x, y, z]) => w.isPiece(x, y, z) || isSolidWood(w.getPlant(x, y, z)));
+    let target = placement(item.shape, origin, rot, flip);
+    if (overlaps(target)) {
+      origin[k] += sign * L[k];
+      target = placement(item.shape, origin, rot, flip);
     }
-
-    // Along the face: flush with a piece's face (on the voxel grid); on ground, a grid level.
-    const face = onPiece ? Math.round(p[k]) : null;
-    if (mode === 'place') {
-      if (face !== null) origin[k] = sign > 0 ? face : face - size[k];
-      else if (onGround && k === 1 && sign > 0) origin[k] = Math.round(p[k] / GROUND_LEVEL) * GROUND_LEVEL;
-      else origin[k] = Math.floor((p[k] + sign * 0.05) / L[k]) * L[k];
-    } else {
-      if (face !== null) origin[k] = sign > 0 ? face - size[k] : face;
-      else origin[k] = Math.floor((p[k] - sign * 0.05) / L[k]) * L[k];
-    }
-
-    const target = placement(item.shape, origin, rot, flip);
-    target.onGround = mode === 'place' && onGround && k === 1 && sign > 0;
+    target.blocked = overlaps(target);
     return target;
+  }
+
+  /**
+   * The solid voxel the crosshair is on, behind the surface you aim at. A
+   * piece's face is on its voxel's side, but smooth ground can lie up to a
+   * voxel in front of the solid voxel it belongs to (solidity is sampled at
+   * voxel centres), so look a little deeper until something solid turns up.
+   */
+  aimedVoxel() {
+    if (this.hit.leaf) return this.hit.leaf;
+    if (this.hit.wood) return this.hit.wood;
+    const { point, normal: n } = this.hit;
+    const p = [point.x / VOXEL, point.y / VOXEL, point.z / VOXEL];
+    const an = [Math.abs(n.x), Math.abs(n.y), Math.abs(n.z)];
+    const k = an[1] >= an[0] && an[1] >= an[2] ? 1 : an[0] >= an[2] ? 0 : 2;
+    const sign = Math.sign([n.x, n.y, n.z][k]) || 1;
+    let first = null;
+    for (const d of [0.05, 0.5, 0.95]) {
+      const v = [p[0] - n.x * d, p[1] - n.y * d, p[2] - n.z * d].map(Math.floor);
+      if (this.world.isSolid(...v)) return v;
+      // Grazing a face: also try straight back along its main axis.
+      const c = p.slice();
+      c[k] -= sign * d;
+      const u = c.map(Math.floor);
+      if (this.world.isSolid(...u)) return u;
+      first = first || v;
+    }
+    return first;
+  }
+
+  /**
+   * What left mouse breaks: { cells, leaves }.
+   *  - Pieces and ground break on the 1 m grid, whatever you hold: the whole
+   *    piece within the metre cell you aim at (see edits.breakCells).
+   *  - Leaves and wood break in the shape of the held item, on its grid: a
+   *    1 m item clears a whole metre, a small block or a piece of wood one
+   *    voxel. Only those voxels go (wood needs no support: see chop.js).
+   *    The axe chops wood instead (see updateChop).
+   */
+  breakTarget(item) {
+    const v = this.aimedVoxel();
+    if (!this.hit.leaf && !this.hit.wood) return { cells: breakCells(this.world, ...v), leaves: false };
+    const L = item.shape ? item.shape.lattice : [1, 1, 1];
+    const o = v.map((c, j) => Math.floor(c / L[j]) * L[j]);
+    const cells = [];
+    for (let z = o[2]; z < o[2] + L[2]; z++)
+      for (let y = o[1]; y < o[1] + L[1]; y++)
+        for (let x = o[0]; x < o[0] + L[0]; x++) if (this.breakable(this.world.getPlant(x, y, z))) cells.push([x, y, z]);
+    return { cells, leaves: true };
+  }
+
+  /** What a digging brush clears: leaves and wood too thin to be solid. */
+  brushable(id) {
+    return id === PLANT.LEAVES || (isWood(id) && !isSolidWood(id));
+  }
+
+  /** Leaves and wood. */
+  breakable(id) {
+    return id === PLANT.LEAVES || isWood(id);
+  }
+
+  /** Clear leaf and wood voxels. */
+  clearPlants(cells) {
+    const w = this.world;
+    let x0 = Infinity, y0 = Infinity, z0 = Infinity, x1 = -Infinity, y1 = -Infinity, z1 = -Infinity;
+    for (const [x, y, z] of cells) {
+      w.setPlant(x, y, z, 0);
+      x0 = Math.min(x0, x); y0 = Math.min(y0, y); z0 = Math.min(z0, z);
+      x1 = Math.max(x1, x); y1 = Math.max(y1, y); z1 = Math.max(z1, z);
+    }
+    // (Wood around it is drawn from up to three voxels away.)
+    if (x0 <= x1) w.markDirtyBox(x0 - 3, y0 - 3, z0 - 3, x1 + 3, y1 + 3, z1 + 3);
   }
 
   // ---- per frame -------------------------------------------------------------
@@ -194,15 +304,19 @@ export class Interaction {
   update(dt, active, shift) {
     this.shift = shift;
     const item = this.item;
-    this.hit = active && item ? this.raycast(item.kind === 'build' ? BUILD_REACH : TOOL_REACH) : null;
+    this.hit = active && item ? this.raycast(item.kind === 'tool' ? TOOL_REACH : BUILD_REACH) : null;
     this.updateGizmos();
     if (!this.hit || !item) return;
 
-    if (item.kind === 'build') {
+    if (item.id === 'axe') {
+      this.updateChop(dt);
+      return;
+    }
+    if (item.kind !== 'tool') {
       if (this.lmb || this.rmb) {
         this.repeat -= dt;
         if (this.repeat <= 0) {
-          this.buildAction(this.lmb ? 'remove' : this.shift ? 'paint' : 'place');
+          this.itemAction(this.lmb);
           this.repeat = REPEAT_RATE;
         }
       }
@@ -219,30 +333,176 @@ export class Interaction {
 
   // ---- building ----------------------------------------------------------------
 
+  /** Left (primary) or right mouse with a building or plant item. */
+  itemAction(primary) {
+    const item = this.item;
+    if (!this.hit || !item) return;
+    const grass = item.kind === 'plant' && item.plant === PLANT.GRASS;
+    if (primary) {
+      if (grass && !this.hit.leaf) this.plantAction('remove');
+      else this.breakAction();
+    } else if (item.kind === 'build') this.buildAction(this.shift ? 'paint' : 'place');
+    else this.plantAction('place');
+  }
+
+  breakAction() {
+    const { cells, leaves } = this.breakTarget(this.item);
+    if (!cells.length) return;
+    if (!leaves) clearCells(this.world, cells);
+    else this.clearPlants(cells);
+  }
+
+  // ---- axe ------------------------------------------------------------------------
+
+  /**
+   * Holding left mouse with the axe on wood: a stroke every chopTime seconds
+   * (longer for thicker wood), each cutting an eighth deeper, on the side
+   * facing you (see chop.js). The eighth goes through, and everything beyond
+   * the cut goes. A notch spans the wood a voxel either side of the one cut,
+   * so aiming anywhere at a notch already started keeps deepening it.
+   */
+  updateChop(dt) {
+    const w = this.world;
+    let cell = this.hit?.wood || (this.hit?.leaf && isWood(w.getPlant(...this.hit.leaf)) ? this.hit.leaf : null);
+    if (!this.lmb || !cell) { this.chopping = null; return; }
+    if (!woodCut(w.getPlant(...cell))) {
+      const notch = [[0, 0, 0], ...DIRS26].map((o) => cell.map((c, k) => c + o[k])).find((u) => isWood(w.getPlant(...u)) && woodCut(w.getPlant(...u)));
+      if (notch) cell = notch;
+    }
+    if (!this.chopping || this.chopping.cell.some((c, k) => c !== cell[k])) this.chopping = { cell, t: 0 };
+    this.chopping.t += dt;
+    const per = chopTime(woodRadius(w.getPlant(...cell)));
+    if (this.chopping.t < per) return;
+    this.chopping.t -= per;
+    const p = this.player.pos;
+    const side = compass(p.x - (cell[0] + 0.5) * VOXEL, p.z - (cell[2] + 0.5) * VOXEL);
+    const set = chop(w, ...cell, side);
+    if (!set) return;
+    this.chopping = null;
+    // (A felled tree's items will drop from here.)
+    remove(w, set);
+  }
+
   buildAction(kind) {
     const item = this.item;
-    if (!this.hit || !item || item.kind !== 'build') return;
     const w = this.world;
     if (kind === 'place') {
-      const p = this.shapeTarget(item, 'place');
-      if (this.blocksPlayer(p)) return;
-      placeShape(w, p, item.material, { foundation: p.onGround });
-    } else if (kind === 'remove') {
-      removeShape(w, this.shapeTarget(item, 'remove'));
+      const p = this.shapeTarget(item);
+      if (p.blocked || this.blocksPlayer(p)) return;
+      // Natural materials are terrain: a metre of ground, run into what's around.
+      if (MATERIALS[item.material].natural) placeTerrain(w, p.origin, item.material, { protect: this.protect });
+      else placeShape(w, p, item.material);
     } else {
-      // Paint: recolour everything solid in the cell.
-      const p = this.shapeTarget(item, 'remove');
-      const [ox, oy, oz] = p.origin;
+      // Paint: recolour what left mouse would break.
+      const { cells, leaves } = this.breakTarget(item);
+      if (leaves) return;
       let changed = false;
-      for (let z = oz; z < oz + p.size[2]; z++)
-        for (let y = oy; y < oy + p.size[1]; y++)
-          for (let x = ox; x < ox + p.size[0]; x++) {
-            const m = w.getMat(x, y, z);
-            if (m && m !== item.material) { w.setMat(x, y, z, item.material); changed = true; }
-          }
-      if (changed) w.markDirtyBox(ox - 1, oy - 1, oz - 1, ox + p.size[0], oy + p.size[1], oz + p.size[2]);
+      for (const [x, y, z] of cells) {
+        if (w.getMat(x, y, z) === item.material) continue;
+        w.setMat(x, y, z, item.material);
+        w.markDirtyBox(x - 1, y - 1, z - 1, x + 1, y + 1, z + 1);
+        changed = true;
+      }
+      if (!changed) return;
     }
     if (MATERIALS[item.material].natural) this.lastNatural = item.material;
+  }
+
+  // ---- plants ----------------------------------------------------------------
+
+  /**
+   * Where a piece of wood goes: the voxel `t` just beyond the face you aim
+   * at, and how it joins.
+   *  - On a log (wood): it grows from that log (`from`), joined. It carries
+   *    the log on, bending round if it leaves at an angle, unless something
+   *    carries it on already: then it branches off its side (`branch`).
+   *    On the end a log grows from (a loose log's back, or a broken end), it
+   *    goes on that end instead: lying that way itself (`lie`), with the log
+   *    growing from it.
+   *  - On anything else (ground, a block, leaves): a loose log (see
+   *    plants.js), lying along the face you aimed at, joined to nothing.
+   *  - `loose` (Shift): a loose log lying along the way you look (level unless
+   *    you look steeply up or down), whatever you aim at.
+   * Nothing joins on its own: only the log you put it on.
+   * `blocked` if that voxel is solid, or solid wood.
+   */
+  woodTarget(loose = false) {
+    const w = this.world;
+    const v = this.aimedVoxel();
+    const n = this.hit.normal;
+    const an = [Math.abs(n.x), Math.abs(n.y), Math.abs(n.z)];
+    const k = an[1] >= an[0] && an[1] >= an[2] ? 1 : an[0] >= an[2] ? 0 : 2;
+    const dn = [0, 0, 0];
+    dn[k] = Math.sign([n.x, n.y, n.z][k]) || 1;
+    const t = v.map((c, j) => c + dn[j]);
+    const vid = w.getPlant(...v);
+    let from = null, branch = false, lie = null, unloose = null;
+    if (loose) {
+      const look = this.camera.getWorldDirection(new THREE.Vector3());
+      const a = Math.abs(look.y) > 0.75 ? 1 : Math.abs(look.x) >= Math.abs(look.z) ? 0 : 2;
+      lie = [0, 0, 0];
+      lie[a] = -(Math.sign([look.x, look.y, look.z][a]) || 1);
+    } else if (isWood(vid)) {
+      const o = DIRS26[woodParent(vid)];
+      if (o && o[0] === dn[0] && o[1] === dn[1] && o[2] === dn[2]) {
+        lie = dn;
+        if (isLoose(vid)) unloose = v;
+      } else {
+        from = v;
+        branch = woodChildren(w, ...v).some((c) => !isBranch(w.getPlant(...c)));
+      }
+    } else lie = dn.map((c) => -c);
+    const blocked = w.isSolid(...t) || isSolidWood(w.getPlant(...t));
+    return { voxels: [t], origin: t, size: [1, 1, 1], shape: SHAPE.small, rot: 0, flip: false, from, branch, lie, unloose, blocked };
+  }
+
+  /**
+   * Leaves: a 1 m block of leaf voxels on the build grid. Wood: one voxel of
+   * wood, joined to the log you put it on, or a loose log (see woodTarget).
+   * Grass: a small brush.
+   */
+  plantAction(kind) {
+    const item = this.item;
+    if (!this.hit || !item || item.kind !== 'plant') return;
+    const w = this.world;
+    if (item.wood !== undefined) {
+      if (kind !== 'place') return;
+      const p = this.woodTarget(this.shift);
+      if (p.blocked || (isSolidWood(woodId(item.wood)) && this.player.intersectsVoxel(...p.origin))) return;
+      const [x, y, z] = p.origin;
+      w.setPlant(x, y, z, p.from ? woodId(item.wood, p.from.map((c, j) => c - p.origin[j]), p.branch) : woodId(item.wood, p.lie, false, true));
+      // A loose log whose back it went on now grows from it.
+      if (p.unloose) w.setPlant(...p.unloose, withParent(w.getPlant(...p.unloose), p.origin.map((c, j) => c - p.unloose[j])));
+      w.markDirtyBox(x - 3, y - 3, z - 3, x + 3, y + 3, z + 3);
+      return;
+    }
+    if (item.plant === PLANT.LEAVES) {
+      if (kind !== 'place') return; // breaking is breakAction
+      const p = this.shapeTarget(item);
+      if (p.blocked) return;
+      for (const [x, y, z] of p.voxels) if (!w.isSolid(x, y, z)) w.setPlant(x, y, z, PLANT.LEAVES);
+      w.markDirtyBox(p.origin[0], p.origin[1], p.origin[2], p.origin[0] + p.size[0] - 1, p.origin[1] + p.size[1] - 1, p.origin[2] + p.size[2] - 1);
+      return;
+    }
+    // Grass: every column within the brush, in the empty voxel on the ground nearest the aim.
+    const r = item.radius / VOXEL;
+    const c = { x: this.hit.point.x / VOXEL, y: this.hit.point.y / VOXEL, z: this.hit.point.z / VOXEL };
+    let changed = false;
+    for (let z = Math.floor(c.z - r); z <= Math.floor(c.z + r); z++)
+      for (let x = Math.floor(c.x - r); x <= Math.floor(c.x + r); x++) {
+        if (Math.hypot(x + 0.5 - c.x, z + 0.5 - c.z) > r) continue;
+        for (let dy = 0; dy <= 6; dy++) {
+          const y = Math.floor(c.y) + (dy % 2 ? (dy + 1) / 2 : -dy / 2);
+          const here = w.getPlant(x, y, z);
+          if (kind === 'remove') {
+            if (plantKind(here) === 1) { w.setPlant(x, y, z, 0); changed = true; break; }
+          } else if (supportsPlant(w, x, y, z, item.plant)) {
+            if (!here) { w.setPlant(x, y, z, item.plant); changed = true; }
+            break;
+          }
+        }
+      }
+    if (changed) w.markDirtyBox(Math.floor(c.x - r), Math.floor(c.y) - 4, Math.floor(c.z - r), Math.floor(c.x + r), Math.floor(c.y) + 4, Math.floor(c.z + r));
   }
 
   /** Placing may not make anything solid inside the player. */
@@ -252,14 +512,27 @@ export class Interaction {
 
   // ---- tools ---------------------------------------------------------------------
 
-  /** Brushes never make terrain solid within half a voxel of the player. */
-  protect = (x, y, z) => this.player.intersectsVoxel(x, y, z, VOXEL * 0.5);
+  /** Brushes never make terrain solid within half a voxel of the player, or where there's solid wood. */
+  protect = (x, y, z) => this.player.intersectsVoxel(x, y, z, VOXEL * 0.5) || isSolidWood(this.world.getPlant(x, y, z));
 
   applyTool(item, dt) {
     const w = this.world;
     const r = this.radiusOf(item) / VOXEL; // voxels
     const { point, normal: n } = this.hit;
     const opts = { protect: this.protect };
+    // Digging tools also clear the leaves and twigs you aim at, within the
+    // brush; solid wood they leave alone.
+    if (this.hit.wood) return;
+    if (this.hit.leaf && this.lmb && (item.id === 'pickaxe' || item.id === 'shovel')) {
+      const c = this.hit.leaf.map((v) => v + 0.5);
+      const cells = [];
+      for (let z = Math.floor(c[2] - r); z <= Math.floor(c[2] + r); z++)
+        for (let y = Math.floor(c[1] - r); y <= Math.floor(c[1] + r); y++)
+          for (let x = Math.floor(c[0] - r); x <= Math.floor(c[0] + r); x++)
+            if (Math.hypot(x + 0.5 - c[0], y + 0.5 - c[1], z + 0.5 - c[2]) <= r && this.brushable(w.getPlant(x, y, z))) cells.push([x, y, z]);
+      this.clearPlants(cells);
+      return;
+    }
     if (item.id === 'pickaxe' || item.id === 'shovel') {
       // The sphere sits just across the surface, overlapping it by `step`:
       // inside the ground to raise, outside it to dig. So the surface moves at
@@ -284,25 +557,29 @@ export class Interaction {
     const item = this.item;
     if (!this.hit || !item) return;
 
-    if (item.kind === 'build') {
-      // While left mouse (remove) or Shift (paint) is held, show the footprint in the surface.
-      const into = this.lmb || this.shift;
-      const p = this.shapeTarget(item, into ? 'remove' : 'place');
+    const grass = item.kind === 'plant' && item.plant === PLANT.GRASS;
+    if (item.kind !== 'tool' && (!grass || this.hit.leaf)) {
+      // Breaking (left mouse held, or aiming at leaves with grass) or painting
+      // (Shift): outline what would go. Otherwise: the piece about to be placed.
+      const painting = item.kind === 'build' && this.shift;
+      if (this.lmb || painting || grass) {
+        const { cells } = this.breakTarget(item);
+        if (!cells.length) return;
+        const { mesh, edges, origin } = this.cellsGhost(cells);
+        this.showGhost(mesh, edges, origin, painting && !this.lmb ? materialColor(item.material) : REMOVE_COLOR, true);
+        return;
+      }
+      const p = item.wood !== undefined ? this.woodTarget(this.shift) : this.shapeTarget(item);
       const { mesh, edges } = this.ghostGeometry(p);
-      ghost.geometry = mesh;
-      ghostEdges.geometry = edges;
-      ghost.position.set(p.origin[0] * VOXEL, p.origin[1] * VOXEL, p.origin[2] * VOXEL);
-      ghostEdges.position.copy(ghost.position);
-      const blocked = !into && this.blocksPlayer(p);
-      this.ghostMat.color.copy(this.lmb ? REMOVE_COLOR : blocked ? BLOCKED_COLOR : materialColor(item.material));
-      ghost.visible = true;
-      ghostEdges.visible = !blocked;
+      const blocked = p.blocked || (item.kind === 'build' && this.blocksPlayer(p));
+      const color = blocked ? BLOCKED_COLOR : item.kind === 'build' ? materialColor(item.material) : item.wood !== undefined ? BARK_COLOR : LEAF_COLOR;
+      this.showGhost(mesh, edges, p.origin, color, !blocked);
       return;
     }
 
-    const r = this.radiusOf(item);
+    const r = item.kind === 'plant' ? item.radius : this.radiusOf(item);
     const p = this.hit.point;
-    const color = { pickaxe: 0xff8a7c, shovel: this.rmb ? 0x7cff8a : 0xffb07c, trowel: 0x7cd8ff, level: 0xffd34d }[item.id];
+    const color = { pickaxe: 0xff8a7c, shovel: this.rmb ? 0x7cff8a : 0xffb07c, trowel: 0x7cd8ff, level: 0xffd34d, axe: 0xffe08a }[item.id] ?? 0x9be07a;
     if (item.id === 'level') {
       const y = this.flattenY ?? Math.round(p.y);
       disc.position.set(p.x, y + 0.02, p.z);
@@ -314,13 +591,49 @@ export class Interaction {
       brush.position.copy(p);
       brush.scale.setScalar(r);
       brush.material.color.setHex(color);
-      brush.visible = true;
+      brush.visible = item.kind === 'tool' && item.id !== 'axe';
       ring.position.copy(p).addScaledVector(this.hit.normal, 0.03);
       ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), this.hit.normal);
     }
     ring.scale.setScalar(r);
     ring.material.color.setHex(color);
     ring.visible = true;
+  }
+
+  showGhost(mesh, edges, origin, color, withEdges) {
+    const { ghost, ghostEdges } = this;
+    ghost.geometry = mesh;
+    ghostEdges.geometry = edges;
+    ghost.position.set(origin[0] * VOXEL, origin[1] * VOXEL, origin[2] * VOXEL);
+    ghostEdges.position.copy(ghost.position);
+    this.ghostMat.color.copy(color);
+    ghost.visible = true;
+    ghostEdges.visible = withEdges;
+  }
+
+  /** Ghost of a set of voxels about to be broken: pieces in their own shapes, the rest as cubes. */
+  cellsGhost(cells) {
+    const origin = [0, 1, 2].map((j) => Math.min(...cells.map((c) => c[j])));
+    const rel = cells.map(([x, y, z]) => [x - origin[0], y - origin[1], z - origin[2], this.world.getShape(x, y, z) || CUBE]);
+    const key = 'cells:' + rel.map((c) => c.join(',')).sort().join(';');
+    let g = this.ghostCache.get(key);
+    if (!g) {
+      const w = new World(1, 1, 1, 8);
+      for (const [x, y, z, st] of rel) w.setVoxel(x + 3, y + 3, z + 3, MAT.PLANKS, st);
+      g = this.meshGhost(w);
+      this.ghostCache.set(key, g);
+    }
+    return { ...g, origin };
+  }
+
+  meshGhost(w) {
+    const crisp = new Float32Array(256).fill(1);
+    const m = meshChunk(w.buildPadded(0, 0, 0), crisp, VOXEL);
+    const pos = m.position;
+    for (let i = 0; i < pos.length; i++) pos[i] -= 3 * VOXEL; // shape origin at local 0
+    const mesh = new THREE.BufferGeometry();
+    mesh.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    return { mesh, edges: new THREE.EdgesGeometry(mesh, 30) };
   }
 
   /** Mesh of a shape on its own (local coordinates, metres), cached per orientation. */
@@ -331,14 +644,7 @@ export class Interaction {
     // Build it exactly as the world would: place the shape into a tiny empty world and mesh it.
     const w = new World(1, 1, 1, 8);
     placeShape(w, placement(p.shape, [3, 3, 3], p.rot, p.flip), MAT.PLANKS);
-    const crisp = new Float32Array(256).fill(1);
-    const m = meshChunk(w.buildPadded(0, 0, 0), crisp, VOXEL);
-    const pos = m.position;
-    for (let i = 0; i < pos.length; i++) pos[i] -= 3 * VOXEL; // shape origin at local 0
-    const mesh = new THREE.BufferGeometry();
-    mesh.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-    const edges = new THREE.EdgesGeometry(mesh, 30);
-    g = { mesh, edges };
+    g = this.meshGhost(w);
     this.ghostCache.set(key, g);
     return g;
   }

@@ -28,6 +28,7 @@ export function itemIcon(item, px = 40) {
   const g = c.getContext('2d');
   g.imageSmoothingEnabled = false;
   if (item.kind === 'build') drawBuild(g, item, px);
+  else if (item.kind === 'plant') g.drawImage(textureCanvas(item.texture, px), 0, 0, px, px);
   else drawTool(g, item.id, px);
   cache.set(key, c);
   return cloneCanvas(c);
@@ -78,6 +79,9 @@ function drawTool(g, id, px) {
   if (id === 'pickaxe') {
     handle(4, 13, 11, 5);
     g.beginPath(); g.moveTo(3, 5); g.quadraticCurveTo(9, 0.5, 14, 6); g.quadraticCurveTo(9, 3, 3, 5); metal('#c9ced6');
+  } else if (id === 'axe') {
+    handle(4, 14, 10.5, 3);
+    g.beginPath(); g.moveTo(8.5, 2.5); g.lineTo(13.5, 3.5); g.quadraticCurveTo(15, 7, 12.5, 9.5); g.lineTo(9.8, 6.2); g.closePath(); metal('#c9ced6');
   } else if (id === 'shovel') {
     handle(3, 13, 9.5, 6.5);
     g.beginPath(); g.moveTo(9, 5); g.lineTo(12, 2); g.quadraticCurveTo(15, 2.5, 14, 6); g.lineTo(11, 9); g.closePath(); metal('#b8bec7');

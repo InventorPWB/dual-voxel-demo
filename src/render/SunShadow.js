@@ -3,6 +3,23 @@ import * as THREE from 'three';
 /** Layer the chunk meshes are on so the shadow pass skips ghosts, rings and other overlays. */
 export const SHADOW_LAYER = 1;
 
+/**
+ * Settings every shadow-casting depth material uses. Both sides are drawn so
+ * open edges of the world (and any surface whose back faces the sun) still
+ * block light. A slope-scaled polygon offset plus the shader's normal offset
+ * keep surfaces from shadowing themselves.
+ */
+export const DEPTH_PARAMS = {
+  colorWrite: false,
+  side: THREE.DoubleSide,
+  polygonOffset: true,
+  polygonOffsetFactor: 1.5,
+  polygonOffsetUnits: 2,
+};
+
+/** Shadow material for geometry that casts no shadow (grass, stained glass). */
+export const HIDDEN = new THREE.MeshBasicMaterial({ visible: false });
+
 const BIAS = new THREE.Matrix4().set(
   0.5, 0, 0, 0.5,
   0, 0.5, 0, 0.5,
@@ -19,6 +36,10 @@ const BIAS = new THREE.Matrix4().set(
  * The sun and the world are static most of the time, so the map is only
  * re-rendered when a chunk mesh changes or the sun moves, not every frame.
  * When nothing changes, shadows cost only the lookups in the terrain shader.
+ *
+ * Each caster on SHADOW_LAYER draws with its own `userData.shadowMaterial`
+ * (an array matching its material groups): plain depth for opaque surfaces,
+ * alpha-tested depth for glass frames and leaves, HIDDEN for what casts none.
  */
 export class SunShadow {
   constructor(renderer, scene) {
@@ -36,17 +57,7 @@ export class SunShadow {
     this.camera = new THREE.OrthographicCamera();
     this.camera.layers.set(SHADOW_LAYER);
 
-    // Depth only. Both sides are drawn so open edges of the world (and any
-    // surface whose back faces the sun) still block light. A slope-scaled
-    // polygon offset plus the shader's normal offset keep the surfaces from
-    // shadowing themselves.
-    this.depthMaterial = new THREE.MeshBasicMaterial({
-      colorWrite: false,
-      side: THREE.DoubleSide,
-      polygonOffset: true,
-      polygonOffsetFactor: 1.5,
-      polygonOffsetUnits: 2,
-    });
+    this.swapped = [];
 
     this.direction = new THREE.Vector3(0, 1, 0); // towards the sun
     this.matrix = new THREE.Matrix4(); // world → shadow-map UV + depth
@@ -80,17 +91,23 @@ export class SunShadow {
     if (box.isEmpty()) return false;
     this.fit(box);
 
-    const { renderer, scene } = this;
+    const { renderer, scene, swapped } = this;
+    // Every caster draws with its shadow material for this pass.
+    swapped.length = 0;
+    scene.traverse((o) => {
+      if (!o.isMesh || !o.userData.shadowMaterial || !o.layers.test(this.camera.layers)) return;
+      swapped.push(o, o.material);
+      o.material = o.userData.shadowMaterial;
+    });
     const prevTarget = renderer.getRenderTarget();
-    const prevOverride = scene.overrideMaterial;
     const prevBackground = scene.background;
-    scene.overrideMaterial = this.depthMaterial;
     scene.background = null;
     renderer.setRenderTarget(this.target);
     renderer.render(scene, this.camera);
     renderer.setRenderTarget(prevTarget);
-    scene.overrideMaterial = prevOverride;
     scene.background = prevBackground;
+    for (let i = 0; i < swapped.length; i += 2) swapped[i].material = swapped[i + 1];
+    swapped.length = 0;
 
     this.renders++;
     this.lastMs = performance.now() - t0;
@@ -135,6 +152,5 @@ export class SunShadow {
 
   dispose() {
     this.target.dispose();
-    this.depthMaterial.dispose();
   }
 }
