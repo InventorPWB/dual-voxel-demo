@@ -9,10 +9,25 @@ const STORAGE_KEY = 'dual-voxel-demo.settings';
 /** What can be set, each with its default `value`. */
 export const SETTINGS = [
   {
+    key: 'realisticTextures', label: 'Realistic textures', type: 'toggle', value: false,
+    hint: 'Photographic textures (with normal and roughness maps) and photographed plants instead of the 32×32 pixel art. Changing it reloads the page, which regenerates the world.',
+  },
+  {
     key: 'leafInterior', label: 'Leaves inside crowns', type: 'toggle', value: true,
     hint: 'Sparse leaf cards through the inside of each crown, seen through its gaps and when you are in the leaves.',
   },
 ];
+
+/** A setting's saved value (or its default), before the panel exists (see boot.js). */
+export function savedSetting(key) {
+  const def = SETTINGS.find((s) => s.key === key).value;
+  try {
+    const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+    return key in saved && typeof saved[key] === typeof def ? saved[key] : def;
+  } catch {
+    return def;
+  }
+}
 
 export class Settings {
   constructor() {

@@ -88,6 +88,37 @@ export const LIGHTING_GLSL = /* glsl */ `
     return albedo * light * ao;
   }
 
+  // Lit colour of a surface with a normal map and roughness. gn is the
+  // geometric normal (shadow lookups and the terminator, so bumps don't cast
+  // acne), n the bumped shading normal. Adds the sun's highlight (GGX, a
+  // dielectric: 4% reflectance head-on) and a sheen of sky at grazing angles.
+  vec3 shadeSurface(vec3 albedo, vec3 wpos, vec3 gn, vec3 n, float ao, float wrap, float rough) {
+    float gndl = dot(gn, uSunDir);
+    float ndl = dot(n, uSunDir);
+    float sun = clamp(ndl * (1.0 - wrap) + wrap, 0.0, 1.0);
+    float facing = smoothstep(0.05 - wrap, 0.25, gndl);
+    float vis = facing > 0.0 ? sunShadow(wpos, gn, gndl) : 0.0;
+    float lit = min(facing, vis);
+    vec3 hemi = mix(uGroundColor, uSkyColor, n.y * 0.5 + 0.5);
+    vec3 light = hemi * 0.62 + uSunColor * sun * lit * 0.72 + uSkyColor * (1.0 - lit) * sun * 0.06;
+    vec3 color = albedo * light * ao;
+
+    vec3 v = normalize(cameraPosition - wpos);
+    vec3 h = normalize(v + uSunDir);
+    float nl = max(ndl, 0.0), nv = max(dot(n, v), 1e-3), nh = max(dot(n, h), 0.0), vh = max(dot(v, h), 0.0);
+    float a = max(rough * rough, 0.003), a2 = a * a;
+    float d = nh * nh * (a2 - 1.0) + 1.0;
+    float D = a2 / (3.14159265 * d * d);
+    // Height-correlated Smith visibility.
+    float V = 0.5 / (nl * sqrt(nv * nv * (1.0 - a2) + a2) + nv * sqrt(nl * nl * (1.0 - a2) + a2) + 1e-5);
+    float F = 0.04 + 0.96 * pow(1.0 - vh, 5.0);
+    // The diffuse term above is albedo × 0.72 × sun, i.e. irradiance 0.72π.
+    color += uSunColor * (D * V * F * nl * lit * 0.72 * 3.14159265);
+    float Fv = 0.04 + 0.96 * pow(1.0 - nv, 5.0);
+    color += uSkyColor * Fv * (1.0 - rough) * (1.0 - rough) * 0.35 * ao;
+    return color;
+  }
+
   vec3 fog(vec3 color, float depth) {
     float f = 1.0 - exp(-pow(depth * uFogDensity, 2.0));
     return mix(color, uFogColor, f);

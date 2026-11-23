@@ -50,6 +50,11 @@ chunkMeshes.onChange = () => { shadow.dirty = true; };
 const settings = new Settings();
 function applySettings(key) {
   const v = settings.values;
+  // Textures are built once, at start (boot.js): start again with the other set.
+  if (key === 'realisticTextures') {
+    location.reload();
+    return;
+  }
   // Leaves inside crowns are meshed in: re-mesh when it changes (not on the
   // first call; nothing's meshed yet).
   const options = { interiorCards: v.leafInterior };

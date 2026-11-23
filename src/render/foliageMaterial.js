@@ -66,10 +66,11 @@ const CARD_FADE_GLSL = /* glsl */ `
  * them without the sway, so the shadow map doesn't need redrawing every frame.
  */
 export function createFoliageMaterials(shadow) {
-  const { texture, layerOf } = textureArray();
+  const { photo, texture, normals, layerOf } = textureArray();
   const head = /* glsl */ `
     precision highp sampler2DArray;
     uniform sampler2DArray uTex;
+    uniform sampler2DArray uNrm;
   `;
   const leafUniforms = { uRankLayer: { value: layerOf('leaves_rank') } };
   const vertexShader = /* glsl */ `
@@ -88,8 +89,10 @@ export function createFoliageMaterials(shadow) {
     out float vDepth;
     out float vFar;
     out float vIsCard;
+    out float vSeed;
     void main() {
       float vFade;
+      vSeed = seed;
       #ifdef LEAVES
         vIsCard = isCard() ? 1.0 : 0.0;
       #else
@@ -128,6 +131,7 @@ export function createFoliageMaterials(shadow) {
     in float vDepth;
     in float vFar;
     in float vIsCard;
+    in float vSeed;
     uniform vec3 uGroundTint;
     ${CARD_FADE_GLSL}
     layout(location = 0) out vec4 outColor;
@@ -135,8 +139,11 @@ export function createFoliageMaterials(shadow) {
       vec3 n = normalize(vNormal);
       vec4 tex;
       #ifdef LEAVES
-        // Card's plane (derivatives taken here, outside any branch).
-        vec3 plane = cross(dFdx(vPos), dFdy(vPos));
+        // Derivatives taken here, outside any branch: the card's plane, and
+        // the bark's tangent frame (from how its uv runs across the screen).
+        vec3 dpx = dFdx(vPos), dpy = dFdy(vPos);
+        vec2 dux = dFdx(vUvl.xy), duy = dFdy(vUvl.xy);
+        vec3 plane = cross(dpx, dpy);
         tex = texture(uTex, vUvl);
         if (vIsCard > 0.5) {
           float near = smoothstep(0.25, 1.1, distance(cameraPosition, vPos));
@@ -147,11 +154,37 @@ export function createFoliageMaterials(shadow) {
       #endif
       if (cutout(tex.a)) discard;
       #ifdef LEAVES
-        // Leaves wrap light and let the sun through; bark is lit like terrain.
-        vec3 color = vIsCard > 0.5 ? shade(tex.rgb, vPos, n, vAo, 0.45, 1.0) : shade(tex.rgb, vPos, n, vAo, 0.2, 0.0);
+        vec3 color;
+        if (vIsCard > 0.5) {
+          // Leaves wrap light and let the sun through.
+          color = shade(tex.rgb, vPos, n, vAo, 0.45, 1.0);
+        } else {
+          #ifdef PIXEL_ART
+          // Bark: lit like terrain.
+          color = shade(tex.rgb, vPos, n, vAo, 0.2, 0.0);
+          #else
+          // Bark: lit like terrain, with its normal and roughness maps
+          // (cotangent frame from the derivatives, after Schüler).
+          vec4 q = texture(uNrm, vUvl);
+          vec3 t = vec3(q.rg * 2.0 - 1.0, 0.0);
+          t.z = sqrt(max(0.0, 1.0 - dot(t.xy, t.xy)));
+          vec3 p2 = cross(dpy, n), p1 = cross(n, dpx);
+          vec3 T = p2 * dux.x + p1 * duy.x, B = p2 * dux.y + p1 * duy.y;
+          float m = inversesqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
+          vec3 bn = normalize(mat3(T * m, B * m, n) * t);
+          color = shadeSurface(tex.rgb, vPos, n, bn, vAo, 0.2, q.b);
+          #endif
+        }
       #else
+        vec3 albedo = tex.rgb;
+        #ifndef PIXEL_ART
+        // Each clump a slightly different green: some lusher, some drier.
+        float h = fract(vSeed * 7.31);
+        albedo *= 0.88 + 0.22 * h;
+        albedo = mix(albedo, albedo * vec3(1.08, 1.0, 0.8), smoothstep(0.7, 1.0, fract(vSeed * 3.17)) * 0.5);
+        #endif
         // Far away: the ground's own colour and light, so blades melt into it.
-        vec3 albedo = mix(tex.rgb, uGroundTint, vFar * 0.85);
+        albedo = mix(albedo, uGroundTint, vFar * 0.85);
         vec3 color = shade(albedo, vPos, n, mix(vAo, 1.0, vFar), 0.3, 0.0);
       #endif
       outColor = vec4(fog(color, vDepth), 1.0);
@@ -159,9 +192,10 @@ export function createFoliageMaterials(shadow) {
   `;
   const make = (defines) => new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
-    defines,
+    // Without the photographic textures: lit as the pixel art always was.
+    defines: photo ? defines : { ...defines, PIXEL_ART: '' },
     uniforms: {
-      ...lightingUniforms(shadow), uTex: { value: texture },
+      ...lightingUniforms(shadow), uTex: { value: texture }, uNrm: { value: normals },
       ...leafUniforms, uGroundTint: { value: new THREE.Vector3(...averageColor('grass_top')) },
     },
     vertexShader,

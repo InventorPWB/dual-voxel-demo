@@ -1,5 +1,5 @@
 import { MATERIALS } from '../world/materials.js';
-import { textureCanvas } from '../render/textures.js';
+import { textureCanvas, hasPhotos } from '../render/textures.js';
 
 /**
  * Item icons, drawn in code: building items are the material's texture cut to
@@ -26,7 +26,9 @@ export function itemIcon(item, px = 40) {
   const c = document.createElement('canvas');
   c.width = c.height = px;
   const g = c.getContext('2d');
-  g.imageSmoothingEnabled = false;
+  // Photo textures shrink smoothly to an icon; pixel art keeps its pixels.
+  g.imageSmoothingEnabled = hasPhotos();
+  g.imageSmoothingQuality = 'high';
   if (item.kind === 'build') drawBuild(g, item, px);
   else if (item.kind === 'plant') g.drawImage(textureCanvas(item.texture, px), 0, 0, px, px);
   else drawTool(g, item.id, px);

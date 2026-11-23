@@ -225,31 +225,115 @@ const GENERATORS = {
   },
 };
 
-/** RGBA pixels for one texture, row 0 = top. */
-export function texturePixels(name) {
+/** RGBA pixels of the procedural texture `name` at `size`² (row 0 = top). */
+function proceduralPixels(name, size = TEX_SIZE) {
   const gen = GENERATORS[name];
-  const out = new Uint8ClampedArray(TEX_SIZE * TEX_SIZE * 4);
-  for (let y = 0; y < TEX_SIZE; y++)
-    for (let x = 0; x < TEX_SIZE; x++) {
-      const [r, g, b, a = 255] = gen(x, y);
-      const i = (x + y * TEX_SIZE) * 4;
+  const k = TEX_SIZE / size; // the generators work on a 32 × 32 grid
+  const out = new Uint8ClampedArray(size * size * 4);
+  for (let y = 0; y < size; y++)
+    for (let x = 0; x < size; x++) {
+      // (The generators add 0.5 themselves: sample at the pixel's centre.)
+      const [r, g, b, a = 255] = gen((x + 0.5) * k - 0.5, (y + 0.5) * k - 0.5);
+      const i = (x + y * size) * 4;
       out[i] = r; out[i + 1] = g; out[i + 2] = b; out[i + 3] = a;
     }
   return out;
 }
 
+// ---- photographic textures ------------------------------------------------------
+// Photo textures (see photoTextures.js) replace procedural ones by name. They
+// are TEX_RES² each, and once any is installed every layer of the texture
+// array is TEX_RES² (the rest are drawn at that size, see `layerPixels`).
+//
+// Besides its colour, each layer has a second texel in a parallel array
+// (`layerNRH`): R, G the tangent-space normal's x and y (OpenGL convention,
+// +y = up the image), B the roughness, A the height (0..1, for height-based
+// blending between materials). And `layerInfo`: how many metres one tile of
+// it covers in the world, and whether the terrain shader should break up its
+// tiling (natural ground; not bricks and planks, whose pattern must stay whole).
+
+export const TEX_RES = 1024;
+const photos = new Map();
+
+/**
+ * Install a photo texture. `nrh`: its normal/roughness/height texels (or null:
+ * flat, at the layer's default roughness); `info`: { metres, stochastic }.
+ */
+export function setPhoto(name, pixels, nrh = null, info = null) {
+  photos.set(name, { pixels, nrh, info });
+  avgCache.delete(name);
+}
+export const hasPhotos = () => photos.size > 0;
+
+// Generators whose shapes are analytic (not pixel patterns), so they can be
+// evaluated between the 32 × 32 pixel centres for crisp detail at TEX_RES.
+const SMOOTH = new Set(['leaves', 'leaves_rank', 'grass_blades', 'flowers', 'stained_glass', 'log_top', 'log_end']);
+
+/** Roughness of layers without a roughness map. */
+const ROUGHNESS = { glass: 0.06, stained_glass: 0.08, leaves: 0.5, grass_blades: 0.55, flowers: 0.55, log_top: 0.7, log_end: 0.7 };
+
+/** RGBA pixels for one texture, row 0 = top: a photo (TEX_RES²) if one is installed, else the 32² procedural one. */
+export function texturePixels(name) {
+  return photos.get(name)?.pixels || proceduralPixels(name);
+}
+
+/** Normal/roughness/height texels of a layer, `size`² (see above). */
+export function layerNRH(name, size) {
+  const own = photos.get(name)?.nrh;
+  if (own) return own;
+  const out = new Uint8ClampedArray(size * size * 4);
+  const rough = Math.round(255 * (ROUGHNESS[name] ?? 0.8));
+  for (let i = 0; i < out.length; i += 4) { out[i] = 128; out[i + 1] = 128; out[i + 2] = rough; out[i + 3] = 128; }
+  return out;
+}
+
+/** { metres, stochastic } of a layer: metres per tile, and whether to break up its tiling. */
+export function layerInfo(name) {
+  return { metres: 1, stochastic: false, ...photos.get(name)?.info };
+}
+
+/** Drop the normal/roughness/height texels once they're in the texture array. */
+export function releaseNRH() {
+  for (const p of photos.values()) p.nrh = null;
+}
+
+/** Pixels of a texture-array layer, `size`² (= TEX_RES with photos, TEX_SIZE without). */
+export function layerPixels(name, size) {
+  if (photos.has(name)) return photos.get(name).pixels;
+  if (size === TEX_SIZE) return proceduralPixels(name);
+  if (SMOOTH.has(name)) return proceduralPixels(name, size);
+  // Pixel-art textures: blow the 32² up as-is.
+  const src = proceduralPixels(name);
+  const out = new Uint8ClampedArray(size * size * 4);
+  const k = TEX_SIZE / size;
+  for (let y = 0; y < size; y++)
+    for (let x = 0; x < size; x++) {
+      const s = (Math.floor(x * k) + Math.floor(y * k) * TEX_SIZE) * 4, d = (x + y * size) * 4;
+      out[d] = src[s]; out[d + 1] = src[s + 1]; out[d + 2] = src[s + 2]; out[d + 3] = src[s + 3];
+    }
+  return out;
+}
+
+/** Tileable value noise on the 32-wide lattice (for photoTextures.js). */
+export const tileNoise = vnoise;
+
 /** Draw a texture into a canvas (for HUD swatches). */
 export function textureCanvas(name, size = TEX_SIZE) {
+  const px = texturePixels(name);
+  const n = Math.round(Math.sqrt(px.length / 4));
   const canvas = document.createElement('canvas');
-  canvas.width = canvas.height = TEX_SIZE;
+  canvas.width = canvas.height = n;
   const ctx = canvas.getContext('2d');
-  ctx.putImageData(new ImageData(texturePixels(name), TEX_SIZE, TEX_SIZE), 0, 0);
+  ctx.putImageData(new ImageData(px, n, n), 0, 0);
   canvas.style.width = canvas.style.height = `${size}px`;
   return canvas;
 }
 
+const avgCache = new Map();
+
 /** Average colour of a texture's visible pixels (0..1 each). */
 export function averageColor(name) {
+  if (avgCache.has(name)) return avgCache.get(name);
   const px = texturePixels(name);
   let r = 0, g = 0, b = 0, n = 0;
   for (let i = 0; i < px.length; i += 4) {
@@ -257,7 +341,9 @@ export function averageColor(name) {
     r += px[i]; g += px[i + 1]; b += px[i + 2]; n++;
   }
   n = n || 1;
-  return [r / n / 255, g / n / 255, b / n / 255];
+  const c = [r / n / 255, g / n / 255, b / n / 255];
+  avgCache.set(name, c);
+  return c;
 }
 
 /** Every texture name, in a fixed order. */

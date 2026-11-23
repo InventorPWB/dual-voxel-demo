@@ -1,50 +1,82 @@
 import * as THREE from 'three';
-import { TEX_SIZE, TEXTURE_NAMES, texturePixels } from './textures.js';
+import { TEX_SIZE, TEX_RES, TEXTURE_NAMES, hasPhotos, layerPixels, layerNRH, layerInfo, releaseNRH } from './textures.js';
 
 let shared = null;
 
 /**
- * Every procedural texture in one texture array, layer i = TEXTURE_NAMES[i]
- * (the mesh workers use the same order for plant layers). Shared by the
- * terrain, glass and foliage materials.
+ * Every texture in two parallel texture arrays, layer i = TEXTURE_NAMES[i]
+ * (the mesh workers use the same order for plant layers), shared by the
+ * terrain, glass and foliage materials:
+ *  - `texture`: colour (and alpha, for cutouts and stained glass);
+ *  - `normals`: normal x, y, roughness, height (see textures.js).
+ * Also per layer: `layerScale` (tiles per metre in the world) and
+ * `layerStoch` (1: break up its tiling); and `photo`: whether these are the
+ * photographic textures (else the 32×32 pixel art, drawn as it always was).
  *
- * Its mipmaps are made here rather than by the GPU (see `mipChain`), so
- * cutout textures (grass, flowers, leaves, glass) look right at a distance.
- * Call `attachMipmaps(renderer)` once to have them uploaded.
+ * The colour array's mipmaps are made here rather than by the GPU (see
+ * `mipChain`), so cutout textures (grass, flowers, leaves, glass) look right
+ * at a distance. Call `attachMipmaps(renderer)` once to have them uploaded.
  */
 export function textureArray() {
   if (shared) return shared;
-  const S = TEX_SIZE;
-  const data = new Uint8Array(S * S * 4 * TEXTURE_NAMES.length);
-  TEXTURE_NAMES.forEach((name, layer) => {
-    const px = texturePixels(name);
-    // Flip rows so image "up" maps to +v (world up on side faces, a plant card's top).
+  const photo = hasPhotos(); // photographic textures: bigger layers, smooth filtering
+  const S = photo ? TEX_RES : TEX_SIZE;
+  const L = TEXTURE_NAMES.length;
+  const data = new Uint8Array(S * S * 4 * L);
+  const nrm = new Uint8Array(S * S * 4 * L);
+  // Flip rows so image "up" maps to +v (world up on side faces, a plant card's top).
+  const put = (dst, px, layer) => {
     for (let y = 0; y < S; y++) {
       const src = y * S * 4;
-      const dst = layer * S * S * 4 + (S - 1 - y) * S * 4;
-      data.set(px.subarray(src, src + S * 4), dst);
+      dst.set(px.subarray(src, src + S * 4), layer * S * S * 4 + (S - 1 - y) * S * 4);
     }
+  };
+  TEXTURE_NAMES.forEach((name, layer) => {
+    put(data, layerPixels(name, S), layer);
+    put(nrm, layerNRH(name, S), layer);
   });
-  const tex = new THREE.DataArrayTexture(data, S, S, TEXTURE_NAMES.length);
+  releaseNRH();
+  const tex = new THREE.DataArrayTexture(data, S, S, L);
   tex.format = THREE.RGBAFormat;
   tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
-  tex.magFilter = THREE.NearestFilter;
-  tex.minFilter = THREE.NearestMipmapLinearFilter;
+  tex.magFilter = photo ? THREE.LinearFilter : THREE.NearestFilter;
+  tex.minFilter = photo ? THREE.LinearMipmapLinearFilter : THREE.NearestMipmapLinearFilter;
   // Lets three allocate the levels; ours overwrite them right after (attachMipmaps).
   tex.generateMipmaps = true;
-  tex.anisotropy = 4;
+  tex.anisotropy = photo ? 8 : 4;
   tex.needsUpdate = true;
-  shared = { texture: tex, layerOf: (name) => TEXTURE_NAMES.indexOf(name), mips: mipChain(data, S, TEXTURE_NAMES.length) };
+
+  const normals = new THREE.DataArrayTexture(nrm, S, S, L);
+  normals.format = THREE.RGBAFormat;
+  normals.wrapS = normals.wrapT = THREE.RepeatWrapping;
+  normals.magFilter = THREE.LinearFilter;
+  normals.minFilter = THREE.LinearMipmapLinearFilter;
+  normals.generateMipmaps = true;
+  normals.anisotropy = photo ? 8 : 4;
+  normals.needsUpdate = true;
+  // Uploaded once: the copy here is only dead weight after that.
+  normals.onUpdate = () => { normals.image.data = null; };
+
+  const info = TEXTURE_NAMES.map(layerInfo);
+  shared = {
+    photo, texture: tex, normals, layerOf: (name) => TEXTURE_NAMES.indexOf(name),
+    layerScale: info.map((i) => 1 / i.metres), layerStoch: info.map((i) => (i.stochastic ? 1 : 0)),
+    mips: mipChain(data, S, L),
+  };
   return shared;
 }
 
 /** Upload the hand-made mip levels whenever three uploads the texture. */
 export function attachMipmaps(renderer) {
-  const { texture, mips } = textureArray();
+  const t = textureArray();
+  const { texture } = t;
   texture.onUpdate = () => {
     // three has just uploaded level 0 and left the texture bound.
     const gl = renderer.getContext();
-    mips.forEach((m, i) => gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, i + 1, 0, 0, 0, m.size, m.size, m.layers, gl.RGBA, gl.UNSIGNED_BYTE, m.data));
+    t.mips.forEach((m, i) => gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, i + 1, 0, 0, 0, m.size, m.size, m.layers, gl.RGBA, gl.UNSIGNED_BYTE, m.data));
+    // Uploaded once: free the copies (hundreds of MB with photo textures).
+    t.mips = [];
+    texture.image.data = null;
   };
 }
 
@@ -69,8 +101,8 @@ export function mipChain(data, size, layers) {
       for (let y = 0; y < h; y++)
         for (let x = 0; x < h; x++) {
           let r = 0, g = 0, b = 0, a = 0, pr = 0, pg = 0, pb = 0;
-          for (const [dx, dy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
-            const i = (l * s * s + (2 * y + dy) * s + 2 * x + dx) * 4;
+          for (let k = 0; k < 4; k++) {
+            const i = (l * s * s + (2 * y + (k >> 1)) * s + 2 * x + (k & 1)) * 4;
             const w = src[i + 3];
             r += src[i] * w; g += src[i + 1] * w; b += src[i + 2] * w; a += w;
             pr += src[i]; pg += src[i + 1]; pb += src[i + 2];
