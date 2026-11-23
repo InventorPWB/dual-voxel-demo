@@ -98,6 +98,8 @@ body.inventory #view { cursor: default; }
 #settings h3 { margin: 0; font-size: 16px; }
 #settings .sub { margin: 4px 0 6px; font-size: 12px; color: var(--muted); }
 #settings .setting { padding: 10px 0; border-top: 1px solid var(--border); }
+#settings .setting.inactive { opacity: 0.45; }
+#settings .section { margin: 14px 0 2px; font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
 #settings .label { font-size: 13px; font-weight: 600; margin-bottom: 6px; }
 #settings .label.check { display: flex; align-items: center; gap: 8px; cursor: pointer; margin-bottom: 2px; }
 #settings .hint { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.4; }

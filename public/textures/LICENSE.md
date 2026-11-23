@@ -6,16 +6,16 @@ Every photographic texture here is public domain ([CC0](https://creativecommons.
 
 Each folder holds the material's colour, OpenGL normal map, AO/roughness (Poly Haven's `arm`, or separate maps for ambientCG) and displacement.
 
-| Layer | Folder | Source | Real size |
+| Layer | Folder | Source | Tile size in the demo |
 | --- | --- | --- | --- |
 | grass_top | `Grass004/` | [ambientCG Grass004](https://ambientcg.com/view?id=Grass004) | 1.4 m |
 | dirt | `forest_ground_06/` | [Poly Haven forest_ground_06](https://polyhaven.com/a/forest_ground_06) | 2.11 m |
 | stone | `rock_boulder_dry/` | [Poly Haven rock_boulder_dry](https://polyhaven.com/a/rock_boulder_dry) | 1.8 m |
 | sand | `sand_01/` | [Poly Haven sand_01](https://polyhaven.com/a/sand_01) | 1.5 m |
 | planks | `oak_wood_planks/` | [Poly Haven oak_wood_planks](https://polyhaven.com/a/oak_wood_planks) | 1.2 m |
-| brick | `castle_brick_07/` | [Poly Haven castle_brick_07](https://polyhaven.com/a/castle_brick_07) | 2.5 m |
-| stone_brick | `stone_brick_wall_001/` | [Poly Haven stone_brick_wall_001](https://polyhaven.com/a/stone_brick_wall_001) | 2.5 m |
-| cobble | `cobblestone_floor_01/` | [Poly Haven cobblestone_floor_01](https://polyhaven.com/a/cobblestone_floor_01) | 1.0 m |
+| brick | `castle_brick_07/` | [Poly Haven castle_brick_07](https://polyhaven.com/a/castle_brick_07) | 4.0 m |
+| stone_brick | `stone_brick_wall_001/` | [Poly Haven stone_brick_wall_001](https://polyhaven.com/a/stone_brick_wall_001) | 4.5 m |
+| cobble | `cobblestone_floor_01/` | [Poly Haven cobblestone_floor_01](https://polyhaven.com/a/cobblestone_floor_01) | 2.0 m |
 | bark | `bark_brown_01/` | [Poly Haven bark_brown_01](https://polyhaven.com/a/bark_brown_01) | 1.0 m |
 
 `grass_dirt` (the side of grass) is made from the grass and dirt sets at load time.

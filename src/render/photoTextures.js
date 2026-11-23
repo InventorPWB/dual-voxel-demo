@@ -32,9 +32,12 @@ const SOURCES = {
   stone: { ...polyHaven('rock_boulder_dry'), metres: 1.8, stochastic: true, filter: 'saturate(0.45) brightness(0.95)' },
   sand: { ...polyHaven('sand_01'), metres: 1.5, stochastic: true, filter: 'saturate(1.1) brightness(1.08)' },
   planks: { ...polyHaven('oak_wood_planks'), metres: 1.2 },
-  brick: { ...polyHaven('castle_brick_07'), metres: 2.5 },
-  stone_brick: { ...polyHaven('stone_brick_wall_001'), metres: 2.5, filter: 'brightness(1.3) saturate(0.85)' },
-  cobble: { ...polyHaven('cobblestone_floor_01'), metres: 1.0 },
+  // Masonry drawn larger than the photos' nominal size, to suit the 1 m
+  // blocks it's built from: bricks about 10 cm a course, stones about 40 cm,
+  // cobbles about 20 cm.
+  brick: { ...polyHaven('castle_brick_07'), metres: 4.0 },
+  stone_brick: { ...polyHaven('stone_brick_wall_001'), metres: 4.5, filter: 'brightness(1.3) saturate(0.85)' },
+  cobble: { ...polyHaven('cobblestone_floor_01'), metres: 2.0 },
   bark: { ...polyHaven('bark_brown_01'), metres: 1.0, filter: 'brightness(1.05)' },
 };
 

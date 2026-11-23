@@ -6,17 +6,61 @@
 
 const STORAGE_KEY = 'dual-voxel-demo.settings';
 
-/** What can be set, each with its default `value`. */
+/**
+ * What can be set, each with its default `value`, in panel order; `section`
+ * entries are headings. `requires`: the key of a toggle this one only has an
+ * effect under (its row is dimmed while that is off).
+ */
 export const SETTINGS = [
+  { type: 'section', label: 'Textures' },
   {
     key: 'realisticTextures', label: 'Realistic textures', type: 'toggle', value: false,
     hint: 'Photographic textures (with normal and roughness maps) and photographed plants instead of the 32×32 pixel art. Changing it reloads the page, which regenerates the world.',
   },
   {
+    key: 'normalMaps', label: 'Normal maps', type: 'toggle', value: true, requires: 'realisticTextures',
+    hint: 'Surface relief on ground, walls and bark. Off: the textures lie flat.',
+  },
+  { type: 'section', label: 'Lighting' },
+  {
+    key: 'shaderLighting', label: 'Shader lighting', type: 'toggle', value: true,
+    hint: 'Lighting like game shader packs: a strong warm sun against a cool sky light, physically based materials and tone mapping, with the effects below. Off: the original flat lighting.',
+  },
+  {
+    key: 'brightness', label: 'Brightness', type: 'range', value: 1, min: 0.5, max: 1.6, step: 0.05,
+    format: (v) => `${Math.round(v * 100)}%`, requires: 'shaderLighting',
+  },
+  {
+    key: 'reflections', label: 'Reflections', type: 'toggle', value: true, requires: 'shaderLighting',
+    hint: 'The sun\'s highlights and the sky reflected off surfaces, by their roughness.',
+  },
+  {
+    key: 'ambientOcclusion', label: 'Ambient occlusion', type: 'toggle', value: true, requires: 'shaderLighting',
+    hint: 'Darkens creases, the feet of walls and grass, and under trees.',
+  },
+  {
+    key: 'sunShafts', label: 'Sun shafts', type: 'toggle', value: true, requires: 'shaderLighting',
+    hint: 'Rays of light through leaves and over ridges when you look towards the sun.',
+  },
+  {
+    key: 'bloom', label: 'Bloom', type: 'toggle', value: true, requires: 'shaderLighting',
+    hint: 'A glow round the sun and anything brighter than white.',
+  },
+  {
+    key: 'clouds', label: 'Clouds', type: 'toggle', value: true, requires: 'shaderLighting',
+    hint: 'Drifting clouds in the sky.',
+  },
+  {
+    key: 'vignette', label: 'Vignette', type: 'toggle', value: true, requires: 'shaderLighting',
+    hint: 'Slightly darker corners.',
+  },
+  { type: 'section', label: 'Plants' },
+  {
     key: 'leafInterior', label: 'Leaves inside crowns', type: 'toggle', value: true,
     hint: 'Sparse leaf cards through the inside of each crown, seen through its gaps and when you are in the leaves.',
   },
 ];
+const VALUES = SETTINGS.filter((s) => s.key);
 
 /** A setting's saved value (or its default), before the panel exists (see boot.js). */
 export function savedSetting(key) {
@@ -31,10 +75,10 @@ export function savedSetting(key) {
 
 export class Settings {
   constructor() {
-    this.values = Object.fromEntries(SETTINGS.map((s) => [s.key, s.value]));
+    this.values = Object.fromEntries(VALUES.map((s) => [s.key, s.value]));
     try {
       const saved = JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
-      for (const s of SETTINGS) if (s.key in saved && typeof saved[s.key] === typeof s.value) this.values[s.key] = saved[s.key];
+      for (const s of VALUES) if (s.key in saved && typeof saved[s.key] === typeof s.value) this.values[s.key] = saved[s.key];
     } catch { /* storage unavailable: defaults */ }
     this.onChange = null;
     this.panel = document.getElementById('settings');
@@ -50,7 +94,13 @@ export class Settings {
     if (this.values[key] === value) return;
     this.values[key] = value;
     try { localStorage.setItem(STORAGE_KEY, JSON.stringify(this.values)); } catch { /* ignore */ }
+    this.syncDependents();
     this.onChange?.(key, this.values);
+  }
+
+  /** Dim the rows whose `requires` toggle is off. */
+  syncDependents() {
+    for (const [row, s] of this.dependents) row.classList.toggle('inactive', !this.values[s.requires]);
   }
 
   get open() {
@@ -65,8 +115,17 @@ export class Settings {
 
   build() {
     const body = this.panel.querySelector('.body');
+    this.dependents = [];
     for (const s of SETTINGS) {
+      if (s.type === 'section') {
+        const h = document.createElement('div');
+        h.className = 'section';
+        h.textContent = s.label;
+        body.appendChild(h);
+        continue;
+      }
       const row = document.createElement('div');
+      if (s.requires) this.dependents.push([row, s]);
       row.className = 'setting';
       const label = document.createElement(s.type === 'toggle' ? 'label' : 'div');
       label.className = 'label';
@@ -129,5 +188,6 @@ export class Settings {
       }
       body.appendChild(row);
     }
+    this.syncDependents();
   }
 }

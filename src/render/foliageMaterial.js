@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { textureArray } from './textureArray.js';
 import { averageColor } from './textures.js';
-import { LIGHTING_GLSL, lightingUniforms } from './lighting.js';
+import { LIGHTING_GLSL, lightingUniforms, litMaterial } from './lighting.js';
 import { DEPTH_PARAMS, HIDDEN } from './SunShadow.js';
 
 /** Grass is drawn fully out to FADE_START metres and gone by FADE_END. */
@@ -71,6 +71,7 @@ export function createFoliageMaterials(shadow) {
     precision highp sampler2DArray;
     uniform sampler2DArray uTex;
     uniform sampler2DArray uNrm;
+    uniform float uNormalStrength;
   `;
   const leafUniforms = { uRankLayer: { value: layerOf('leaves_rank') } };
   const vertexShader = /* glsl */ `
@@ -166,13 +167,13 @@ export function createFoliageMaterials(shadow) {
           // Bark: lit like terrain, with its normal and roughness maps
           // (cotangent frame from the derivatives, after Schüler).
           vec4 q = texture(uNrm, vUvl);
-          vec3 t = vec3(q.rg * 2.0 - 1.0, 0.0);
+          vec3 t = vec3((q.rg * 2.0 - 1.0) * uNormalStrength, 0.0);
           t.z = sqrt(max(0.0, 1.0 - dot(t.xy, t.xy)));
           vec3 p2 = cross(dpy, n), p1 = cross(n, dpx);
           vec3 T = p2 * dux.x + p1 * duy.x, B = p2 * dux.y + p1 * duy.y;
           float m = inversesqrt(max(max(dot(T, T), dot(B, B)), 1e-12));
           vec3 bn = normalize(mat3(T * m, B * m, n) * t);
-          color = shadeSurface(tex.rgb, vPos, n, bn, vAo, 0.2, q.b);
+          color = shadeSurface(tex.rgb, vPos, n, bn, vAo, 0.2, q.b, 0.6);
           #endif
         }
       #else
@@ -187,10 +188,10 @@ export function createFoliageMaterials(shadow) {
         albedo = mix(albedo, uGroundTint, vFar * 0.85);
         vec3 color = shade(albedo, vPos, n, mix(vAo, 1.0, vFar), 0.3, 0.0);
       #endif
-      outColor = vec4(fog(color, vDepth), 1.0);
+      outColor = vec4(fog(color, vDepth, vPos), 1.0);
     }
   `;
-  const make = (defines) => new THREE.ShaderMaterial({
+  const make = (defines) => litMaterial(new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     // Without the photographic textures: lit as the pixel art always was.
     defines: photo ? defines : { ...defines, PIXEL_ART: '' },
@@ -201,7 +202,7 @@ export function createFoliageMaterials(shadow) {
     vertexShader,
     fragmentShader,
     side: THREE.DoubleSide,
-  });
+  }));
   const materials = [make({ GRASS: '' }), make({ LEAVES: '' })];
 
   const leafDepth = new THREE.ShaderMaterial({

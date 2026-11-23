@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 import { MATERIALS } from '../world/materials.js';
 import { textureArray } from './textureArray.js';
-import { LIGHTING_GLSL, lightingUniforms } from './lighting.js';
+import { LIGHTING_GLSL, lightingUniforms, litMaterial } from './lighting.js';
 import { DEPTH_PARAMS, HIDDEN } from './SunShadow.js';
 
 export { SKY_COLOR, SUN_AZIMUTH, SUN_ELEVATION, sunDirection } from './lighting.js';
@@ -27,7 +27,7 @@ const SURFACE_GLSL = /* glsl */ `
   }
 
   vec3 unpackNormal(vec4 nrh) {
-    vec2 xy = nrh.rg * 2.0 - 1.0;
+    vec2 xy = (nrh.rg * 2.0 - 1.0) * uNormalStrength;
     return vec3(xy, sqrt(max(0.0, 1.0 - dot(xy, xy))));
   }
 
@@ -268,9 +268,14 @@ export function createChunkMaterials(shadow) {
   const frames = MATERIALS.map((m) => new THREE.Vector4(...(m.frame || [0, 0, 0, 0])));
   const pieceMap = MATERIALS.map((m) => (m.mapping === 'piece' ? 1 : 0));
   const macro = MATERIALS.map((m) => (m.natural ? 1 : 0.3));
+  // Specular level (shader lighting): grass and soil keep most of their
+  // reflection in their own gaps; stone, brick and glass show all of it.
+  const SPECULAR = { grass_top: 0.25, dirt: 0.5, sand: 0.6, planks: 0.8 };
+  const specular = MATERIALS.map((m) => SPECULAR[m.top] ?? 1);
   const shared = {
     uTex: { value: texture }, uNrm: { value: normals }, uLayers: { value: layers }, uFrame: { value: frames },
-    uPieceMap: { value: pieceMap }, uMacro: { value: macro }, uLayerScale: { value: layerScale }, uLayerStoch: { value: layerStoch },
+    uPieceMap: { value: pieceMap }, uMacro: { value: macro }, uSpecular: { value: specular },
+    uNormalStrength: lightingUniforms(shadow).uNormalStrength, uLayerScale: { value: layerScale }, uLayerStoch: { value: layerStoch },
   };
   const head = /* glsl */ `
     precision highp sampler2DArray;
@@ -280,6 +285,8 @@ export function createChunkMaterials(shadow) {
     uniform vec4 uFrame[${layers.length}];
     uniform float uPieceMap[${layers.length}];
     uniform float uMacro[${layers.length}];
+    uniform float uSpecular[${layers.length}];
+    uniform float uNormalStrength;
     uniform float uLayerScale[${layerScale.length}];
     uniform float uLayerStoch[${layerScale.length}];
   `;
@@ -336,10 +343,11 @@ export function createChunkMaterials(shadow) {
       else s = surface(vPos, n, vLocal, vMat);
       vec4 tex = s.col;
       #ifdef PIXEL_ART
-        vec3 color = fog(shade(tex.rgb, vPos, n, vAo, 0.2, 0.0), vDepth);
+        vec3 color = fog(shade(tex.rgb, vPos, n, vAo, 0.2, 0.0), vDepth, vPos);
       #else
         vec3 albedo = macroVariation(tex.rgb, vPos, vBlend > 0 ? vBlend & 255 : vMat);
-        vec3 color = fog(shadeSurface(albedo, vPos, n, s.n, vAo, 0.2, s.rough), vDepth);
+        int sm = vBlend > 0 ? vBlend & 255 : vMat;
+        vec3 color = fog(shadeSurface(albedo, vPos, n, s.n, vAo, 0.2, s.rough, uSpecular[sm]), vDepth, vPos);
       #endif
       #if defined(CUTOUT)
         if (cutout(tex.a)) discard;
@@ -352,14 +360,14 @@ export function createChunkMaterials(shadow) {
     }
   `;
 
-  const make = (defines, extra) => new THREE.ShaderMaterial({
+  const make = (defines, extra) => litMaterial(new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     defines: { ...mode, ...defines },
     uniforms: { ...lightingUniforms(shadow), ...shared },
     vertexShader,
     fragmentShader,
     ...extra,
-  });
+  }));
 
   const materials = [
     make({}, {}),

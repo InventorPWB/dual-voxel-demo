@@ -3,8 +3,11 @@ import { World, VOXEL } from './world/World.js';
 import { generateWorld, surfaceHeight } from './world/generate.js';
 import { createChunkMaterials, SKY_COLOR, SUN_AZIMUTH, sunDirection } from './render/terrainMaterial.js';
 import { createFoliageMaterials } from './render/foliageMaterial.js';
-import { lightingUniforms } from './render/lighting.js';
+import { lightingUniforms, setShaderLighting, shaderLighting } from './render/lighting.js';
+import { createSky } from './render/Sky.js';
+import { PostFX } from './render/PostFX.js';
 import { attachMipmaps } from './render/textureArray.js';
+import { hasPhotos } from './render/textures.js';
 import { SunShadow } from './render/SunShadow.js';
 import { ChunkMeshes } from './render/ChunkMeshes.js';
 import { Player } from './player/Player.js';
@@ -21,11 +24,13 @@ renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(window.innerWidth, window.innerHeight);
 
 const scene = new THREE.Scene();
-scene.background = new THREE.Color(SKY_COLOR);
+const flatSky = new THREE.Color(SKY_COLOR);
+scene.background = flatSky;
 const camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 0.05, 500);
 
 window.addEventListener('resize', () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
+  post?.setSize(window.innerWidth, window.innerHeight);
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
 });
@@ -45,6 +50,19 @@ const chunkMeshes = new ChunkMeshes(world, scene, createChunkMaterials(shadow), 
 const uTime = lightingUniforms(shadow).uTime;
 chunkMeshes.onChange = () => { shadow.dirty = true; };
 
+// Shader lighting (Settings): a sky dome instead of the flat sky colour, and
+// the frame drawn through PostFX (occlusion, sun shafts, bloom, tone mapping).
+const sky = createSky(shadow);
+scene.add(sky);
+const post = new PostFX(renderer, shadow.direction);
+post.setSize(window.innerWidth, window.innerHeight);
+post.setGrade(hasPhotos() ? { exposure: 0.85, saturation: 1 } : { exposure: 0.72, saturation: 0.8 });
+function setLighting(on) {
+  setShaderLighting(on);
+  sky.visible = on;
+  scene.background = on ? null : flatSky;
+}
+
 // ---- settings ------------------------------------------------------------------
 
 const settings = new Settings();
@@ -55,6 +73,13 @@ function applySettings(key) {
     location.reload();
     return;
   }
+  setLighting(v.shaderLighting);
+  // The visual settings, applied live.
+  post.setEffects({ ao: v.ambientOcclusion, rays: v.sunShafts, bloom: v.bloom, vignette: v.vignette, brightness: v.brightness });
+  sky.setClouds(v.clouds);
+  const lu = lightingUniforms(shadow);
+  lu.uSpecularScale.value = v.reflections ? 1 : 0;
+  lu.uNormalStrength.value = v.normalMaps ? 1 : 0;
   // Leaves inside crowns are meshed in: re-mesh when it changes (not on the
   // first call; nothing's meshed yet).
   const options = { interiorCards: v.leafInterior };
@@ -248,7 +273,8 @@ function frame(now) {
     hud.setLoading('');
   }
 
-  renderer.render(scene, camera);
+  if (shaderLighting()) post.render(scene, camera);
+  else renderer.render(scene, camera);
 
   statsTimer -= dt;
   if (statsTimer <= 0) {
@@ -268,4 +294,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Handy for poking at the demo from the devtools console.
-if (import.meta.env.DEV) window.demo = { settings, shadow, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };
+if (import.meta.env.DEV) window.demo = { settings, shadow, post, sky, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };

@@ -163,8 +163,10 @@ function crossPlants(p, scale, out) {
             const u0 = flip ? 1 : 0, u1 = 1 - u0;
             const v = (x, y, z, u, vv, w, ao) => [x * scale, y * scale, z * scale, u, vv, w, ao];
             out.quad(
-              v(px - dx, h, pz - dz, u0, 0, 0, 0.55),
-              v(px + dx, h, pz + dz, u1, 0, 0, 0.55),
+              // A little darker at the root (other blades shade it), not so
+              // much that it stands out against the ground it grows from.
+              v(px - dx, h, pz - dz, u0, 0, 0, 0.82),
+              v(px + dx, h, pz + dz, u1, 0, 0, 0.82),
               v(px + dx + lean[0], h + H, pz + dz + lean[1], u1, 1, 1, 1),
               v(px - dx + lean[0], h + H, pz - dz + lean[1], u0, 1, 1, 1),
               // Ground normal: tufts shade like the ground they grow from.
