@@ -8,6 +8,8 @@ THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
 THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
+const COLLIDER_MATERIAL = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
+
 /**
  * Keeps the three.js meshes of each chunk in sync with the voxel data. Dirty
  * chunks are re-meshed on a pool of web workers, nearest to the player first.
@@ -50,8 +52,6 @@ export class ChunkMeshes {
       this.workers.push(worker);
     }
     this.workerCount = count;
-    this.detached = new Map();
-    this.detachedId = 0;
   }
 
   /** Change how foliage is meshed (see meshFoliage's options); re-mesh everything unless `remesh` is false. */
@@ -97,26 +97,7 @@ export class ChunkMeshes {
     }
   }
 
-  /**
-   * Mesh a padded chunk that isn't part of the world (see Felling) on a
-   * worker: resolves to a foliage geometry, or null if there's nothing.
-   */
-  meshDetached(padded) {
-    const id = ++this.detachedId;
-    const worker = this.workers[id % this.workers.length];
-    return new Promise((resolve) => {
-      this.detached.set(id, resolve);
-      worker.postMessage({ type: 'mesh', index: -1, version: 0, detached: id, ...padded });
-    });
-  }
-
   onResult(worker, msg) {
-    if (msg.detached) {
-      const resolve = this.detached.get(msg.detached);
-      this.detached.delete(msg.detached);
-      resolve(msg.foliage.triangles ? foliageGeometry(msg.foliage) : null);
-      return;
-    }
     this.idle.push(worker);
     this.inFlight[msg.index] = false;
     this.lastMeshMs = msg.ms;
@@ -163,7 +144,8 @@ export class ChunkMeshes {
       }
       return;
     }
-    const mesh = old || new THREE.Mesh(geometry);
+    // (Both sides count, so aim never slips in through an open end.)
+    const mesh = old || new THREE.Mesh(geometry, COLLIDER_MATERIAL);
     mesh.geometry = geometry;
     mesh.userData.cells = cells;
     mesh.updateMatrixWorld();
@@ -245,7 +227,7 @@ function dist2([cx, cy, cz], focus, s) {
 }
 
 /** Geometry of a meshFoliage result. */
-export function foliageGeometry(foliage) {
+function foliageGeometry(foliage) {
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(foliage.position, 3));
   g.setAttribute('normal', new THREE.BufferAttribute(foliage.normal, 3));

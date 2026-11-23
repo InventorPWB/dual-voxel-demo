@@ -1,7 +1,6 @@
 import { MATERIALS, MAT } from './materials.js';
 import { applyCSG, exposeCuts } from './csg.js';
 import { settlePlants } from './plants.js';
-import { settleWood } from './chop.js';
 
 /**
  * World edit rules shared by every tool.
@@ -12,8 +11,8 @@ import { settleWood } from './chop.js';
  *    re-fits the surface. They never touch building pieces.
  *  - Nothing ever becomes solid inside the player (pass `protect`).
  * After terrain edits, tiny disconnected bits left floating are dissolved.
- * Plants go with whatever they stood on (settlePlants), and wood with
- * whatever it grew from, taking everything it carried (settleWood).
+ * Floor plants go with whatever they stood on (settlePlants); wood needs
+ * no support (see chop.js).
  */
 
 /** Disconnected pieces this many voxels or smaller are removed after brush edits. */
@@ -102,7 +101,6 @@ export function removeSpecks(world, r) {
 function cleanup(world, box) {
   removeSpecks(world, region(world, box[0] - 2, box[1] - 2, box[2] - 2, box[3] + 2, box[4] + 2, box[5] + 2));
   settlePlants(world, [box[0] - 3, box[1] - 3, box[2] - 3, box[3] + 3, box[4] + 3, box[5] + 3]);
-  settleWood(world, [box[0] - 3, box[1] - 3, box[2] - 3, box[3] + 3, box[4] + 3, box[5] + 3]);
 }
 
 // ----------------------------------------------------------------- brushes
@@ -270,7 +268,6 @@ export function placeShape(world, p, material) {
   world.markDirtyBox(ox - 1, oy - 1, oz - 1, ox + p.size[0], oy + p.size[1], oz + p.size[2]);
   // A piece with a rounded or sloped top can't carry the plants above it.
   settlePlants(world, [ox, oy, oz, ox + p.size[0] - 1, oy + p.size[1], oz + p.size[2] - 1]);
-  settleWood(world, [ox - 1, oy - 1, oz - 1, ox + p.size[0], oy + p.size[1], oz + p.size[2]]);
   return n;
 }
 
@@ -340,7 +337,6 @@ export function clearCells(world, cells) {
   world.markDirtyBox(x0 - 1, y0 - 1, z0 - 1, x1 + 1, y1 + 1, z1 + 1);
   removeSpecks(world, region(world, x0 - 3, y0 - 3, z0 - 3, x1 + 3, y1 + 3, z1 + 3));
   settlePlants(world, [x0 - 3, y0 - 3, z0 - 3, x1 + 3, y1 + 4, z1 + 3]);
-  settleWood(world, [x0 - 3, y0 - 3, z0 - 3, x1 + 3, y1 + 4, z1 + 3]);
   return gone.size;
 }
 

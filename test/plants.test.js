@@ -1,7 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { World, VOXEL } from '../src/world/World.js';
 import { MAT, CRISP, PASS_OPAQUE, PASS_CUTOUT, PASS_TRANSLUCENT } from '../src/world/materials.js';
-import { PLANT, DIRS26, plantDef, isWood, isSolidWood, woodParent, woodRadius, woodCut, woodCutSide, supportsPlant, settlePlants } from '../src/world/plants.js';
+import { PLANT, DIRS26, plantDef, isWood, isSolidWood, isCutOff, woodParent, woodRadius, woodCut, woodCutSide, supportsPlant, settlePlants } from '../src/world/plants.js';
 import { chop, severed, remove } from '../src/world/chop.js';
 import { TEXTURE_NAMES } from '../src/render/textures.js';
 import { placeShape, sculptSphere, removeShape, removeSpecks, breakAt } from '../src/world/edits.js';
@@ -321,7 +321,7 @@ describe('trees', () => {
     expect(solid).toBeGreaterThan(300);
   });
 
-  it('chops wood an eighth at a time, drawing the notch as end grain, and fells all it carried', () => {
+  it('chops wood an eighth at a time, drawing the notch as end grain; through, all beyond goes, leaving a stump', () => {
     const w = flatWorld(4, 16);
     growTree(w, 32, 32, rng(2));
     const f = foot(w, 32, 32);
@@ -337,16 +337,39 @@ describe('trees', () => {
       expect(woodCutSide(w.getPlant(...f))).toBe(2);
     }
     expect(endGrain()).toBeGreaterThan(0);
-    // The eighth stroke goes through: the whole tree and its leaves are freed.
+    // The eighth stroke goes through: everything above it and all the leaves
+    // are freed, and the foot stays, as a stump cut flat.
     const before = plants(w);
     const set = chop(w, ...f, 6);
-    // (The foot is all the tree grows from: roots and all grow from it.)
-    expect(set.wood.length).toBe(before.wood.length);
+    expect(set.wood.length).toBe(before.wood.length - 1);
     expect(set.leaves.length).toBe(before.leaves.length);
     remove(w, set);
     const after = plants(w);
     expect(after.leaves.length).toBe(0);
-    for (const v of after.wood) expect(grounded(w, v.slice(0, 3))).toBe(true);
+    expect(after.wood.map((v) => v.slice(0, 3))).toEqual([f]);
+    expect(isCutOff(w.getPlant(...f))).toBe(true);
+    expect(endGrain()).toBeGreaterThan(0);
+  });
+
+  it('felling one of two trees whose crowns run together takes its own leaves, not those of the other', () => {
+    const w = flatWorld(4, 16);
+    growTree(w, 24, 32, rng(2));
+    const one = plants(w);
+    growTree(w, 38, 32, rng(5));
+    const both = plants(w);
+    // The crowns touch: some leaves of the second sit against the first's.
+    const f = foot(w, 24, 32);
+    let set = null;
+    for (let k = 0; k < 8; k++) set = chop(w, ...f, 0) || set;
+    remove(w, set);
+    const after = plants(w);
+    // Most of the first tree's leaves went; nearly all the second's stayed.
+    expect(set.leaves.length).toBeGreaterThan(one.leaves.length * 0.8);
+    expect(after.leaves.length).toBeGreaterThan((both.leaves.length - one.leaves.length) * 0.9);
+    // Hardly any leaf left is nearer the felled tree's wood than the other's.
+    const near = (v, wood) => Math.min(...wood.map((u) => Math.abs(u[0] - v[0]) + Math.abs(u[1] - v[1]) + Math.abs(u[2] - v[2])));
+    const felled = set.wood;
+    expect(after.leaves.filter((v) => near(v, felled) < near(v, after.wood)).length).toBeLessThan(after.leaves.length * 0.03);
   });
 
   it('cutting off a branch takes what grows from it and its leaves, and leaves the rest of the tree whole', () => {
@@ -365,15 +388,19 @@ describe('trees', () => {
     for (const v of after.wood) expect(grounded(w, v.slice(0, 3))).toBe(true);
   });
 
-  it('a tree goes when the ground under its trunk is dug away', () => {
+  it('wood needs no support: a tree stays when the ground under it is dug away, and breaking wood takes only that', () => {
     const w = flatWorld(4, 16);
     growTree(w, 32, 32, rng(4));
-    expect(plants(w).wood.length).toBeGreaterThan(50);
-    sculptSphere(w, { x: 32.5, y: GROUND - 0.5, z: 32.5 }, 3, 'sub');
-    const { wood, leaves } = plants(w);
-    for (const v of wood) expect(grounded(w, v.slice(0, 3))).toBe(true);
-    expect(wood.filter((v) => Math.hypot(v[0] - 32, v[2] - 32) < 3 && v[1] > GROUND + 4)).toEqual([]);
-    expect(leaves.length).toBe(0);
+    const before = plants(w);
+    const f = foot(w, 32, 32);
+    sculptSphere(w, { x: f[0] + 0.5, y: GROUND - 0.5, z: f[2] + 0.5 }, 3, 'sub');
+    expect(w.isSolid(f[0], f[1] - 1, f[2])).toBe(false);
+    expect(plants(w).wood.length).toBe(before.wood.length);
+    expect(plants(w).leaves.length).toBe(before.leaves.length);
+    // The foot, its ground gone, is still drawn (a stub cut flat beneath it).
+    w.setPlant(...f.map((c, k) => (k === 1 ? c + 1 : c)), 0); // break a voxel out of the trunk
+    expect(plants(w).wood.length).toBe(before.wood.length - 1);
+    expect(meshTrees(w).reduce((n, m) => n + m.triangles, 0)).toBeGreaterThan(1000);
   });
 
   it('draws terrain wood cut open by an edit as end grain, at any angle, and the outside as bark', () => {

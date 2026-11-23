@@ -32,7 +32,8 @@ import { MAT } from './materials.js';
  *              no cut, 1 means what grew on from it was cut off, so it ends
  *              in a flat cut (a stump).
  * Wood at least COLLIDE_RADIUS thick is solid to walk into and stand on, and
- * takes an axe to cut; thinner wood is brushed through and snapped by hand.
+ * isn't cleared by digging brushes; thinner wood is walked through. Any
+ * wood can be chopped with an axe or broken out voxel by voxel (see chop.js).
  */
 const SOIL = [MAT.GRASS, MAT.DIRT];
 
@@ -62,7 +63,7 @@ export function dirIndex(d) {
 export const WOOD = 0x8000;
 /** Radii (metres) of the 16 wood sizes. */
 export const WOOD_RADIUS = Float32Array.from({ length: 16 }, (_, k) => 0.035 * 1.2 ** k);
-/** Wood at least this thick (metres) is solid and needs an axe. */
+/** Wood at least this thick (metres) is solid. */
 export const COLLIDE_RADIUS = 0.1;
 /** Wood sizes from which it's solid. */
 export const SOLID_SIZE = WOOD_RADIUS.findIndex((r) => r >= COLLIDE_RADIUS);

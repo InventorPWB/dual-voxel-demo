@@ -21,7 +21,7 @@ self.onmessage = (e) => {
     const solid = meshChunk(msg, crisp, scale);
     const foliage = meshFoliage(msg, scale, foliageOptions);
     self.postMessage(
-      { type: 'mesh', index: msg.index, version: msg.version, detached: msg.detached, ms: performance.now() - t0, solid, foliage },
+      { type: 'mesh', index: msg.index, version: msg.version, ms: performance.now() - t0, solid, foliage },
       [
         solid.position.buffer, solid.normal.buffer, solid.material.buffer, solid.ao.buffer, solid.local.buffer,
         foliage.position.buffer, foliage.normal.buffer, foliage.uvl.buffer, foliage.wind.buffer, foliage.ao.buffer, foliage.seed.buffer, foliage.center.buffer, foliage.axis.buffer,

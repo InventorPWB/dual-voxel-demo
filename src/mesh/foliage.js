@@ -393,7 +393,9 @@ function frame(t) {
  *
  * A voxel an axe has cut into has its ring flattened on the cut's side, as
  * deep as the cut, so the pieces either side of it make a notch, faced with
- * end grain (see chop.js).
+ * end grain (see chop.js). A stump (cut through, nothing beyond) ends flat
+ * in end grain; wood whose parent is gone (broken out by hand, or the ground
+ * dug from under it) ends in a short stub towards it, cut flat.
  *
  * Solid wood (see plants.js) also goes into `collide`: its triangles,
  * each with the voxel it belongs to, for the player to bump into and stand
@@ -563,14 +565,18 @@ function wood(p, scale, out, field, collide) {
   const n = [0, 0, 0];
   // Only a little darker inside the leaves.
   const aoAt = (q) => (field ? 1 - 0.35 * (1 - field.shadeAt(q[0], q[1], q[2], n)) : 1);
-  // A flat end of end grain at voxel i, square to t (towards its parent).
-  const endGrain = (i, t, ao) => {
+  // A flat end of end grain at voxel i, square to t (towards its parent),
+  // facing `face` (1: towards the parent, -1: away from it).
+  // (Solid wood's goes in the collider too, as voxel `cell`'s.)
+  const endGrain = (i, t, ao, face, cell = null) => {
     const E = ring(point(i), t, radius(i), plant[i]);
     const c = point(i);
-    const mid = [world(c[0], 0), world(c[1], 1), world(c[2], 2), 0.5, 0.5, 0, ao, t];
+    const nf = [t[0] * face, t[1] * face, t[2] * face];
+    const mid = [world(c[0], 0), world(c[1], 1), world(c[2], 2), 0.5, 0.5, 0, ao, nf];
     for (let k = 0; k < ROD_SIDES; k++) {
-      const q = (e) => [e.p[0], e.p[1], e.p[2], 0.5 + 0.5 * Math.cos((k + (e === E.verts[k] ? 0 : 1)) * Math.PI / 4), 0.5 + 0.5 * Math.sin((k + (e === E.verts[k] ? 0 : 1)) * Math.PI / 4), 0, ao, t];
-      out.tri(mid, q(E.verts[k]), q(E.verts[k + 1]), t, CUT_LAYER);
+      const q = (e, j) => [e.p[0], e.p[1], e.p[2], 0.5 + 0.5 * Math.cos((j * Math.PI) / 4), 0.5 + 0.5 * Math.sin((j * Math.PI) / 4), 0, ao, nf];
+      out.tri(mid, q(E.verts[k], k), q(E.verts[k + 1], k + 1), nf, CUT_LAYER);
+      if (cell) collide.tri(mid, q(E.verts[k], k), q(E.verts[k + 1], k + 1), cell);
     }
   };
   for (const [i, par] of parentOf) {
@@ -579,28 +585,31 @@ function wood(p, scale, out, field, collide) {
     const id = plant[i];
     if (par < 0 && woodParent(id) >= 0) continue; // what it grows from is off the array: not drawn here
     const solid = par >= 0 && !!mat[par];
-    if (!solid && !isW(par)) {
-      // What it grew from is gone (cut away): the wood ends here, cut flat.
-      if (main.has(i)) endGrain(i, along(i) || unit(point(i).map((q, k) => q - point(main.get(i))[k])), aoAt(point(i)));
+    // What it grew from is gone (broken away, or dug out from under it): a
+    // short stub towards where it was, cut flat.
+    const gone = !solid && !isW(par);
+    if (gone && woodParent(id) < 0) {
+      if (main.has(i)) endGrain(i, along(i) || unit(point(i).map((q, k) => q - point(main.get(i))[k])), aoAt(point(i)), 1);
       continue;
     }
     const a = point(i);
     const into = solid && intoSolid(i);
     // Out of the ground (or other solid): carry straight on into it, rather
     // than bending to the voxel's centre, which may be off to one side.
-    const b = into ? [0, 1, 2].map((k) => a[k] + into[k] * rootDepth(a, into)) : point(par);
+    const b = into ? [0, 1, 2].map((k) => a[k] + into[k] * rootDepth(a, into))
+      : gone ? [0, 1, 2].map((k) => a[k] + unit(DIRS26[woodParent(id)])[k] * 0.5) : point(par);
     const d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
     const len = Math.hypot(d[0], d[1], d[2]);
     if (len < 1e-6) continue;
     const dir = [d[0] / len, d[1] / len, d[2] / len];
     const ta = along(i) || dir;
-    const tb = into || (main.get(par) === i && along(par)) || dir;
+    const tb = into || (!gone && main.get(par) === i && along(par)) || dir;
     // Into the ground below: flaring out (a trunk's foot); into anything
     // else solid, tapering away inside it. Into a stem it leaves from the
     // side: narrowing as it sinks to that stem's middle, so its end stays
     // inside it however steeply it leaves.
     const ra = radius(i), solidWood = isSolidWood(id);
-    const rb = into ? ra * (into[1] < -0.6 && solidWood ? 1.9 : 0.5) : main.get(par) === i ? radius(par) : 0.7 * Math.min(ra, radius(par));
+    const rb = into ? ra * (into[1] < -0.6 && solidWood ? 1.9 : 0.5) : gone ? ra : main.get(par) === i ? radius(par) : 0.7 * Math.min(ra, radius(par));
     const A = ring(a, ta, ra, id), B = ring(b, tb, rb, !solid && main.get(par) === i ? plant[par] : 0);
     const lenM = len * scale;
     let vb = B.v;
@@ -608,17 +617,32 @@ function wood(p, scale, out, field, collide) {
     const ao = aoAt([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2]);
     const corner = (q, vv) => [q.p[0], q.p[1], q.p[2], q.u, vv, 0, ao, q.e];
     const cell = [ox + x - PAD, oy + y - PAD, oz + z - PAD];
+    // Aim: each half of the piece belongs to the voxel at its end (so a
+    // notch is aimed at by its own voxel, from above or below).
+    const pc = coords(par), parCell = isW(par) && isSolidWood(plant[par]) ? [ox + pc[0] - PAD, oy + pc[1] - PAD, oz + pc[2] - PAD] : cell;
+    const mid = (p, q) => [0, 1, 2, 3, 4, 5, 6].map((j) => (p[j] + q[j]) / 2);
     for (let k = 0; k < ROD_SIDES; k++) {
       const q = [corner(A.verts[k], A.v), corner(A.verts[k + 1], A.v), corner(B.verts[k + 1], vb), corner(B.verts[k], vb)];
       const cut = A.verts[k].cut || A.verts[k + 1].cut || B.verts[k].cut || B.verts[k + 1].cut;
       out.quad(q[0], q[1], q[2], q[3], A.verts[k].e, cut ? CUT_LAYER : BARK_LAYER);
-      if (solidWood) collide.quad(q, cell);
+      if (solidWood) {
+        const m1 = mid(q[1], q[2]), m0 = mid(q[0], q[3]);
+        collide.quad([q[0], q[1], m1, m0], cell);
+        collide.quad([m0, m1, q[2], q[3]], parCell);
+      }
     }
     // Close the ends no other piece shares, so you never see into the tube:
     // where it sinks into something solid, a flat end; at a tip, a short point.
     if (solid) {
       const c = [world(b[0], 0), world(b[1], 1), world(b[2], 2), 0.5, vb, 0, ao, tb];
       for (let k = 0; k < ROD_SIDES; k++) out.tri(c, corner(B.verts[k + 1], vb), corner(B.verts[k], vb), tb, BARK_LAYER);
+    }
+    if (gone) {
+      const c = [world(b[0], 0), world(b[1], 1), world(b[2], 2), 0.5, 0.5, 0, ao, dir];
+      for (let k = 0; k < ROD_SIDES; k++) {
+        const e = (v, j) => [v.p[0], v.p[1], v.p[2], 0.5 + 0.5 * Math.cos((j * Math.PI) / 4), 0.5 + 0.5 * Math.sin((j * Math.PI) / 4), 0, ao, dir];
+        out.tri(c, e(B.verts[k + 1], k + 1), e(B.verts[k], k), dir, CUT_LAYER);
+      }
     }
     const onward = [-dir[0], -dir[1], -dir[2]];
     if (!children.has(i) && solidAt([a[0] + onward[0] * 0.9, a[1] + onward[1] * 0.9, a[2] + onward[2] * 0.9])) {
@@ -627,7 +651,7 @@ function wood(p, scale, out, field, collide) {
       const C = ring(e, ta, ra * 0.6);
       for (let k = 0; k < ROD_SIDES; k++)
         out.quad(corner(C.verts[k], A.v - lenM), corner(C.verts[k + 1], A.v - lenM), corner(A.verts[k + 1], A.v), corner(A.verts[k], A.v), A.verts[k].e, BARK_LAYER);
-    } else if (!children.has(i) && isCutOff(id)) endGrain(i, ta, ao); // a stump: cut flat
+    } else if (!children.has(i) && (isCutOff(id) || solidWood)) endGrain(i, ta, ao, -1, solidWood ? cell : null); // a stump, or a log's end: cut flat
     else if (!children.has(i)) {
       const tip = [0, 1, 2].map((k) => a[k] - dir[k] * (ra / scale) * 1.5);
       const back = [-dir[0], -dir[1], -dir[2]];
