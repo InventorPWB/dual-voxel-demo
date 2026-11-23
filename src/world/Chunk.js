@@ -12,10 +12,6 @@
  *          once the chunk has any surface.
  * plant – plant id per voxel (16 bits; see plants.js: grass, leaves, wood), only in
  *         empty voxels. Allocated only once the chunk has a plant.
- * cut   – per voxel, bits 0-2: its +x, +y, +z edges were opened by an edit
- *         (wood on one end, a voxel that was removed on the other), so the
- *         surface there is a cut (end grain), not the outside (bark).
- *         Allocated on the first cut.
  * Voxel (x, y, z) covers [x, x+1]·VOXEL on each axis, in metres.
  */
 export class Chunk {
@@ -26,7 +22,6 @@ export class Chunk {
     this.t = null; // Uint8Array(n * 3)
     this.n = null; // Uint8Array(n * 6)
     this.plant = null; // Uint16Array(n)
-    this.cut = null; // Uint8Array(n)
   }
 
   index(x, y, z) {
@@ -39,10 +34,6 @@ export class Chunk {
       this.t = new Uint8Array(n * 3);
       this.n = new Uint8Array(n * 6);
     }
-  }
-
-  ensureCuts() {
-    if (!this.cut) this.cut = new Uint8Array(this.mat.length);
   }
 
   ensurePlants() {

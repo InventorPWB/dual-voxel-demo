@@ -9,6 +9,8 @@ import { PLANT } from '../world/plants.js';
  *  - Tools reshape the ground with smooth brushes; the axe chops wood.
  *  - Building items are a material + a shape: right mouse places the shape,
  *    left mouse carves the same shape out, Shift + right mouse repaints.
+ *    Natural materials (grass, dirt, stone, sand) come as one item each,
+ *    which places a metre of smooth terrain, run into the ground around it.
  *  - Plant items fill the plant layer: Leaves places a 1 m block of leaf
  *    voxels like a building piece; the wood items one voxel of tree wood,
  *    growing from what it's put on; Grass plants (or pulls up) grass under a
@@ -60,17 +62,23 @@ export const PLANT_ITEMS = [
 for (const [name, wood, across] of [['Trunk', 12, '62 cm'], ['Bough', 9, '36 cm'], ['Branch', 6, '21 cm'], ['Twig', 1, '8 cm']]) {
   PLANT_ITEMS.push({
     kind: 'plant', id: `plant:${name.toLowerCase()}`, name: `${name} wood`, wood, texture: 'bark', shape: SHAPE.small,
-    use: `Right mouse grows a piece of ${across} wood from the wood or ground you aim at · left mouse breaks wood`,
+    use: `Right mouse adds ${across} wood: on a log it joins it, anywhere else it lies loose · Shift + right mouse lays a loose log along your view · left mouse breaks wood`,
   });
 }
 
 export const PLANT_ITEM = { leaves: PLANT_ITEMS[0], grass: PLANT_ITEMS[1], trunk: PLANT_ITEMS[2], branch: PLANT_ITEMS[4] };
 
-/** Inventory layout: tools, plants, then one row of shapes per material. */
+/**
+ * Inventory layout: tools, plants, natural ground (one item each: it places
+ * as terrain), then one row of shapes per crafted material.
+ */
 export const INVENTORY = {
   tools: TOOLS,
   plants: PLANT_ITEMS,
-  rows: PALETTE.map((m) => SHAPES.map((s) => buildItem(m.id, s.id))),
+  rows: [
+    PALETTE.filter((m) => m.natural).map((m) => buildItem(m.id, 'block')),
+    ...PALETTE.filter((m) => !m.natural).map((m) => SHAPES.map((s) => buildItem(m.id, s.id))),
+  ],
 };
 
 export const HOTBAR_SIZE = 9;

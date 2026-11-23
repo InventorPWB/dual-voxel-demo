@@ -1,10 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import { World, VOXEL } from '../src/world/World.js';
 import { MAT, CRISP, PASS_OPAQUE, PASS_CUTOUT, PASS_TRANSLUCENT } from '../src/world/materials.js';
-import { PLANT, DIRS26, plantDef, isWood, isSolidWood, isCutOff, woodParent, woodRadius, woodCut, woodCutSide, supportsPlant, settlePlants } from '../src/world/plants.js';
+import { PLANT, DIRS26, plantDef, isWood, isSolidWood, isCutOff, woodId, woodParent, woodRadius, woodCut, woodCutSide, supportsPlant, settlePlants } from '../src/world/plants.js';
 import { chop, severed, remove } from '../src/world/chop.js';
 import { TEXTURE_NAMES } from '../src/render/textures.js';
-import { placeShape, sculptSphere, removeShape, removeSpecks, breakAt } from '../src/world/edits.js';
+import { placeShape, placeTerrain, sculptSphere, removeShape, removeSpecks, breakAt } from '../src/world/edits.js';
 import { SHAPE, placement } from '../src/world/shapes.js';
 import { growGrass, growTree, rng } from '../src/world/trees.js';
 import { meshChunk } from '../src/mesh/dualContour.js';
@@ -287,6 +287,17 @@ describe('trees', () => {
     }
   });
 
+  it('joins the wood of a tree into continuous tubes: an uncut tree has no sawn ends', () => {
+    const rings = TEXTURE_NAMES.indexOf('log_top');
+    for (let seed = 1; seed <= 6; seed++) {
+      const w = flatWorld(4, 16);
+      growTree(w, 32, 32, rng(seed));
+      let sawn = 0;
+      for (const m of meshTrees(w)) for (let v = 0; v < m.uvl.length / 3; v++) if (m.uvl[v * 3 + 2] === rings) sawn++;
+      expect(sawn, `seed ${seed}`).toBe(0);
+    }
+  });
+
   it('grows trees of different habits, sizes and girths', () => {
     const heights = [], girths = [];
     for (let seed = 1; seed <= 12; seed++) {
@@ -321,23 +332,22 @@ describe('trees', () => {
     expect(solid).toBeGreaterThan(300);
   });
 
-  it('chops wood an eighth at a time, drawing the notch as end grain; through, all beyond goes, leaving a stump', () => {
+  it('chops wood a quarter at a time, drawing the notch as end grain; through, all beyond goes, leaving a stump', () => {
     const w = flatWorld(4, 16);
     growTree(w, 32, 32, rng(2));
     const f = foot(w, 32, 32);
-    const cutLayer = TEXTURE_NAMES.indexOf('log_end');
-    const endGrain = () => meshTrees(w).reduce((n, m) => {
-      for (let v = 0; v < m.uvl.length / 3; v++) if (m.uvl[v * 3 + 2] === cutLayer) n++;
+    const endGrain = (name = 'log_end') => meshTrees(w).reduce((n, m) => {
+      for (let v = 0; v < m.uvl.length / 3; v++) if (m.uvl[v * 3 + 2] === TEXTURE_NAMES.indexOf(name)) n++;
       return n;
     }, 0);
     expect(endGrain()).toBe(0);
-    for (let k = 1; k < 8; k++) {
+    for (let k = 1; k < 4; k++) {
       expect(chop(w, ...f, 2)).toBe(null);
       expect(woodCut(w.getPlant(...f))).toBe(k);
       expect(woodCutSide(w.getPlant(...f))).toBe(2);
     }
     expect(endGrain()).toBeGreaterThan(0);
-    // The eighth stroke goes through: everything above it and all the leaves
+    // The fourth stroke goes through: everything above it and all the leaves
     // are freed, and the foot stays, as a stump cut flat.
     const before = plants(w);
     const set = chop(w, ...f, 6);
@@ -348,7 +358,7 @@ describe('trees', () => {
     expect(after.leaves.length).toBe(0);
     expect(after.wood.map((v) => v.slice(0, 3))).toEqual([f]);
     expect(isCutOff(w.getPlant(...f))).toBe(true);
-    expect(endGrain()).toBeGreaterThan(0);
+    expect(endGrain('log_top')).toBeGreaterThan(0);
   });
 
   it('felling one of two trees whose crowns run together takes its own leaves, not those of the other', () => {
@@ -360,7 +370,7 @@ describe('trees', () => {
     // The crowns touch: some leaves of the second sit against the first's.
     const f = foot(w, 24, 32);
     let set = null;
-    for (let k = 0; k < 8; k++) set = chop(w, ...f, 0) || set;
+    for (let k = 0; k < 4; k++) set = chop(w, ...f, 0) || set;
     remove(w, set);
     const after = plants(w);
     // Most of the first tree's leaves went; nearly all the second's stayed.
@@ -388,6 +398,70 @@ describe('trees', () => {
     for (const v of after.wood) expect(grounded(w, v.slice(0, 3))).toBe(true);
   });
 
+  it('builds with logs: end to end they make one log; one laid against another joins it from the side, leaving it straight', () => {
+    const w = flatWorld(2, 16);
+    const T = 12; // trunk wood
+    // A post three pieces tall, with a log laid level off its top piece, and
+    // a loose log of two pieces lying along x (growing from the empty voxel behind it).
+    for (let y = GROUND; y < GROUND + 3; y++) w.setPlant(8, y, 8, woodId(T, [0, -1, 0]));
+    // (The level log's first piece branches off the post's side, as placing it does.)
+    for (let x = 9; x < 12; x++) w.setPlant(x, GROUND + 2, 8, woodId(T, [-1, 0, 0], x === 9));
+    w.setPlant(4, GROUND + 5, 12, woodId(T, [-1, 0, 0]));
+    w.setPlant(5, GROUND + 5, 12, woodId(T, [-1, 0, 0]));
+    const rings = TEXTURE_NAMES.indexOf('log_top');
+    const ends = [];
+    for (const m of meshTrees(w))
+      for (let t = 0; t < m.position.length / 9; t++) {
+        if (m.uvl[t * 9 + 2] !== rings) continue;
+        ends.push([0, 1, 2].map((k) => (m.position[t * 9 + k] + m.position[t * 9 + 3 + k] + m.position[t * 9 + 6 + k]) / 3 / VOXEL));
+      }
+    const endAt = (x, y, z) => ends.filter((c) => Math.hypot(c[0] - x, c[1] - y, c[2] - z) < 0.75).length;
+    // The post still ends flat at the top of its top piece: not bent round into the log.
+    expect(endAt(8.5, GROUND + 3, 8.5)).toBeGreaterThan(4);
+    // The level log ends flat at its far face; the loose log at both of its ends.
+    expect(endAt(12, GROUND + 2.5, 8.5)).toBeGreaterThan(4);
+    expect(endAt(4, GROUND + 5.5, 12.5)).toBeGreaterThan(4);
+    expect(endAt(6, GROUND + 5.5, 12.5)).toBeGreaterThan(4);
+    // And nothing in between: the two pieces are one log.
+    expect(endAt(5, GROUND + 5.5, 12.5)).toBe(0);
+  });
+
+  it('builds with logs: loose logs side by side stay apart; one on a log end at a right angle makes an elbow', () => {
+    const w = flatWorld(2, 16);
+    const T = 12;
+    // Two loose logs end to end along x, each lying that way: two logs.
+    w.setPlant(4, GROUND, 4, woodId(T, [-1, 0, 0], false, true));
+    w.setPlant(5, GROUND, 4, woodId(T, [-1, 0, 0], false, true));
+    // A post two pieces tall, then a piece on the side of its top, carrying it on.
+    w.setPlant(10, GROUND, 10, woodId(T, [0, -1, 0], false, true));
+    w.setPlant(10, GROUND + 1, 10, woodId(T, [0, -1, 0]));
+    w.setPlant(11, GROUND + 1, 10, woodId(T, [-1, 0, 0]));
+    const rings = TEXTURE_NAMES.indexOf('log_top');
+    const ends = [];
+    for (const m of meshTrees(w))
+      for (let t = 0; t < m.position.length / 9; t++)
+        if (m.uvl[t * 9 + 2] === rings) ends.push([0, 1, 2].map((k) => (m.position[t * 9 + k] + m.position[t * 9 + 3 + k] + m.position[t * 9 + 6 + k]) / 3 / VOXEL));
+    const endAt = (x, y, z) => ends.filter((c) => Math.hypot(c[0] - x, c[1] - y, c[2] - z) < 0.75).length;
+    // Between the loose logs, an end of each.
+    expect(endAt(5, GROUND + 0.5, 4.5)).toBeGreaterThan(12);
+    // The post's top turns into the piece: no end there; the piece ends at its far face,
+    // and the post at its foot (it lies loose on the ground).
+    expect(endAt(10.5, GROUND + 2, 10.5)).toBe(0);
+    expect(endAt(12, GROUND + 1.5, 10.5)).toBeGreaterThan(4);
+    expect(endAt(10.5, GROUND, 10.5)).toBeGreaterThan(4);
+  });
+
+  it('places natural ground as a metre of smooth terrain, closed', () => {
+    const w = flatWorld(2, 16);
+    placeTerrain(w, [8, GROUND, 8], MAT.DIRT);
+    for (const [x, y, z] of [[8, GROUND, 8], [9, GROUND + 1, 9]]) {
+      expect(w.getMat(x, y, z)).toBe(MAT.DIRT);
+      expect(w.isTerrain(x, y, z)).toBe(true);
+    }
+    expect(w.isSolid(8, GROUND + 2, 8)).toBe(false);
+    expect(interiorOpenEdges(w)).toEqual([]);
+  });
+
   it('wood needs no support: a tree stays when the ground under it is dug away, and breaking wood takes only that', () => {
     const w = flatWorld(4, 16);
     growTree(w, 32, 32, rng(4));
@@ -401,37 +475,6 @@ describe('trees', () => {
     w.setPlant(...f.map((c, k) => (k === 1 ? c + 1 : c)), 0); // break a voxel out of the trunk
     expect(plants(w).wood.length).toBe(before.wood.length - 1);
     expect(meshTrees(w).reduce((n, m) => n + m.triangles, 0)).toBeGreaterThan(1000);
-  });
-
-  it('draws terrain wood cut open by an edit as end grain, at any angle, and the outside as bark', () => {
-    const w = flatWorld(3, 16);
-    sculptSphere(w, { x: 24.5, y: GROUND + 5, z: 24.5 }, 4, 'add', MAT.LOG);
-    const count = () => {
-      let log = 0, cut = 0, sideways = 0;
-      for (const m of meshAll(w))
-        for (let i = 0; i < m.position.length; i += 9) {
-          const mat = m.material[i / 3];
-          if (mat === MAT.LOG) log++;
-          if (mat !== MAT.CUT_LOG) continue;
-          cut++;
-          const n = faceNormal(Array.from(m.position.subarray(i, i + 9)));
-          if (n && Math.abs(n[1]) < 0.5) sideways++;
-        }
-      return { log, cut, sideways };
-    };
-    expect(count().cut).toBe(0);
-    // Break a metre out of it: the edges it opened above and below are cut.
-    breakAt(w, 24, GROUND + 2, 24);
-    expect(w.getCut(24, GROUND + 1, 24, 1)).toBe(true);
-    expect(w.getCut(24, GROUND + 3, 24, 1)).toBe(true);
-    expect(w.getMat(24, GROUND + 1, 24)).toBe(MAT.LOG); // the wood itself is unchanged
-    expect(count().cut).toBeGreaterThan(0);
-    // Digging into its side from +x: that cut faces sideways, and is end grain too.
-    sculptSphere(w, { x: 28.1, y: GROUND + 6.5, z: 24.5 }, 1.6, 'sub');
-    const after = count();
-    expect(after.sideways).toBeGreaterThan(0);
-    // Most of the wood is untouched bark.
-    expect(after.log).toBeGreaterThan(after.cut * 3);
   });
 });
 
@@ -464,7 +507,7 @@ describe('cutout mipmaps', () => {
 describe('piece texturing', () => {
   it('gives piece vertices their place in the whole piece, and the kind of shape', () => {
     const w = flatWorld();
-    placeShape(w, placement(SHAPE.pillar, [4, GROUND, 4]), MAT.LOG);
+    placeShape(w, placement(SHAPE.pillar, [4, GROUND, 4]), MAT.STAINED_GLASS);
     placeShape(w, placement(SHAPE.small, [8, GROUND, 4]), MAT.GLASS);
     const m = meshChunk(w.buildPadded(0, 0, 0), CRISP, VOXEL);
     const span = { 2: [Infinity, -Infinity], 1: [Infinity, -Infinity] };

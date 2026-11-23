@@ -35,7 +35,7 @@
 
 import { unpackNormal } from '../world/normals.js';
 import { stateGeometry, faceHidden, DIRS, shapeKind } from '../world/shapes.js';
-import { PASS, OPAQUE, CUT_OF } from '../world/materials.js';
+import { PASS, OPAQUE } from '../world/materials.js';
 
 /** Voxels of border each side of a chunk needed to mesh it. */
 export const PAD = 3;
@@ -55,7 +55,6 @@ const BIT_AXIS = { 1: 0, 2: 1, 4: 2 };
 export function meshChunk(p, crisp, scale = 1) {
   const { mat, shape, et, en, size, origin } = p;
   const offs = p.off || new Uint8Array(mat.length);
-  const cuts = p.cut || new Uint8Array(mat.length);
   const N = size + 2 * PAD;
   const NN = N * N;
   const [ox, oy, oz] = origin;
@@ -212,10 +211,8 @@ export function meshChunk(p, crisp, scale = 1) {
           quad[2] = cell(px, py, pz);
           quad[3] = cell(px - u[0], py - u[1], pz - u[2]);
 
-          // Each quad is one crossed edge. Where an edit cut it open, wood
-          // shows its inside (Cut Log, end grain), whichever way it faces.
-          let m = mat[sa ? ia : ib];
-          if (CUT_OF[m] && ((cuts[ia] >> axis) & 1)) m = CUT_OF[m];
+          // Each quad is one crossed edge.
+          const m = mat[sa ? ia : ib];
           const o = streams[PASS[m]];
           const dir = sa ? 1 : -1;
           const p0 = quad[0] * 3, p1 = quad[1] * 3, p2 = quad[2] * 3, p3 = quad[3] * 3;

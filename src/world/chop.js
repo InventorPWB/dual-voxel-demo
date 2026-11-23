@@ -1,13 +1,13 @@
-import { DIRS26, PLANT, isWood, woodParent, woodCut, woodCutSide, withCut } from './plants.js';
+import { DIRS26, PLANT, isWood, woodGrowsFrom, woodCut, woodCutSide, withCut } from './plants.js';
 
 /**
  * Cutting trees. Wood voxels form exact trees (each records the voxel it grows
  * from: see plants.js), so what a cut frees is simply everything growing on
  * from the voxel cut through, and the leaves hanging from that.
  *
- * An axe cuts a voxel an eighth of its thickness deeper per stroke, on the
+ * An axe cuts a voxel a quarter of its thickness deeper per stroke, on the
  * side it's struck from (the first stroke picks the side); the mesher draws
- * the cut as a notch faced with end grain. The eighth stroke goes through:
+ * the cut as a notch faced with end grain. The fourth stroke goes through:
  * the voxel stays as the stump's top, cut flat, and everything beyond it
  * goes. (That's where a felled tree's items will come from.)
  *
@@ -24,7 +24,7 @@ export function woodChildren(world, x, y, z) {
   for (const [dx, dy, dz] of DIRS26) {
     const id = world.getPlant(x + dx, y + dy, z + dz);
     if (!isWood(id)) continue;
-    const p = DIRS26[woodParent(id)];
+    const p = DIRS26[woodGrowsFrom(id)];
     if (p && p[0] === -dx && p[1] === -dy && p[2] === -dz) out.push([x + dx, y + dy, z + dz]);
   }
   return out;
@@ -101,7 +101,7 @@ export function remove(world, set) {
   for (const [x, y, z] of set.wood) world.setPlant(x, y, z, 0);
   for (const [x, y, z] of set.leaves) world.setPlant(x, y, z, 0);
   for (const [x, y, z, id] of set.wood) {
-    const o = DIRS26[woodParent(id)];
+    const o = DIRS26[woodGrowsFrom(id)];
     if (!o) continue;
     const px = x + o[0], py = y + o[1], pz = z + o[2], pid = world.getPlant(px, py, pz);
     if (isWood(pid)) world.setPlant(px, py, pz, withCut(pid, 0, 1));
@@ -109,12 +109,12 @@ export function remove(world, set) {
   world.markDirtyBox(...set.box);
 }
 
-/** Seconds per eighth an axe takes to cut into wood of `radius` metres. */
-export const chopTime = (radius) => 0.08 + radius;
+/** Seconds per quarter an axe takes to cut into wood of `radius` metres. */
+export const chopTime = (radius) => 0.16 + 2 * radius;
 
 /**
  * One axe stroke on wood voxel (x, y, z), from compass direction `side`
- * (0-7, see plants.js; only the first stroke's counts). Cuts an eighth
+ * (0-3, see plants.js; only the first stroke's counts). Cuts a quarter
  * deeper and returns null; on the stroke that goes through, the voxel is
  * left as a flat-topped stump and what grew on from it is returned (severed,
  * not yet removed).
@@ -123,7 +123,7 @@ export function chop(world, x, y, z, side) {
   const id = world.getPlant(x, y, z);
   if (!isWood(id)) return null;
   const depth = woodCut(id) + 1;
-  if (depth >= 8) {
+  if (depth >= 4) {
     const set = severed(world, woodChildren(world, x, y, z));
     world.setPlant(x, y, z, withCut(id, 0, 1));
     world.markDirtyBox(x - 1, y - 1, z - 1, x + 1, y + 1, z + 1);
@@ -134,7 +134,7 @@ export function chop(world, x, y, z, side) {
   return null;
 }
 
-/** Compass direction (0-7) of a horizontal vector. */
+/** Compass direction (0-3) of a horizontal vector. */
 export function compass(dx, dz) {
-  return (Math.round(Math.atan2(dz, dx) / (Math.PI / 4)) + 8) % 8;
+  return (Math.round(Math.atan2(dz, dx) / (Math.PI / 2)) + 4) % 4;
 }

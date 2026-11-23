@@ -1,6 +1,7 @@
 import { createNoise3D } from './noise.js';
 import { MAT } from './materials.js';
-import { PLANT, DIRS26, isWood, woodId, woodSizeFor } from './plants.js';
+import { PLANT, DIRS26, isWood, isSolidWood, isBranch, woodId, woodSizeFor } from './plants.js';
+import { woodChildren } from './chop.js';
 import { VOXEL } from './World.js';
 import { unpackNormal } from './normals.js';
 
@@ -181,7 +182,9 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
       let dir = [Math.cos(a) * Math.sin(tilt), Math.cos(tilt), Math.sin(a) * Math.sin(tilt)];
       if (habit === 'leaning') dir = norm(add(dir, [Math.cos(leanDir), 0, Math.sin(leanDir)], 0.35));
       const len = m((5.5 + 2.5 * random()) * s * (i === 0 ? 1 : 0.8 + 0.2 * random()));
-      limbs.push(stem({ from: top, dir, len, level: 1, parent: trunk, at: 1, bend: 0.3, up: 0.04, out: 0.08 }));
+      const limb = stem({ from: top, dir, len, level: 1, parent: trunk, at: 1, bend: 0.3, up: 0.04, out: 0.08 });
+      limb.continues = i === 0; // the first carries the trunk on; the others branch off it
+      limbs.push(limb);
     }
     // Sometimes a low limb or two below the fork.
     const low = random() < 0.45 ? 1 + (random() < 0.3 ? 1 : 0) : 0;
@@ -265,6 +268,10 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
       prev = best ? best.v : null;
     }
     const line = [], placed = [];
+    // Whether the voxel it would grow from is its own (or, for a stem that
+    // carries its parent on, its parent's): then it carries that on, else
+    // it branches off it (see plants.js).
+    let own = !!st.continues;
     for (let k = 0; k < n; k++) {
       const a = st.pts[k], b = st.pts[k + 1];
       const steps = Math.ceil(Math.max(Math.abs(b[0] - a[0]), Math.abs(b[1] - a[1]), Math.abs(b[2] - a[2])));
@@ -277,8 +284,12 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
         line.push({ v, t });
         const here = world.getPlant(v[0], v[1], v[2]);
         if (world.isSolid(v[0], v[1], v[2]) || isWood(here)) {
-          // Ground, or another stem: carry on from it.
+          // Ground, or wood: carry on from it, carrying the wood on if nothing
+          // else does yet (where a stem starts inside its parent, or runs
+          // into a free end), else branching off it.
           prev = v;
+          own = isWood(here) && (st.continues || !st.parent || woodChildren(world, ...v).length === 0)
+            && !woodChildren(world, ...v).some((c) => !isBranch(world.getPlant(...c)));
           if (!world.isSolid(...v)) placed.push(v);
           continue;
         }
@@ -299,12 +310,14 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
             if (score > best) { best = score; step = o; }
           }
           if (!step) continue;
+          own = false;
         }
         const r = st.rad[k] + (st.rad[k + 1] - st.rad[k]) * u;
-        world.setPlant(v[0], v[1], v[2], woodId(woodSizeFor(r * V), step));
+        world.setPlant(v[0], v[1], v[2], woodId(woodSizeFor(r * V), step, !own));
         twigVoxels.push(v);
         placed.push(v);
         prev = v;
+        own = true;
       }
     }
     lines.set(st, line);
@@ -317,6 +330,19 @@ export function growTree(world, x, z, random = Math.random, debug = null) {
       for (let k = Math.floor(from * n); k < n; k++) leafy.push({ a: st.pts[k], b: st.pts[k + 1], r: r * (0.8 + 0.2 * k / n) });
     }
     if (st.tip) leafTips.push({ p: st.pts[n], r: st.tip });
+  }
+  // A stem that runs straight into other wood carries on from that, which can
+  // leave the voxel it started with as a stub with nothing growing on: thick
+  // wood never ends like that on a living tree (its ends are twigs), so those go.
+  for (let pruned = true; pruned;) {
+    pruned = false;
+    for (let k = twigVoxels.length - 1; k >= 0; k--) {
+      const v = twigVoxels[k];
+      if (!isSolidWood(world.getPlant(...v)) || woodChildren(world, ...v).length) continue;
+      world.setPlant(v[0], v[1], v[2], 0);
+      twigVoxels.splice(k, 1);
+      pruned = true;
+    }
   }
   const forkY = g.height + crownBase;
   // ---- leaves around the shoots and twigs, in empty voxels.

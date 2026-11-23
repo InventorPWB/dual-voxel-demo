@@ -16,8 +16,7 @@ const SURFACE_GLSL = /* glsl */ `
     // Nudge sample points off exact grid faces so nearest filtering is stable.
     vec3 p = pos - n * 0.001;
     vec4 cx = texture(uTex, vec3(p.z, p.y, L.y));
-    vec2 C = uWorldCaps[mat];
-    vec4 cy = texture(uTex, vec3(p.x, p.z, n.y >= 0.0 ? C.x : C.y));
+    vec4 cy = texture(uTex, vec3(p.x, p.z, n.y >= 0.0 ? L.x : L.z));
     vec4 cz = texture(uTex, vec3(p.x, p.y, L.y));
     return cx * w.x + cy * w.y + cz * w.z;
   }
@@ -78,19 +77,15 @@ export function createChunkMaterials(shadow) {
   const layers = MATERIALS.map((m) =>
     m.id === 0 ? new THREE.Vector3() : new THREE.Vector3(layerOf(m.top), layerOf(m.side), layerOf(m.bottom)),
   );
-  const worldCaps = MATERIALS.map((m) =>
-    m.id === 0 ? new THREE.Vector2() : new THREE.Vector2(layerOf(m.worldTop || m.top), layerOf(m.worldBottom || m.bottom)),
-  );
   const frames = MATERIALS.map((m) => new THREE.Vector4(...(m.frame || [0, 0, 0, 0])));
   const pieceMap = MATERIALS.map((m) => (m.mapping === 'piece' ? 1 : 0));
   const shared = {
-    uTex: { value: texture }, uLayers: { value: layers }, uWorldCaps: { value: worldCaps }, uFrame: { value: frames }, uPieceMap: { value: pieceMap },
+    uTex: { value: texture }, uLayers: { value: layers }, uFrame: { value: frames }, uPieceMap: { value: pieceMap },
   };
   const head = /* glsl */ `
     precision highp sampler2DArray;
     uniform sampler2DArray uTex;
     uniform vec3 uLayers[${layers.length}];
-    uniform vec2 uWorldCaps[${layers.length}];
     uniform vec4 uFrame[${layers.length}];
     uniform float uPieceMap[${layers.length}];
   `;

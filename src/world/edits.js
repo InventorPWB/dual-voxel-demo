@@ -1,5 +1,5 @@
 import { MATERIALS, MAT } from './materials.js';
-import { applyCSG, exposeCuts } from './csg.js';
+import { applyCSG } from './csg.js';
 import { settlePlants } from './plants.js';
 
 /**
@@ -247,6 +247,25 @@ function falloff(t) {
 
 // ------------------------------------------------------------------ shapes
 
+/**
+ * Add a metre of natural ground (`material`) as terrain: a cube on the 1 m
+ * grid with corner `o` (voxels), rounded off so it runs into the ground
+ * around it, which keeps its own material. The counterpart of breaking ground,
+ * which takes out a metre cell (see breakCells).
+ */
+export function placeTerrain(world, o, material, opts = {}) {
+  const c = [o[0] + 1, o[1] + 1, o[2] + 1], h = 1, round = 0.45;
+  const sdf = (x, y, z) => {
+    const q = [Math.abs(x - c[0]) - (h - round), Math.abs(y - c[1]) - (h - round), Math.abs(z - c[2]) - (h - round)];
+    const out = Math.hypot(Math.max(q[0], 0), Math.max(q[1], 0), Math.max(q[2], 0));
+    return -(out + Math.min(Math.max(q[0], q[1], q[2]), 0) - round);
+  };
+  const box = [o[0] - 1, o[1] - 1, o[2] - 1, o[0] + 2, o[1] + 2, o[2] + 2];
+  const res = applyCSG(world, 'union', box, sdf, { material, keep: true, protect: opts.protect });
+  if (res.touched) cleanup(world, box);
+  return res.changed;
+}
+
 /** Voxels a placed shape fills, as [x, y, z]. */
 export function shapeSolidVoxels(world, p) {
   return p.voxels.filter(([x, y, z]) => world.inBounds(x, y, z)).map(([x, y, z]) => [x, y, z]);
@@ -324,7 +343,6 @@ export function clearCells(world, cells) {
     x1 = Math.max(x1, x); y1 = Math.max(y1, y); z1 = Math.max(z1, z);
   }
   if (!gone.size) return 0;
-  exposeCuts(world, [...gone].flatMap((k) => k.split(',').map(Number)));
   // Terrain that now borders the hole: a flat face on the cell boundary.
   for (const k of gone) {
     const [x, y, z] = k.split(',').map(Number);

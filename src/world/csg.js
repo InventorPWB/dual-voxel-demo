@@ -13,29 +13,9 @@
  * mesher puts it there), so no crossing is stored on those edges.
  */
 
-import { CUT_OF } from './materials.js';
-
 const AXES = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 const scratch = [0, 0, 0];
 
-/**
- * Terrain that an edit cuts into shows its inside. For each removed voxel
- * ([x, y, z, ...] flat), the edges to its neighbours that are terrain of a
- * material with a `cut` form (Log) are marked cut, so the surface across
- * them is drawn as that form (end grain), whatever way it faces, while the
- * outside of the same wood stays bark. Doesn't mark meshes dirty.
- */
-export function exposeCuts(world, removed) {
-  for (let i = 0; i < removed.length; i += 3) {
-    const x = removed[i], y = removed[i + 1], z = removed[i + 2];
-    for (let a = 0; a < 3; a++) {
-      const [dx, dy, dz] = AXES[a];
-      // Neighbour on the + side: the edge is this voxel's; on the - side, the neighbour's.
-      if (world.isTerrain(x + dx, y + dy, z + dz) && CUT_OF[world.getMat(x + dx, y + dy, z + dz)]) world.setCut(x, y, z, a);
-      if (world.isTerrain(x - dx, y - dy, z - dz) && CUT_OF[world.getMat(x - dx, y - dy, z - dz)]) world.setCut(x - dx, y - dy, z - dz, a);
-    }
-  }
-}
 const nrm = [0, 0, 0];
 
 /** Outward unit normal of an SDF at p (negative gradient), by central differences. */
@@ -135,7 +115,6 @@ export function applyCSG(world, op, box, sdf, options = {}) {
         if (was !== now) changed++;
       }
 
-  exposeCuts(world, removed);
 
   // 2. Edges with at least one end in the box.
   const s = scratch;

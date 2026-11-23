@@ -11,7 +11,7 @@ export const CONTROLS = [
   ['Toggle fly', 'F or double-tap Space'],
   ['Break / dig / chop', 'Left mouse'],
   ['Place / use', 'Right mouse'],
-  ['Paint', 'Shift + right mouse'],
+  ['Paint / lay a loose log', 'Shift + right mouse'],
   ['Choose item', '1–9 or mouse wheel'],
   ['Inventory', 'E'],
   ['Settings', 'O'],

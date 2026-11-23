@@ -92,7 +92,7 @@ export class ChunkMeshes {
       this.version[index]++;
       worker.postMessage(
         { type: 'mesh', index, version: this.version[index], ...padded },
-        [padded.mat.buffer, padded.shape.buffer, padded.off.buffer, padded.cut.buffer, padded.et.buffer, padded.en.buffer, ...(padded.plant ? [padded.plant.buffer] : [])],
+        [padded.mat.buffer, padded.shape.buffer, padded.off.buffer, padded.et.buffer, padded.en.buffer, ...(padded.plant ? [padded.plant.buffer] : [])],
       );
     }
   }

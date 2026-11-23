@@ -27,10 +27,19 @@ import { MAT } from './materials.js';
  *              tube along each chain of voxels (see foliage.js);
  *   bits 5-8   its size: one of WOOD_RADIUS, 16 radii from a 7 cm twig to a
  *              metre-thick trunk, each about a fifth thicker than the last;
- *   bits 9-11  how deep an axe has cut into it (0-7 eighths; see chop.js);
- *   bits 12-14 which side the cut is on (one of 8 compass directions); with
+ *   bits 9-10  how deep an axe has cut into it (0-3 quarters; see chop.js);
+ *   bits 11-12 which side the cut is on (one of 4 compass directions); with
  *              no cut, 1 means what grew on from it was cut off, so it ends
- *              in a flat cut (a stump).
+ *              in a flat cut (a stump);
+ *   bit 13     it's a loose log (LOOSE): the neighbour in bits 0-4 only says
+ *              which way it lies, and it grows from nothing (a log put down
+ *              on the ground or a block: see interaction.js);
+ *   bit 14     it branches off its parent's side (BRANCH), rather than
+ *              carrying its parent's wood on: the wood a voxel's tube carries
+ *              on into is its thickest child without this. Generated trees
+ *              set it on the first voxel of each side shoot; building sets
+ *              it on a piece put against a log that something already
+ *              carries on (see interaction.js).
  * Wood at least COLLIDE_RADIUS thick is solid to walk into and stand on, and
  * isn't cleared by digging brushes; thinner wood is walked through. Any
  * wood can be chopped with an axe or broken out voxel by voxel (see chop.js).
@@ -61,6 +70,10 @@ export function dirIndex(d) {
 // ---------------------------------------------------------------------- wood
 
 export const WOOD = 0x8000;
+/** Flag: branches off its parent's side (see above). */
+export const BRANCH = 0x4000;
+/** Flag: a loose log, lying along its neighbour's direction, growing from nothing (see above). */
+export const LOOSE = 0x2000;
 /** Radii (metres) of the 16 wood sizes. */
 export const WOOD_RADIUS = Float32Array.from({ length: 16 }, (_, k) => 0.035 * 1.2 ** k);
 /** Wood at least this thick (metres) is solid. */
@@ -69,27 +82,42 @@ export const COLLIDE_RADIUS = 0.1;
 export const SOLID_SIZE = WOOD_RADIUS.findIndex((r) => r >= COLLIDE_RADIUS);
 
 export const isWood = (id) => (id & WOOD) !== 0;
-/** Index in DIRS26 of the neighbour a wood voxel grows from, or -1. */
+/** Index in DIRS26 of the neighbour a wood voxel grows from (or, loose, lies towards), or -1. */
 export const woodParent = (id) => (id & 31) - 1;
+/** Is it a loose log, growing from nothing? */
+export const isLoose = (id) => (id & LOOSE) !== 0;
+/** Index in DIRS26 of the neighbour it actually grows from: -1 for none, or loose. */
+export const woodGrowsFrom = (id) => ((id & LOOSE) ? -1 : (id & 31) - 1);
 export const woodSize = (id) => (id >> 5) & 15;
 export const woodRadius = (id) => WOOD_RADIUS[(id >> 5) & 15];
-/** How deep it's been cut, in eighths of its thickness. */
-export const woodCut = (id) => (id >> 9) & 7;
-/** Which side the cut is on: compass direction k, at angle k·45° from +x towards +z. */
-export const woodCutSide = (id) => (id >> 12) & 7;
+/** How deep it's been cut, in quarters of its thickness. */
+export const woodCut = (id) => (id >> 9) & 3;
+/** Which side the cut is on: compass direction k, at angle k·90° from +x towards +z. */
+export const woodCutSide = (id) => (id >> 11) & 3;
+/** Does it branch off its parent's side, rather than carry its parent on? */
+export const isBranch = (id) => (id & BRANCH) !== 0;
 export const isSolidWood = (id) => (id & WOOD) !== 0 && ((id >> 5) & 15) >= SOLID_SIZE;
 
-/** A wood voxel of `size` growing from its neighbour at offset `from` (or none), cut `cut` eighths deep on `side`. */
-export function woodId(size, from = null, cut = 0, side = 0) {
-  return WOOD | (side & 7) << 12 | (cut & 7) << 9 | (size & 15) << 5 | (from ? dirIndex(from) + 1 : 0);
+/**
+ * A wood voxel of `size` growing from its neighbour at offset `from` (or
+ * none), off its side if `branch`; or, `loose`, lying towards it, growing
+ * from nothing.
+ */
+export function woodId(size, from = null, branch = false, loose = false) {
+  return WOOD | (branch ? BRANCH : 0) | (loose ? LOOSE : 0) | (size & 15) << 5 | (from ? dirIndex(from) + 1 : 0);
 }
 
 /** Was what grew on from this wood voxel cut off (a stump)? */
-export const isCutOff = (id) => (id & (63 << 9)) === 1 << 12;
+export const isCutOff = (id) => (id & (15 << 9)) === 1 << 11;
 
-/** The same wood voxel cut `cut` eighths deep on `side`. */
+/** The same wood voxel growing from its neighbour at offset `from` instead (not loose), carrying it on (or off its side if `branch`). */
+export function withParent(id, from, branch = false) {
+  return (id & ~31 & ~BRANCH & ~LOOSE) | (branch ? BRANCH : 0) | (dirIndex(from) + 1);
+}
+
+/** The same wood voxel cut `cut` quarters deep on `side`. */
 export function withCut(id, cut, side) {
-  return (id & ~(63 << 9)) | (side & 7) << 12 | (cut & 7) << 9;
+  return (id & ~(15 << 9)) | (side & 3) << 11 | (cut & 3) << 9;
 }
 
 /** The wood size nearest `radius` metres. */

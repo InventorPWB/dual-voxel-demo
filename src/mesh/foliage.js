@@ -26,14 +26,15 @@
 
 import { unpackNormal } from '../world/normals.js';
 import { faceKey } from '../world/shapes.js';
-import { PLANT, plantDef, plantKind, isWood, isSolidWood, isCutOff, woodParent, woodRadius, woodCut, woodCutSide, DIRS26 } from '../world/plants.js';
+import { PLANT, plantDef, plantKind, isWood, isSolidWood, isCutOff, isBranch, isLoose, woodParent, woodGrowsFrom, woodRadius, woodCut, woodCutSide, DIRS26 } from '../world/plants.js';
 import { TEXTURE_NAMES } from '../render/textures.js';
 import { PAD } from './dualContour.js';
 
 const UP = [0, 1, 0];
 const layerOf = (id) => TEXTURE_NAMES.indexOf(plantDef(id).texture);
 const BARK_LAYER = TEXTURE_NAMES.indexOf('bark');
-const CUT_LAYER = TEXTURE_NAMES.indexOf('log_end');
+const CUT_LAYER = TEXTURE_NAMES.indexOf('log_end'); // a notch's faces
+const RINGS_LAYER = TEXTURE_NAMES.indexOf('log_top'); // a flat end: rings round the middle
 const CARD_LAYER = TEXTURE_NAMES.indexOf('leaves');
 
 /** Hash of integer world coordinates and a salt, in [0, 1). */
@@ -354,8 +355,8 @@ const ROD_SIDES = 8;
 /** How far (voxels) a tube growing out of the ground or other solid runs on into it. */
 const ROOT_DEPTH = 1.6;
 const SNAP = DIRS26.map(([x, y, z]) => { const l = Math.hypot(x, y, z); return [x / l, y / l, z / l]; });
-/** The 8 compass directions a cut can face (see plants.js). */
-const CUT_SIDES = Array.from({ length: 8 }, (_, k) => [Math.cos((k * Math.PI) / 4), 0, Math.sin((k * Math.PI) / 4)]);
+/** The 4 compass directions a cut can face (see plants.js). */
+const CUT_SIDES = [[1, 0, 0], [0, 0, 1], [-1, 0, 0], [0, 0, -1]];
 /** Padded-index offset of each DIRS26 direction, for a padded chunk N voxels across. */
 const dirSteps = (N) => DIRS26.map(([dx, dy, dz]) => dx + N * dy + N * N * dz);
 
@@ -422,7 +423,7 @@ function wood(p, scale, out, field, collide) {
       for (let x = 0; x < N; x++) {
         const i = x + N * y + NN * z;
         if (!isWood(plant[i])) continue;
-        const d = woodParent(plant[i]);
+        const d = woodGrowsFrom(plant[i]); // (a loose log grows from nothing)
         let par = -1;
         if (d >= 0) {
           const [dx, dy, dz] = DIRS26[d];
@@ -436,12 +437,18 @@ function wood(p, scale, out, field, collide) {
         }
       }
   if (!parentOf.size) return;
-  // Each voxel's main child: its thickest (the first, of equals).
+  // Each voxel's main child, the wood its tube carries on into: the
+  // thickest of those that carry it on rather than branch off its side (see
+  // plants.js), so side shoots, and logs laid against a log's side, join it
+  // without bending it round.
   const main = new Map();
   for (const [i, kids] of children) {
-    let best = kids[0];
-    for (const c of kids) if (woodRadius(plant[c]) > woodRadius(plant[best])) best = c;
-    main.set(i, best);
+    let best = -1;
+    for (const c of kids) {
+      if (isBranch(plant[c])) continue;
+      if (best < 0 || woodRadius(plant[c]) > woodRadius(plant[best])) best = c;
+    }
+    if (best >= 0) main.set(i, best);
   }
   const isW = (i) => i >= 0 && parentOf.has(i);
 
@@ -494,6 +501,13 @@ function wood(p, scale, out, field, collide) {
   // from and the way into the solid, so the bend there is mitred too.
   const along = (i) => {
     const par = parentOf.get(i);
+    if (isLoose(plant[i]) && main.has(i)) {
+      // A loose log: mitred between the way it lies and the way its main
+      // child leaves it.
+      const back = unit(DIRS26[woodParent(plant[i])]);
+      const from = unit(coords(i).map((q, k) => q - coords(main.get(i))[k]));
+      return (from && unit(back.map((q, k) => q + from[k]))) || back;
+    }
     if (par < 0 || !main.has(i)) return null;
     const c = main.get(i);
     if (mat[par]) {
@@ -529,7 +543,7 @@ function wood(p, scale, out, field, collide) {
     if (id && woodCut(id)) {
       const s = CUT_SIDES[woodCutSide(id)], st = s[0] * t[0] + s[1] * t[1] + s[2] * t[2];
       side = unit([s[0] - t[0] * st, s[1] - t[1] * st, s[2] - t[2] * st]);
-      limit = r * (1 - (2 * woodCut(id)) / 8);
+      limit = r * (1 - (2 * woodCut(id)) / 4);
     }
     const verts = [];
     for (let k = 0; k <= ROD_SIDES; k++) {
@@ -568,14 +582,13 @@ function wood(p, scale, out, field, collide) {
   // A flat end of end grain at voxel i, square to t (towards its parent),
   // facing `face` (1: towards the parent, -1: away from it).
   // (Solid wood's goes in the collider too, as voxel `cell`'s.)
-  const endGrain = (i, t, ao, face, cell = null) => {
-    const E = ring(point(i), t, radius(i), plant[i]);
-    const c = point(i);
+  const endGrain = (i, t, ao, face, cell = null, c = point(i)) => {
+    const E = ring(c, t, radius(i), plant[i]);
     const nf = [t[0] * face, t[1] * face, t[2] * face];
     const mid = [world(c[0], 0), world(c[1], 1), world(c[2], 2), 0.5, 0.5, 0, ao, nf];
     for (let k = 0; k < ROD_SIDES; k++) {
       const q = (e, j) => [e.p[0], e.p[1], e.p[2], 0.5 + 0.5 * Math.cos((j * Math.PI) / 4), 0.5 + 0.5 * Math.sin((j * Math.PI) / 4), 0, ao, nf];
-      out.tri(mid, q(E.verts[k], k), q(E.verts[k + 1], k + 1), nf, CUT_LAYER);
+      out.tri(mid, q(E.verts[k], k), q(E.verts[k + 1], k + 1), nf, RINGS_LAYER);
       if (cell) collide.tri(mid, q(E.verts[k], k), q(E.verts[k + 1], k + 1), cell);
     }
   };
@@ -583,10 +596,10 @@ function wood(p, scale, out, field, collide) {
     const [x, y, z] = coords(i);
     if (x < PAD || y < PAD || z < PAD || x >= PAD + size || y >= PAD + size || z >= PAD + size) continue;
     const id = plant[i];
-    if (par < 0 && woodParent(id) >= 0) continue; // what it grows from is off the array: not drawn here
+    if (par < 0 && woodGrowsFrom(id) >= 0) continue; // what it grows from is off the array: not drawn here
     const solid = par >= 0 && !!mat[par];
-    // What it grew from is gone (broken away, or dug out from under it): a
-    // short stub towards where it was, cut flat.
+    // What it grew from is gone (broken away, or dug out from under it), or
+    // it's a loose log: a short stub towards that side, cut flat.
     const gone = !solid && !isW(par);
     if (gone && woodParent(id) < 0) {
       if (main.has(i)) endGrain(i, along(i) || unit(point(i).map((q, k) => q - point(main.get(i))[k])), aoAt(point(i)), 1);
@@ -641,18 +654,31 @@ function wood(p, scale, out, field, collide) {
       const c = [world(b[0], 0), world(b[1], 1), world(b[2], 2), 0.5, 0.5, 0, ao, dir];
       for (let k = 0; k < ROD_SIDES; k++) {
         const e = (v, j) => [v.p[0], v.p[1], v.p[2], 0.5 + 0.5 * Math.cos((j * Math.PI) / 4), 0.5 + 0.5 * Math.sin((j * Math.PI) / 4), 0, ao, dir];
-        out.tri(c, e(B.verts[k + 1], k + 1), e(B.verts[k], k), dir, CUT_LAYER);
+        out.tri(c, e(B.verts[k + 1], k + 1), e(B.verts[k], k), dir, RINGS_LAYER);
+        if (solidWood) collide.tri(c, e(B.verts[k + 1], k + 1), e(B.verts[k], k), cell);
       }
     }
     const onward = [-dir[0], -dir[1], -dir[2]];
-    if (!children.has(i) && solidAt([a[0] + onward[0] * 0.9, a[1] + onward[1] * 0.9, a[2] + onward[2] * 0.9])) {
+    const end = !main.has(i);
+    if (end && solidAt([a[0] + onward[0] * 0.9, a[1] + onward[1] * 0.9, a[2] + onward[2] * 0.9])) {
       // Running into the ground (a root): carry on into it, out of sight.
       const e = [0, 1, 2].map((k) => a[k] + onward[k] * ROOT_DEPTH);
       const C = ring(e, ta, ra * 0.6);
       for (let k = 0; k < ROD_SIDES; k++)
         out.quad(corner(C.verts[k], A.v - lenM), corner(C.verts[k + 1], A.v - lenM), corner(A.verts[k + 1], A.v), corner(A.verts[k], A.v), A.verts[k].e, BARK_LAYER);
-    } else if (!children.has(i) && (isCutOff(id) || solidWood)) endGrain(i, ta, ao, -1, solidWood ? cell : null); // a stump, or a log's end: cut flat
-    else if (!children.has(i)) {
+    } else if (end && isCutOff(id)) endGrain(i, ta, ao, -1, solidWood ? cell : null); // a stump: cut flat at the cut
+    else if (end && solidWood) {
+      // A log's end: on to the voxel's face, sawn flat.
+      const e = [0, 1, 2].map((k) => a[k] + onward[k] * 0.5);
+      const E = ring(e, ta, ra);
+      const ve = A.v - 0.5 * scale;
+      for (let k = 0; k < ROD_SIDES; k++) {
+        const q = [corner(E.verts[k], ve), corner(E.verts[k + 1], ve), corner(A.verts[k + 1], A.v), corner(A.verts[k], A.v)];
+        out.quad(q[0], q[1], q[2], q[3], E.verts[k].e, BARK_LAYER);
+        collide.quad(q, cell);
+      }
+      endGrain(i, ta, ao, -1, cell, e);
+    } else if (end) {
       const tip = [0, 1, 2].map((k) => a[k] - dir[k] * (ra / scale) * 1.5);
       const back = [-dir[0], -dir[1], -dir[2]];
       const c = [world(tip[0], 0), world(tip[1], 1), world(tip[2], 2), 0.5, A.v - ra * 1.5, 0, ao, back];

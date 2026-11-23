@@ -3,10 +3,10 @@ import { World, VOXEL } from '../world/World.js';
 import { MATERIALS, MAT } from '../world/materials.js';
 import { placement, rotationForFacing, CUBE } from '../world/shapes.js';
 import {
-  sculptSphere, smoothBrush, flattenBrush, placeShape, shapeSolidVoxels, breakCells, clearCells,
+  sculptSphere, smoothBrush, flattenBrush, placeShape, placeTerrain, shapeSolidVoxels, breakCells, clearCells,
 } from '../world/edits.js';
-import { PLANT, DIRS26, plantDef, plantKind, isWood, isSolidWood, woodRadius, woodCut, woodId, supportsPlant } from '../world/plants.js';
-import { chop, chopTime, compass, remove } from '../world/chop.js';
+import { PLANT, DIRS26, plantDef, plantKind, isWood, isSolidWood, isBranch, isLoose, woodRadius, woodCut, woodId, woodParent, withParent, supportsPlant } from '../world/plants.js';
+import { chop, chopTime, compass, remove, woodChildren } from '../world/chop.js';
 import { SHAPE } from '../world/shapes.js';
 import { meshChunk } from '../mesh/dualContour.js';
 import { averageColor } from '../render/textures.js';
@@ -389,7 +389,9 @@ export class Interaction {
     if (kind === 'place') {
       const p = this.shapeTarget(item);
       if (p.blocked || this.blocksPlayer(p)) return;
-      placeShape(w, p, item.material);
+      // Natural materials are terrain: a metre of ground, run into what's around.
+      if (MATERIALS[item.material].natural) placeTerrain(w, p.origin, item.material, { protect: this.protect });
+      else placeShape(w, p, item.material);
     } else {
       // Paint: recolour what left mouse would break.
       const { cells, leaves } = this.breakTarget(item);
@@ -409,34 +411,55 @@ export class Interaction {
   // ---- plants ----------------------------------------------------------------
 
   /**
-   * Where a piece of wood goes: the voxel just beyond the face you aim at,
-   * growing from the voxel you aim at if that's wood or solid, else from any
-   * wood or solid beside it (preferring below). `blocked` if that voxel is
-   * solid or solid wood, or there's nothing for it to grow from.
+   * Where a piece of wood goes: the voxel `t` just beyond the face you aim
+   * at, and how it joins.
+   *  - On a log (wood): it grows from that log (`from`), joined. It carries
+   *    the log on, bending round if it leaves at an angle, unless something
+   *    carries it on already: then it branches off its side (`branch`).
+   *    On the end a log grows from (a loose log's back, or a broken end), it
+   *    goes on that end instead: lying that way itself (`lie`), with the log
+   *    growing from it.
+   *  - On anything else (ground, a block, leaves): a loose log (see
+   *    plants.js), lying along the face you aimed at, joined to nothing.
+   *  - `loose` (Shift): a loose log lying along the way you look (level unless
+   *    you look steeply up or down), whatever you aim at.
+   * Nothing joins on its own: only the log you put it on.
+   * `blocked` if that voxel is solid, or solid wood.
    */
-  woodTarget() {
+  woodTarget(loose = false) {
     const w = this.world;
     const v = this.aimedVoxel();
     const n = this.hit.normal;
     const an = [Math.abs(n.x), Math.abs(n.y), Math.abs(n.z)];
     const k = an[1] >= an[0] && an[1] >= an[2] ? 1 : an[0] >= an[2] ? 0 : 2;
-    const t = v.slice();
-    t[k] += Math.sign([n.x, n.y, n.z][k]) || 1;
-    const holds = (u) => w.isSolid(...u) || isWood(w.getPlant(...u));
-    let from = null;
-    if (holds(v) && Math.max(...t.map((c, j) => Math.abs(c - v[j]))) === 1) from = v;
-    else {
-      const around = DIRS26.map((o) => t.map((c, j) => c + o[j])).filter(holds);
-      from = around.sort((a, b) => a[1] - b[1])[0] || null;
-    }
-    const blocked = !from || w.isSolid(...t) || isSolidWood(w.getPlant(...t));
-    return { voxels: [t], origin: t, size: [1, 1, 1], shape: SHAPE.small, rot: 0, flip: false, from, blocked };
+    const dn = [0, 0, 0];
+    dn[k] = Math.sign([n.x, n.y, n.z][k]) || 1;
+    const t = v.map((c, j) => c + dn[j]);
+    const vid = w.getPlant(...v);
+    let from = null, branch = false, lie = null, unloose = null;
+    if (loose) {
+      const look = this.camera.getWorldDirection(new THREE.Vector3());
+      const a = Math.abs(look.y) > 0.75 ? 1 : Math.abs(look.x) >= Math.abs(look.z) ? 0 : 2;
+      lie = [0, 0, 0];
+      lie[a] = -(Math.sign([look.x, look.y, look.z][a]) || 1);
+    } else if (isWood(vid)) {
+      const o = DIRS26[woodParent(vid)];
+      if (o && o[0] === dn[0] && o[1] === dn[1] && o[2] === dn[2]) {
+        lie = dn;
+        if (isLoose(vid)) unloose = v;
+      } else {
+        from = v;
+        branch = woodChildren(w, ...v).some((c) => !isBranch(w.getPlant(...c)));
+      }
+    } else lie = dn.map((c) => -c);
+    const blocked = w.isSolid(...t) || isSolidWood(w.getPlant(...t));
+    return { voxels: [t], origin: t, size: [1, 1, 1], shape: SHAPE.small, rot: 0, flip: false, from, branch, lie, unloose, blocked };
   }
 
   /**
    * Leaves: a 1 m block of leaf voxels on the build grid. Wood: one voxel of
-   * wood, growing from what you put it on (see woodTarget), drawn joined to
-   * it. Grass: a small brush.
+   * wood, joined to the log you put it on, or a loose log (see woodTarget).
+   * Grass: a small brush.
    */
   plantAction(kind) {
     const item = this.item;
@@ -444,10 +467,12 @@ export class Interaction {
     const w = this.world;
     if (item.wood !== undefined) {
       if (kind !== 'place') return;
-      const p = this.woodTarget();
+      const p = this.woodTarget(this.shift);
       if (p.blocked || (isSolidWood(woodId(item.wood)) && this.player.intersectsVoxel(...p.origin))) return;
       const [x, y, z] = p.origin;
-      w.setPlant(x, y, z, woodId(item.wood, p.from.map((c, j) => c - p.origin[j])));
+      w.setPlant(x, y, z, p.from ? woodId(item.wood, p.from.map((c, j) => c - p.origin[j]), p.branch) : woodId(item.wood, p.lie, false, true));
+      // A loose log whose back it went on now grows from it.
+      if (p.unloose) w.setPlant(...p.unloose, withParent(w.getPlant(...p.unloose), p.origin.map((c, j) => c - p.unloose[j])));
       w.markDirtyBox(x - 3, y - 3, z - 3, x + 3, y + 3, z + 3);
       return;
     }
@@ -544,7 +569,7 @@ export class Interaction {
         this.showGhost(mesh, edges, origin, painting && !this.lmb ? materialColor(item.material) : REMOVE_COLOR, true);
         return;
       }
-      const p = item.wood !== undefined ? this.woodTarget() : this.shapeTarget(item);
+      const p = item.wood !== undefined ? this.woodTarget(this.shift) : this.shapeTarget(item);
       const { mesh, edges } = this.ghostGeometry(p);
       const blocked = p.blocked || (item.kind === 'build' && this.blocksPlayer(p));
       const color = blocked ? BLOCKED_COLOR : item.kind === 'build' ? materialColor(item.material) : item.wood !== undefined ? BARK_COLOR : LEAF_COLOR;

@@ -159,8 +159,8 @@ const GENERATORS = {
     return jitter(c, 4, hash(x, y, 34));
   },
   log_end(x, y) {
-    // End grain without a centre: wavy growth lines that tile, for wherever a
-    // trunk of smooth terrain is cut (its rings can't be centred on it).
+    // End grain without a centre: wavy growth lines that tile, for the faces
+    // of an axe's notch (log_top, rings round the middle, is for sawn ends).
     const v = y + 2.5 * Math.sin((x / 32) * Math.PI * 2) + 1.5 * vnoise(x, y, 8, 36);
     const ring = 0.5 + 0.5 * Math.cos((v / 32) * Math.PI * 2 * 5);
     const c = [176 + 26 * ring, 138 + 20 * ring, 88 + 12 * ring];
