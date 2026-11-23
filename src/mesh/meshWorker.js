@@ -23,7 +23,7 @@ self.onmessage = (e) => {
     self.postMessage(
       { type: 'mesh', index: msg.index, version: msg.version, ms: performance.now() - t0, solid, foliage },
       [
-        solid.position.buffer, solid.normal.buffer, solid.material.buffer, solid.ao.buffer, solid.local.buffer,
+        solid.position.buffer, solid.normal.buffer, solid.material.buffer, solid.blend.buffer, solid.ao.buffer, solid.local.buffer,
         foliage.position.buffer, foliage.normal.buffer, foliage.uvl.buffer, foliage.wind.buffer, foliage.ao.buffer, foliage.seed.buffer, foliage.center.buffer, foliage.axis.buffer,
         foliage.wood.position.buffer, foliage.wood.cell.buffer,
       ],

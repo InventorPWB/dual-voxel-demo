@@ -66,12 +66,23 @@ export function generateWorld(world, seed = 1337, { avoid = [] } = {}) {
     return d / V;
   };
 
-  // Materials by depth below the surface and steepness.
+  // Materials by depth below the surface and steepness. `d` is the SDF's value
+  // (vertical distance to the surface, plus the overhang noise), which
+  // overstates the depth wherever the ground is steep or the noise leans: so
+  // depth is measured the way the SDF's gradient says, as distance
+  // perpendicular to the surface, and steepness comes from the same gradient.
+  // (Otherwise dirt and stone show through the grass on slopes and overhangs.)
+  const G = 0.5; // gradient sample spacing, voxels
   const matAt = (x, y, z, d) => {
-    const h = hAt(x, z);
-    const slope = Math.hypot(hAt(x + 1, z) - hAt(x - 1, z), hAt(x, z + 1) - hAt(x, z - 1)) / (2 * V);
-    const dd = d * V; // metres below the surface
-    if (h < 17.5 && dd <= 1.5) return MAT.SAND;
+    if (d * V > 8) return MAT.STONE; // deep inside: no need to look at the gradient
+    const cx = x + 0.5, cy = y + 0.5, cz = z + 0.5;
+    const gx = (sdf(cx + G, cy, cz) - sdf(cx - G, cy, cz)) / (2 * G);
+    const gy = (sdf(cx, cy + G, cz) - sdf(cx, cy - G, cz)) / (2 * G);
+    const gz = (sdf(cx, cy, cz + G) - sdf(cx, cy, cz - G)) / (2 * G);
+    // Steepness: how far the surface leans from level (rise over run is 1/slope).
+    const slope = Math.hypot(gx, gz) / Math.max(Math.abs(gy), 1e-3);
+    const dd = (d / Math.max(Math.hypot(gx, gy, gz), 0.25)) * V; // metres below the surface
+    if (hAt(x, z) < 17.5 && dd <= 1.5) return MAT.SAND;
     if (slope > 1.1) return dd <= 0.6 && slope < 1.6 ? MAT.GRASS : MAT.STONE;
     if (dd <= 0.6) return MAT.GRASS;
     if (dd <= 2.5) return MAT.DIRT;

@@ -7,18 +7,51 @@ import { DEPTH_PARAMS, HIDDEN } from './SunShadow.js';
 export { SKY_COLOR, SUN_AZIMUTH, SUN_ELEVATION, sunDirection } from './lighting.js';
 
 const SURFACE_GLSL = /* glsl */ `
+  float hash31(vec3 p) {
+    p = fract(p * 0.1031);
+    p += dot(p, p.yzx + 33.33);
+    return fract((p.x + p.y) * p.z);
+  }
+
   // Triplanar pixel-art texturing, one tile per metre in world space, so
   // brick and plank patterns line up across neighbouring shapes.
   vec4 triplanar(vec3 pos, vec3 n, int mat) {
-    vec3 w = pow(abs(n), vec3(8.0));
-    w /= (w.x + w.y + w.z);
-    vec3 L = uLayers[mat];
     // Nudge sample points off exact grid faces so nearest filtering is stable.
     vec3 p = pos - n * 0.001;
-    vec4 cx = texture(uTex, vec3(p.z, p.y, L.y));
+    // Each face takes the projection it leans toward, and projections only
+    // mix in a thin seam where two are about equally square-on (the usual
+    // pow(n, k) weights smear two angles over a wide slope). The seam is
+    // roughened per texel, so it's a ragged dissolve, not a hard line.
+    vec3 a = abs(n);
+    vec3 q = floor(p * 32.0);
+    a += (vec3(hash31(q), hash31(q + 7.1), hash31(q + 13.3)) - 0.5) * 0.12;
+    vec3 w = clamp((a - max(a.x, max(a.y, a.z))) / 0.1 + 1.0, 0.0, 1.0);
+    w /= (w.x + w.y + w.z);
+    vec3 L = uLayers[mat];
+    // A material with its own side texture (grass over dirt) shows it only on
+    // near-vertical faces: on a slope the side projection would paint the
+    // dirt half of it across the hillside. The change-over is dithered.
+    float sideLayer = L.y;
+    if (L.x != L.y && n.y > 0.0 && length(n.xz) + (hash31(floor(p * 16.0)) - 0.5) * 0.1 < 0.95) sideLayer = L.x;
+    vec4 cx = texture(uTex, vec3(p.z, p.y, sideLayer));
     vec4 cy = texture(uTex, vec3(p.x, p.z, n.y >= 0.0 ? L.x : L.z));
-    vec4 cz = texture(uTex, vec3(p.x, p.y, L.y));
+    vec4 cz = texture(uTex, vec3(p.x, p.y, sideLayer));
     return cx * w.x + cy * w.y + cz * w.z;
+  }
+
+  // Smooth terrain where materials meet: the triangle's three corners each
+  // stand for a material (mats), and w is where this pixel is between them.
+  // The weights are roughened by noise per half texel and then sharpened
+  // (a "height blend"), so the border is a ragged, pixel-art dissolve about a
+  // cell wide instead of a flat cross-fade. Pure areas stay pure.
+  vec4 terrainTexture(vec3 pos, vec3 n, ivec3 mats, vec3 w) {
+    if (mats.x == mats.y && mats.y == mats.z) return triplanar(pos, n, mats.x);
+    vec3 q = floor((pos - n * 0.001) * 16.0);
+    vec3 jitter = vec3(hash31(q), hash31(q + 19.7), hash31(q + 47.3)) - 0.5;
+    vec3 s = w + jitter * 0.55;
+    vec3 b = max(s - (max(s.x, max(s.y, s.z)) - 0.3), 0.0);
+    b /= (b.x + b.y + b.z);
+    return triplanar(pos, n, mats.x) * b.x + triplanar(pos, n, mats.y) * b.y + triplanar(pos, n, mats.z) * b.z;
   }
 
   // One texture over a whole building piece, following its shape. local.xyz:
@@ -92,12 +125,15 @@ export function createChunkMaterials(shadow) {
 
   const vertexShader = /* glsl */ `
     in float material;
+    in float blend;
     in float ao;
     in vec4 local;
     out vec3 vPos;
     out vec3 vNormal;
     out vec4 vLocal;
     flat out int vMat;
+    flat out int vBlend;
+    out vec3 vCorner;
     out float vAo;
     out float vDepth;
     void main() {
@@ -105,6 +141,10 @@ export function createChunkMaterials(shadow) {
       vLocal = local;
       vNormal = normal;
       vMat = int(material + 0.5);
+      vBlend = int(blend + 0.5);
+      // Which corner of its triangle this vertex is (meshes are not indexed).
+      int corner = gl_VertexID % 3;
+      vCorner = vec3(corner == 0 ? 1.0 : 0.0, corner == 1 ? 1.0 : 0.0, corner == 2 ? 1.0 : 0.0);
       vAo = ao;
       vec4 mv = modelViewMatrix * vec4(position, 1.0);
       vDepth = -mv.z;
@@ -120,13 +160,17 @@ export function createChunkMaterials(shadow) {
     in vec3 vNormal;
     in vec4 vLocal;
     flat in int vMat;
+    flat in int vBlend;
+    in vec3 vCorner;
     in float vAo;
     in float vDepth;
     layout(location = 0) out vec4 outColor;
 
     void main() {
       vec3 n = normalize(vNormal);
-      vec4 tex = surface(vPos, n, vLocal, vMat);
+      vec4 tex;
+      if (vBlend > 0) tex = terrainTexture(vPos, n, ivec3(vBlend & 255, (vBlend >> 8) & 255, (vBlend >> 16) & 255), vCorner);
+      else tex = surface(vPos, n, vLocal, vMat);
       vec3 color = fog(shade(tex.rgb, vPos, n, vAo, 0.2, 0.0), vDepth);
       #if defined(CUTOUT)
         if (cutout(tex.a)) discard;

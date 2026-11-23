@@ -69,16 +69,15 @@ for (const [name, wood, across] of [['Trunk', 12, '62 cm'], ['Bough', 9, '36 cm'
 export const PLANT_ITEM = { leaves: PLANT_ITEMS[0], grass: PLANT_ITEMS[1], trunk: PLANT_ITEMS[2], branch: PLANT_ITEMS[4] };
 
 /**
- * Inventory layout: tools, plants, natural ground (one item each: it places
- * as terrain), then one row of shapes per crafted material.
+ * Inventory layout: tools, plants, terrain (natural ground, one item each:
+ * it places as smooth terrain, not as a shape), then the building grid: one
+ * row of shapes per crafted material.
  */
 export const INVENTORY = {
   tools: TOOLS,
   plants: PLANT_ITEMS,
-  rows: [
-    PALETTE.filter((m) => m.natural).map((m) => buildItem(m.id, 'block')),
-    ...PALETTE.filter((m) => !m.natural).map((m) => SHAPES.map((s) => buildItem(m.id, s.id))),
-  ],
+  terrain: PALETTE.filter((m) => m.natural).map((m) => buildItem(m.id, 'block')),
+  rows: PALETTE.filter((m) => !m.natural).map((m) => SHAPES.map((s) => buildItem(m.id, s.id))),
 };
 
 export const HOTBAR_SIZE = 9;

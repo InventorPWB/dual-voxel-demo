@@ -110,6 +110,7 @@ export class ChunkMeshes {
       g.setAttribute('position', new THREE.BufferAttribute(solid.position, 3));
       g.setAttribute('normal', new THREE.BufferAttribute(solid.normal, 3));
       g.setAttribute('material', new THREE.BufferAttribute(solid.material, 1));
+      g.setAttribute('blend', new THREE.BufferAttribute(solid.blend, 1));
       g.setAttribute('ao', new THREE.BufferAttribute(solid.ao, 1));
       g.setAttribute('local', new THREE.BufferAttribute(solid.local, 4));
       for (const grp of solid.groups) g.addGroup(grp.start, grp.count, grp.pass);

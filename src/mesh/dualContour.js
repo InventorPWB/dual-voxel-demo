@@ -19,6 +19,13 @@
  * Shading: terrain uses the average of a cell's crossing normals; pieces
  * their own face normals. AO samples how much opaque material is just outside.
  *
+ * Texture blending: each cell's vertex has a material, voted by its crossings
+ * (most wins; a tie goes to the higher one). A natural terrain triangle's
+ * `blend` packs its three vertices' materials (m0 | m1 << 8 | m2 << 16); the
+ * shader fades between them across the triangle, so borders between
+ * materials are soft. 0 means no blending (pieces, crafted or glass terrain).
+ * (`material` stays the quad's own solid voxel's material, which picks its pass.)
+ *
  * Texturing: piece vertices also carry `local`: where they sit within the
  * whole piece they belong to (0..1 per axis; xyz) and its kind of shape (w:
  * 1 box or wedge, 2 round, 3 sphere; 0 for terrain). Materials mapped per
@@ -124,8 +131,10 @@ export function meshChunk(p, crisp, scale = 1) {
   const C = size + 1;
   const cellBase = PAD - 1;
   const cellSlot = new Int32Array(C * C * C).fill(-1);
-  const cPos = [], cNrm = [], cAo = [];
+  const cPos = [], cNrm = [], cAo = [], cMat = [];
   const corI = new Int32Array(8);
+  // Scratch for a cell's material vote (a cell has at most 12 crossings).
+  const voteMat = new Uint8Array(12), voteCount = new Uint8Array(12), voteTop = new Uint8Array(12);
 
   function cell(px, py, pz) {
     const key = (px - cellBase) + C * ((py - cellBase) + C * (pz - cellBase));
@@ -141,11 +150,22 @@ export function meshChunk(p, crisp, scale = 1) {
 
     qef.fill(0);
     let sx = 0, sy = 0, sz = 0, n = 0, snx = 0, sny = 0, snz = 0;
+    let kinds = 0; // materials tallied in vote*
     for (let e = 0; e < CELL_EDGES.length; e += 2) {
       const a = CELL_EDGES[e], b = CELL_EDGES[e + 1];
       const ia = corI[a], ib = corI[b];
       if (ter[ia] === ter[ib]) continue;
       const axis = BIT_AXIS[b - a];
+      // Vote for the cell's material: that of the solid end of each crossing.
+      {
+        const solid = ter[ia] ? a : b;
+        const m = mat[corI[solid]], h = (solid >> 1) & 1;
+        let k = 0;
+        while (k < kinds && voteMat[k] !== m) k++;
+        if (k === kinds) { voteMat[k] = m; voteCount[k] = 0; voteTop[k] = 0; kinds++; }
+        voteCount[k]++;
+        if (h > voteTop[k]) voteTop[k] = h;
+      }
       let t;
       if (shape[ia] || shape[ib]) {
         // Terrain meets a building piece: on the piece's face, normal out of the terrain.
@@ -164,6 +184,11 @@ export function meshChunk(p, crisp, scale = 1) {
       sx += cx; sy += cy; sz += cz; n++;
       snx += n3[0]; sny += n3[1]; snz += n3[2];
     }
+    // Most crossings win; a tie goes to the material that reaches higher
+    // (the surface layer over what's under it).
+    let best = 0;
+    for (let k = 1; k < kinds; k++)
+      if (voteCount[k] > voteCount[best] || (voteCount[k] === voteCount[best] && voteTop[k] > voteTop[best])) best = k;
     sx /= n; sy /= n; sz /= n;
     solveQEF(SOFT_BIAS * (1 - crispness) + 1e-4, sx, sy, sz);
     const kk = SOFT_SHARPNESS + (1 - SOFT_SHARPNESS) * crispness;
@@ -185,13 +210,16 @@ export function meshChunk(p, crisp, scale = 1) {
     cPos.push((ox + qx - PAD + 0.5) * scale, (oy + qy - PAD + 0.5) * scale, (oz + qz - PAD + 0.5) * scale);
     cNrm.push(nx, ny, nz);
     cAo.push(ao);
+    cMat.push(voteMat[best]);
     cellSlot[key] = slot;
     return slot;
   }
 
   // One output stream per render pass; terrain first, then pieces.
-  const streams = [0, 1, 2].map(() => ({ pos: [], nrm: [], mat: [], ao: [], local: [], terrain: 0 }));
+  const streams = [0, 1, 2].map(() => ({ pos: [], nrm: [], mat: [], blend: [], ao: [], local: [], terrain: 0 }));
   const quad = [0, 0, 0, 0];
+  /** Only natural, opaque terrain blends into its neighbours; crafted and glass stay as they are. */
+  const blendable = (m) => m !== 0 && OPAQUE[m] === 1 && crisp[m] < 0.5;
 
   for (let lz = 0; lz < size; lz++)
     for (let ly = 0; ly < size; ly++)
@@ -234,6 +262,13 @@ export function meshChunk(p, crisp, scale = 1) {
               const gl = Math.hypot(gx, gy, gz);
               if (gl > 1e-12) { gx /= gl; gy /= gl; gz /= gl; } else { gx = gy = gz = 0; }
             }
+            // Natural terrain blends its textures: the triangle carries its three
+            // cells' materials, and each vertex stands for its own (see terrainMaterial.js).
+            let blend = 0;
+            if (blendable(m)) {
+              const c0 = cMat[quad[order[t]]], c1 = cMat[quad[order[t + 1]]], c2 = cMat[quad[order[t + 2]]];
+              if (blendable(c0) && blendable(c1) && blendable(c2)) blend = c0 | (c1 << 8) | (c2 << 16);
+            }
             for (let j = t; j < t + 3; j++) {
               const s = quad[order[j]];
               o.pos.push(cPos[s * 3], cPos[s * 3 + 1], cPos[s * 3 + 2]);
@@ -241,6 +276,7 @@ export function meshChunk(p, crisp, scale = 1) {
               if (crease && (gx || gy || gz) && nx * gx + ny * gy + nz * gz < CREASE_COS) o.nrm.push(gx, gy, gz);
               else o.nrm.push(nx, ny, nz);
               o.mat.push(m);
+              o.blend.push(blend);
               o.ao.push(cAo[s]);
               o.local.push(0, 0, 0, 0);
             }
@@ -289,6 +325,7 @@ export function meshChunk(p, crisp, scale = 1) {
             o.pos.push((ox + lx + vx) * scale, (oy + ly + vy) * scale, (oz + lz + vz) * scale);
             o.nrm.push(nx, ny, nz);
             o.mat.push(m);
+            o.blend.push(0);
             o.local.push((bx + vx) / extent[0], (by + vy) / extent[1], (bz + vz) / extent[2], kind);
             // Padded sample coordinates of the vertex (sample P sits at the voxel's centre).
             const qx = px + vx - 0.5, qy = py + vy - 0.5, qz = pz + vz - 0.5;
@@ -302,6 +339,7 @@ export function meshChunk(p, crisp, scale = 1) {
   const total = streams.reduce((n, o) => n + o.ao.length, 0);
   const position = new Float32Array(total * 3), normal = new Float32Array(total * 3);
   const material = new Float32Array(total), ao = new Float32Array(total), local = new Float32Array(total * 4);
+  const blend = new Float32Array(total);
   const groups = [];
   let at = 0;
   streams.forEach((o, pass) => {
@@ -310,13 +348,14 @@ export function meshChunk(p, crisp, scale = 1) {
     position.set(o.pos, at * 3);
     normal.set(o.nrm, at * 3);
     material.set(o.mat, at);
+    blend.set(o.blend, at);
     ao.set(o.ao, at);
     local.set(o.local, at * 4);
     groups.push({ start: at, count: n, pass, terrain: o.terrain });
     at += n;
   });
   return {
-    position, normal, material, ao, local, groups,
+    position, normal, material, blend, ao, local, groups,
     /** Terrain vertices at the start of the opaque pass. */
     terrainVertices: streams[0].terrain,
     triangles: total / 3,

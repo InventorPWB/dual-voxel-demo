@@ -1,6 +1,7 @@
 import { MATERIALS, MAT } from './materials.js';
 import { applyCSG } from './csg.js';
 import { settlePlants } from './plants.js';
+import { unpackNormal } from './normals.js';
 
 /**
  * World edit rules shared by every tool.
@@ -127,31 +128,141 @@ export function sculptSphere(world, c, r, mode, material = MAT.DIRT, opts = {}) 
   return res.changed;
 }
 
+const DIST_MAX = 3, DIST_MIN = 1e-4;
+// Neighbour steps for the sweeps: the 13 before a voxel in scan order, and the 13 after.
+const STEPS_BEFORE = [], STEPS_AFTER = [];
+for (let dz = -1; dz <= 1; dz++)
+  for (let dy = -1; dy <= 1; dy++)
+    for (let dx = -1; dx <= 1; dx++) {
+      if (!dx && !dy && !dz) continue;
+      const before = dz < 0 || (dz === 0 && (dy < 0 || (dy === 0 && dx < 0)));
+      (before ? STEPS_BEFORE : STEPS_AFTER).push([dx, dy, dz]);
+    }
+const nrmScratch = [0, 0, 0];
+
 /**
- * Smooth the surface inside a sphere. Builds a signed-distance estimate from
- * the stored crossings, blurs it, and re-extracts solidity and crossings from
- * the result, so edges round off and dents fill over time.
+ * Signed distance to the terrain surface for every voxel of a region
+ * (positive inside, clamped to �DIST_MAX), at true scale. Every crossing on
+ * the region's edges is a point of the surface with a normal. Each voxel
+ * finds the nearest such point (seeded from its own edges, then passed along
+ * by sweeps) and takes its distance to the tangent plane there: exact on flat
+ * ground whatever its tilt, and not clamped or measured along an axis. So
+ * blurring it moves the surface the way diffusion should, until it's flat,
+ * rather than stopping where the estimate's own errors balance the curve.
+ */
+function signedDistance(world, rg, c, r) {
+  const { nx, ny } = rg;
+  const d = new Float32Array(rg.size);
+  const solid = new Uint8Array(rg.size);
+  const best = new Float32Array(rg.size).fill(Infinity); // squared distance to the nearest surface point found
+  const feat = new Float32Array(rg.size * 6); // that point (voxel units, centres at +0.5) and its normal
+  const e = [0, 0, 0];
+  for (let z = rg.z0; z <= rg.z1; z++)
+    for (let y = rg.y0; y <= rg.y1; y++)
+      for (let x = rg.x0; x <= rg.x1; x++) solid[rg.index(x, y, z)] = world.isTerrain(x, y, z) ? 1 : 0;
+
+  const offer = (i, x, y, z, cx, cy, cz, nx, ny, nz) => {
+    const dx = cx - (x + 0.5), dy = cy - (y + 0.5), dz = cz - (z + 0.5);
+    const d2 = dx * dx + dy * dy + dz * dz;
+    if (d2 >= best[i]) return;
+    best[i] = d2;
+    const k = i * 6;
+    feat[k] = cx; feat[k + 1] = cy; feat[k + 2] = cz; feat[k + 3] = nx; feat[k + 4] = ny; feat[k + 5] = nz;
+  };
+  // Seeds: both ends of every crossed edge.
+  for (let z = rg.z0; z <= rg.z1; z++)
+    for (let y = rg.y0; y <= rg.y1; y++)
+      for (let x = rg.x0; x <= rg.x1; x++) {
+        const i = rg.index(x, y, z);
+        for (let a = 0; a < 3; a++) {
+          const qx = x + AXES[a][0], qy = y + AXES[a][1], qz = z + AXES[a][2];
+          if (!rg.contains(qx, qy, qz)) continue;
+          const j = rg.index(qx, qy, qz);
+          if (solid[i] === solid[j]) continue;
+          let t = 0.5;
+          const sg = solid[i] ? 1 : -1; // outward normal along the axis, if none is stored
+          nrmScratch[0] = a === 0 ? sg : 0; nrmScratch[1] = a === 1 ? sg : 0; nrmScratch[2] = a === 2 ? sg : 0;
+          if (!world.isPiece(x, y, z) && !world.isPiece(qx, qy, qz) && world.getEdge(x, y, z, a, e)) {
+            t = e[0];
+            unpackNormal(e[1], e[2], nrmScratch);
+          }
+          const cx = x + 0.5 + AXES[a][0] * t, cy = y + 0.5 + AXES[a][1] * t, cz = z + 0.5 + AXES[a][2] * t;
+          offer(i, x, y, z, cx, cy, cz, nrmScratch[0], nrmScratch[1], nrmScratch[2]);
+          offer(j, qx, qy, qz, cx, cy, cz, nrmScratch[0], nrmScratch[1], nrmScratch[2]);
+        }
+      }
+  // Pass the nearest points on to neighbours, forward then backward, through
+  // the interior voxels near the brush (what the blur reads).
+  const offs = (steps) => steps.map(([dx, dy, dz]) => dx + nx * (dy + ny * dz));
+  const before = offs(STEPS_BEFORE), after = offs(STEPS_AFTER);
+  const reach2 = (r + 2.5) * (r + 2.5);
+  const sweep = (steps, forward) => {
+    const xs = forward ? [rg.x0 + 1, rg.x1, 1] : [rg.x1 - 1, rg.x0, -1];
+    const ys = forward ? [rg.y0 + 1, rg.y1, 1] : [rg.y1 - 1, rg.y0, -1];
+    const zs = forward ? [rg.z0 + 1, rg.z1, 1] : [rg.z1 - 1, rg.z0, -1];
+    for (let z = zs[0]; z !== zs[1]; z += zs[2]) {
+      const dz = z + 0.5 - c.z;
+      for (let y = ys[0]; y !== ys[1]; y += ys[2]) {
+        const dyz = dz * dz + (y + 0.5 - c.y) * (y + 0.5 - c.y);
+        if (dyz > reach2) continue;
+        for (let x = xs[0]; x !== xs[1]; x += xs[2]) {
+          const dx = x + 0.5 - c.x;
+          if (dyz + dx * dx > reach2) continue;
+          const i = (x - rg.x0) + nx * ((y - rg.y0) + ny * (z - rg.z0));
+          const px = x + 0.5, py = y + 0.5, pz = z + 0.5;
+          let bi = best[i], bk = -1;
+          for (let n = 0; n < steps.length; n++) {
+            const j = i + steps[n];
+            if (best[j] === Infinity) continue;
+            const k = j * 6;
+            const ex = feat[k] - px, ey = feat[k + 1] - py, ez = feat[k + 2] - pz;
+            const d2 = ex * ex + ey * ey + ez * ez;
+            if (d2 < bi) { bi = d2; bk = k; }
+          }
+          if (bk >= 0) {
+            best[i] = bi;
+            const k = i * 6;
+            feat[k] = feat[bk]; feat[k + 1] = feat[bk + 1]; feat[k + 2] = feat[bk + 2];
+            feat[k + 3] = feat[bk + 3]; feat[k + 4] = feat[bk + 4]; feat[k + 5] = feat[bk + 5];
+          }
+        }
+      }
+    }
+  };
+  sweep(before, true);
+  sweep(after, false);
+  sweep(before, true);
+  sweep(after, false);
+
+  for (let z = rg.z0; z <= rg.z1; z++)
+    for (let y = rg.y0; y <= rg.y1; y++)
+      for (let x = rg.x0; x <= rg.x1; x++) {
+        const i = rg.index(x, y, z), k = i * 6;
+        let m = DIST_MAX;
+        if (best[i] !== Infinity) {
+          const plane = Math.abs((feat[k] - (x + 0.5)) * feat[k + 3] + (feat[k + 1] - (y + 0.5)) * feat[k + 4] + (feat[k + 2] - (z + 0.5)) * feat[k + 5]);
+          m = Math.min(DIST_MAX, plane);
+        }
+        // Never exactly 0: the sign is what says solid or empty, so a voxel
+        // whose surface passes through its centre would otherwise read as
+        // empty while still solid, and no blur could ever remove it.
+        m = Math.max(m, DIST_MIN);
+        d[i] = solid[i] ? m : -m;
+      }
+  return d;
+}
+
+/**
+ * Smooth the surface inside a sphere. Builds a signed distance field from the
+ * stored crossings (see signedDistance), blurs it, and re-extracts solidity and
+ * crossings from the result, so edges round off and dents fill over time.
  */
 export function smoothBrush(world, c, r, dt, opts = {}) {
   const rg = region(world, Math.floor(c.x - r) - 2, Math.floor(c.y - r) - 2, Math.floor(c.z - r) - 2,
     Math.floor(c.x + r) + 2, Math.floor(c.y + r) + 2, Math.floor(c.z + r) + 2);
   if (rg.empty) return 0;
-  const s = new Float32Array(rg.size);
-  const e = [0, 0, 0];
-  // 1. Signed distance estimate: distance to the nearest crossing on the
-  //    voxel's own six edges (about a voxel if none), signed by solidity.
-  for (let z = rg.z0; z <= rg.z1; z++)
-    for (let y = rg.y0; y <= rg.y1; y++)
-      for (let x = rg.x0; x <= rg.x1; x++) {
-        const solid = world.isTerrain(x, y, z);
-        let d = 1.2;
-        for (let a = 0; a < 3; a++) {
-          const [dx, dy, dz] = AXES[a];
-          if (world.isTerrain(x + dx, y + dy, z + dz) !== solid && world.getEdge(x, y, z, a, e)) d = Math.min(d, e[0]);
-          if (world.isTerrain(x - dx, y - dy, z - dz) !== solid && world.getEdge(x - dx, y - dy, z - dz, a, e)) d = Math.min(d, 1 - e[0]);
-        }
-        s[rg.index(x, y, z)] = solid ? d : -d;
-      }
+  // 1. Signed distance to the surface, in voxels (positive inside).
+  const s = signedDistance(world, rg, c, r);
   // 2. Blur toward the 3×3×3 average, strongest at the centre.
   const out = new Float32Array(s);
   const weight = new Float32Array(rg.size);
