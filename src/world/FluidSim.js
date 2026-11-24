@@ -161,10 +161,28 @@ export class FluidSim {
 
   /** One simulation step. */
   tick() {
+    const { sx, sy } = this.world;
+    this.redeposit();
+    const batch = this.takeBatch();
+
+    // Each cell's transfers happen at once, in the order visited (forwards
+    // one tick, backwards the next, so neither way is favoured). Every
+    // transfer goes from a higher level to a lower one and never past
+    // level, so the water's potential energy only ever falls: it must come
+    // to rest, and then sleeps. (Worked out all together from the state
+    // before the tick instead, flows can chase each other round for ever.)
+    const back = this.stats.ticks & 1;
+    for (let n = 0; n < batch.length; n++) {
+      const k = batch[back ? batch.length - 1 - n : n];
+      const x = k % sx, t = (k - x) / sx, y = t % sy, z = (t - y) / sy;
+      this.flow(x, y, z);
+    }
+  }
+
+  /** Take this tick's cells off the queue (and count the tick). */
+  takeBatch() {
     const w = this.world;
     const { sx, sy } = w;
-    this.redeposit();
-
     // This tick's cells: all of them, or the nearest maxCells. Water far from
     // the player (beyond FAR) only moves every FAR_EVERY ticks: it flows
     // slower there, but ends up just the same, for a fraction of the cost.
@@ -195,19 +213,7 @@ export class FluidSim {
     for (const k of batch) this.queued[k] = 0;
     this.stats.active = batch.length + this.queue.length;
     this.stats.ticks++;
-
-    // Each cell's transfers happen at once, in the order visited (forwards
-    // one tick, backwards the next, so neither way is favoured). Every
-    // transfer goes from a higher level to a lower one and never past
-    // level, so the water's potential energy only ever falls: it must come
-    // to rest, and then sleeps. (Worked out all together from the state
-    // before the tick instead, flows can chase each other round for ever.)
-    const back = this.stats.ticks & 1;
-    for (let n = 0; n < batch.length; n++) {
-      const k = batch[back ? batch.length - 1 - n : n];
-      const x = k % sx, t = (k - x) / sx, y = t % sy, z = (t - y) / sy;
-      this.flow(x, y, z);
-    }
+    return batch;
   }
 
   /** A cell's volume changed: wake it and its neighbours, wash away plants, tell FluidCore. */
@@ -271,6 +277,12 @@ export class FluidSim {
     const vol = this.vol(x, y, z);
     if (!vol) return;
     const source = this.isSource(x, y, z);
+    // A source holds its level: overfill (pressure) in one would push water
+    // out that it never loses, round and round for ever. It just sits full.
+    if (source && vol > this.cap(x, y, z)) {
+      this.addDelta(x, y, z, this.cap(x, y, z) - vol);
+      return;
+    }
     const speed = FLUIDS[FLUID.WATER].speed;
     let remaining = vol;
     const give = (nx, ny, nz, f) => {
@@ -344,7 +356,8 @@ export class FluidSim {
     // Up: overfill goes up, where it can.
     // (All of it, at once: held back, a cell fed from the side and below can
     // fill faster than it empties.)
-    if (remaining > cap && y + 1 < w.sy && this.open(x, y + 1, z)) give(x, y + 1, z, remaining - cap);
+    // (Not from a source: it would never lose the overfill, and pump it up for ever.)
+    if (!source && remaining > cap && y + 1 < w.sy && this.open(x, y + 1, z)) give(x, y + 1, z, remaining - cap);
   }
 
   /** Put fluid pushed out of voxels that became solid back into open cells nearby: upwards first. */

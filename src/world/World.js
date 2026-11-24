@@ -353,7 +353,7 @@ export class World {
    * in a column, the height of its surface above the voxel's bottom (the same
    * units). Null if there's no fluid in or around the chunk.
    */
-  buildFluidPadded(cx, cy, cz) {
+  buildFluidPadded(cx, cy, cz, withSurface = false) {
     let any = false;
     for (let dz = -1; dz <= 1 && !any; dz++)
       for (let dy = -1; dy <= 1 && !any; dy++)
@@ -389,6 +389,36 @@ export class World {
           floor[i] = Math.round(this.floorOffset(gx, gy, gz) * 1024);
         }
     if (!wet) return null;
-    return { mat, shape, fluid, floor, size: s, pad: P, origin: [ox, oy, oz] };
+    const out = { mat, shape, fluid, floor, size: s, pad: P, origin: [ox, oy, oz] };
+    if (withSurface) {
+      // For the contoured surface (fluidSurface.js): the terrain's crossings
+      // (as buildPadded), and FluxSim's flow through each voxel's +x and +z faces.
+      const et = new Uint8Array(N * N * N * 3), en = new Uint8Array(N * N * N * 6);
+      const flux = new Float32Array(N * N * N * 2);
+      for (let z = 0, i = 0; z < N; z++)
+        for (let y = 0; y < N; y++)
+          for (let x = 0; x < N; x++, i++) {
+            const gx = ox + x - P, gy = oy + y - P, gz = oz + z - P;
+            if (!this.inBounds(gx, gy, gz)) continue;
+            const c = this.chunkAt(gx, gy, gz);
+            const li = c.index(gx & this.mask, gy & this.mask, gz & this.mask);
+            if (c.flux && fluid[i]) { flux[i * 2] = c.flux[li * 2]; flux[i * 2 + 1] = c.flux[li * 2 + 1]; }
+            if (!c.t) continue;
+            for (let a = 0; a < 3; a++) {
+              const j = a === 0 ? i + 1 : a === 1 ? i + N : i + N * N;
+              if (j >= mat.length) continue;
+              // Only where terrain meets something that isn't (that's where crossings are).
+              const tHere = mat[i] && mat[i] !== 255 && !shape[i], tThere = mat[j] && mat[j] !== 255 && !shape[j];
+              if (tHere === tThere) continue;
+              et[i * 3 + a] = c.t[li * 3 + a];
+              en[(i * 3 + a) * 2] = c.n[(li * 3 + a) * 2];
+              en[(i * 3 + a) * 2 + 1] = c.n[(li * 3 + a) * 2 + 1];
+            }
+          }
+      out.et = et;
+      out.en = en;
+      out.flux = flux;
+    }
+    return out;
   }
 }

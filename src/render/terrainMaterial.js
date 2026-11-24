@@ -264,6 +264,7 @@ export function createChunkMaterials(shadow, water = null) {
     uWaterHeight: { value: new THREE.DataTexture(new Float32Array([-1000, 0]), 1, 1, THREE.RGFormat, THREE.FloatType) },
     uWorldSize: { value: new THREE.Vector2(1, 1) },
     uWaterOn: { value: 0 },
+    uFilmOn: { value: 0 },
   };
   const { photo, texture, normals, layerOf, layerScale, layerStoch } = textureArray();
   // Without the photographic textures: the pixel-art texturing and lighting.
@@ -350,10 +351,13 @@ export function createChunkMaterials(shadow, water = null) {
       if (vBlend > 0) s = terrainTexture(vPos, n, ivec3(vBlend & 255, (vBlend >> 8) & 255, (vBlend >> 16) & 255), vCorner);
       else s = surface(vPos, n, vLocal, vMat);
       vec4 tex = s.col;
-      // Water: ground under it is wet (a little darker, glossier), fading in
-      // over the first few centimetres so the waterline isn't a hard edge.
+      // Water: ground under it is wet (a little darker, glossier, with
+      // caustics), fading in from 10 to 30 cm under: by height, so smoothly;
+      // not under shallow sheets, whose 0.5 m columns of water data would
+      // show through as blobs (the water's own surface tints those).
       float under = underWater(vPos);
-      float wet = smoothstep(0.0, 0.05, under) * (tex.a > 0.5 ? 1.0 : 0.0);
+      float wet = smoothstep(0.1, 0.3, under) * (tex.a > 0.5 ? 1.0 : 0.0);
+      if (wet > 0.0) wet *= waterLevelness(vPos);
       // Shallow water is drawn right here on the ground: dark, glossy, tinted,
       // with streaks where it runs downhill. It follows the smooth ground
       // exactly, however the voxels step.

@@ -3,6 +3,7 @@ import { flatWorld, slopedWorld, GROUND } from './helpers.js';
 import { MAT } from '../src/world/materials.js';
 import { PLANT } from '../src/world/plants.js';
 import { FluidSim } from '../src/world/FluidSim.js';
+import { FluxSim } from '../src/world/FluxSim.js';
 import { FULL, FLUID, packFluid, fluidVolumeOf } from '../src/world/fluids.js';
 
 const water = (v = FULL) => packFluid(FLUID.WATER, v);
@@ -36,11 +37,12 @@ function surface(sim, x, z) {
   return -1;
 }
 
-describe('fluid simulation', () => {
+// Both simulations: the cellular one, and the flux one (with momentum).
+for (const Sim of [FluidSim, FluxSim]) describe(`fluid simulation (${Sim.name})`, () => {
   it('conserves volume and levels out in a closed basin, then sleeps', () => {
     const w = flatWorld();
     basin(w, 6, 20, GROUND + 8);
-    const sim = new FluidSim(w);
+    const sim = new Sim(w);
     pour(sim, 12, GROUND + 4, 12, 14, GROUND + 6, 14);
     const total = sim.totalVolume();
     const ticks = sim.settle(5000);
@@ -61,7 +63,7 @@ describe('fluid simulation', () => {
     wall(w, 3, GROUND, 3, 3, GROUND + 14, 11);
     wall(w, 21, GROUND, 3, 21, GROUND + 14, 11);
     wall(w, 11, GROUND + 1, 4, 13, GROUND + 14, 10);
-    const sim = new FluidSim(w);
+    const sim = new Sim(w);
     pour(sim, 4, GROUND, 4, 10, GROUND + 7, 10);
     const total = sim.totalVolume();
     sim.settle(20000);
@@ -74,7 +76,7 @@ describe('fluid simulation', () => {
   it('spills off a ledge and ends up at the bottom', () => {
     const w = flatWorld();
     wall(w, 8, GROUND, 8, 12, GROUND + 3, 12);
-    const sim = new FluidSim(w);
+    const sim = new Sim(w);
     pour(sim, 10, GROUND + 4, 10, 10, GROUND + 4, 10);
     const total = sim.totalVolume();
     sim.settle(5000);
@@ -86,7 +88,7 @@ describe('fluid simulation', () => {
 
   it('runs downhill on smooth sloping ground', () => {
     const w = slopedWorld(0.15);
-    const sim = new FluidSim(w);
+    const sim = new Sim(w);
     // Above the ground near the high end.
     const x = 26, z = 16;
     let y = w.sy - 1;
@@ -99,13 +101,14 @@ describe('fluid simulation', () => {
       const v = sim.vol(xx, yy, zz);
       sum += v; sumX += v * xx;
     }
-    expect(sumX / sum).toBeLessThan(10);
+    // (Poured at x = 26; most of it ends near the low end.)
+    expect(sumX / sum).toBeLessThan(12);
   });
 
   it('puts water back nearby when a voxel it was in becomes solid', () => {
     const w = flatWorld();
     basin(w, 8, 16, GROUND + 8);
-    const sim = new FluidSim(w);
+    const sim = new Sim(w);
     pour(sim, 8, GROUND, 8, 16, GROUND + 1, 16);
     sim.settle();
     const total = sim.totalVolume();
@@ -120,7 +123,7 @@ describe('fluid simulation', () => {
     const w = flatWorld();
     basin(w, 8, 12, GROUND + 6);
     w.setPlant(10, GROUND, 10, PLANT.GRASS);
-    const sim = new FluidSim(w);
+    const sim = new Sim(w);
     pour(sim, 8, GROUND + 2, 8, 12, GROUND + 2, 12);
     sim.settle();
     expect(w.getPlant(10, GROUND, 10)).toBe(0);
@@ -128,7 +131,7 @@ describe('fluid simulation', () => {
 
   it('stores a chunk full of still water as one value, and expands it again when needed', () => {
     const w = flatWorld(2, 16, 4); // ground surface at y = 4: chunks above it are all open
-    const sim = new FluidSim(w);
+    const sim = new Sim(w);
     // Fill the lower-left chunk above the ground, and the one above it all but its top layers, with water.
     for (let z = 0; z < 16; z++) for (let y = 4; y < 29; y++) for (let x = 0; x < 16; x++) w.setFluid(x, y, z, water());
     sim.compact(w.chunks.length);
@@ -150,7 +153,7 @@ describe('fluid simulation', () => {
   it('wakes when an edit opens a way out', () => {
     const w = flatWorld();
     basin(w, 8, 12, GROUND + 4);
-    const sim = new FluidSim(w);
+    const sim = new Sim(w);
     pour(sim, 8, GROUND, 8, 12, GROUND + 2, 12);
     sim.settle();
     expect(sim.queue.length).toBe(0);

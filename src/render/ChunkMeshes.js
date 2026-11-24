@@ -40,6 +40,8 @@ export class ChunkMeshes {
     this.solid = solid;
     this.foliageMaterials = foliage;
     this.waterMaterial = water;
+    /** Mesh water as the contoured surface (fluidSurface.js, for FluxSim) rather than the cellular one's mesher. */
+    this.waterSurface = false;
     // Water: its own meshes, re-meshed separately (and at most WATER_HZ per chunk) as it moves.
     this.water = new Array(world.chunks.length).fill(null);
     this.waterList = [];
@@ -107,7 +109,7 @@ export class ChunkMeshes {
       if (!this.idle.length) break;
       world.fluidDirty.delete(index);
       const [cx, cy, cz] = world.chunkCoords(index);
-      const padded = world.buildFluidPadded(cx, cy, cz);
+      const padded = world.buildFluidPadded(cx, cy, cz, this.waterSurface);
       this.waterVersion[index]++;
       if (!padded) {
         this.setWater(index, null);
@@ -117,8 +119,8 @@ export class ChunkMeshes {
       this.waterInFlight[index] = true;
       this.waterSent[index] = now;
       worker.postMessage(
-        { type: 'fluid', index, version: this.waterVersion[index], ...padded },
-        [padded.mat.buffer, padded.shape.buffer, padded.fluid.buffer, padded.floor.buffer],
+        { type: 'fluid', index, version: this.waterVersion[index], surface: this.waterSurface, ...padded },
+        [padded.mat.buffer, padded.shape.buffer, padded.fluid.buffer, padded.floor.buffer, ...(padded.et ? [padded.et.buffer, padded.en.buffer, padded.flux.buffer] : [])],
       );
     }
   }

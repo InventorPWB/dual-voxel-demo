@@ -55,6 +55,8 @@ export class Player {
     this.waterLevel = -Infinity;
     this.againstWall = false;
     this.onSplash = null;
+    /** (x, y, z voxel, out) => water velocity [x, z] in m/s, if the simulation knows it (else guessed from the slope). */
+    this.currentAt = null;
   }
 
   spawn(x, y, z) {
@@ -201,6 +203,11 @@ export class Player {
     this.underwater = se > eye;
     this.waterLevel = S;
     if (S === -Infinity) return { depth: 0, flow: [0, 0] };
+    // The water's own velocity, where the simulation has one (FluxSim).
+    if (this.currentAt) {
+      const v = this.currentAt(vx, Math.floor((p.y + 0.3) / V), vz, [0, 0]);
+      return { depth: Math.max(0, S - p.y), flow: [v[0] * 0.6, v[1] * 0.6] };
+    }
     // Surface slope from the columns either side, at the same layer.
     const at = (x, z) => {
       const s = w.waterSurface(x, sy, z);

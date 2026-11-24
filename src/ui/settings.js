@@ -56,6 +56,10 @@ export const SETTINGS = [
   },
   { type: 'section', label: 'Water' },
   {
+    key: 'fluxWater', label: 'Water with momentum (new)', type: 'toggle', value: true,
+    hint: 'The new water: flows with momentum (rivers run on, floods surge, ripples cross a pond and fade), drawn as one smooth surface traced like the terrain, waterfalls included. Off: the earlier cellular water. Changing it reloads the page.',
+  },
+  {
     key: 'waterEffects', label: 'Water effects', type: 'toggle', value: true, requires: 'shaderLighting',
     hint: 'Water refracts and tints what\'s under it by its depth, with foam along the shore and caustics on the bed. Off: a plain see-through surface (cheaper).',
   },

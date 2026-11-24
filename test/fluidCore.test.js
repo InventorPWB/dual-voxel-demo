@@ -1,7 +1,10 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach } from 'vitest';
 import { flatWorld, GROUND } from './helpers.js';
 import { MAT } from '../src/world/materials.js';
 import { FluidSim } from '../src/world/FluidSim.js';
+import { FluxSim } from '../src/world/FluxSim.js';
+
+let Sim = FluidSim;
 import { FluidCore, TILE } from '../src/world/fluidCore.js';
 import { FULL, FLUID, packFluid } from '../src/world/fluids.js';
 
@@ -12,14 +15,15 @@ import { FULL, FLUID, packFluid } from '../src/world/fluids.js';
 function pit(x0, x1, z0, z1, deep = 4) {
   const w = flatWorld(3, 16);
   for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) for (let y = GROUND - deep; y < GROUND; y++) w.setMat(x, y, z, 0);
-  const sim = new FluidSim(w);
+  const sim = new Sim(w);
   for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) for (let y = GROUND - deep; y < GROUND; y++) w.setFluid(x, y, z, packFluid(FLUID.WATER, FULL));
   const core = new FluidCore(w, sim);
   core.rebuild(true);
   return { w, sim, core };
 }
 
-describe('derived sources', () => {
+for (const S of [FluidSim, FluxSim]) describe(`derived sources (${S.name})`, () => {
+  beforeEach(() => { Sim = S; });
   it('makes the middle of a 12 m pool a source, but not a 4 m pool or a 1 m channel', () => {
     expect(pit(4, 27, 4, 27).core.coreCount).toBeGreaterThan(0);
     expect(pit(4, 11, 4, 11).core.coreCount).toBe(0);

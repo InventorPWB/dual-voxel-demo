@@ -32,6 +32,9 @@ export class WaterHeight {
       uWaterHeight: { value: this.texture },
       uWorldSize: { value: new THREE.Vector2(sx * VOXEL, sz * VOXEL) },
       uWaterOn: { value: 1 },
+      // Paint shallow water on the ground (waterFilm): for the cellular water, whose
+      // mesher leaves it out. The contoured surface draws it itself.
+      uFilmOn: { value: 1 },
     };
   }
 
@@ -87,6 +90,7 @@ export const WATER_GLSL = /* glsl */ `
   uniform highp sampler2D uWaterHeight;
   uniform vec2 uWorldSize;
   uniform float uWaterOn;
+  uniform float uFilmOn;
   float underWater(vec3 p) {
     if (uWaterOn < 0.5) return -1.0;
     vec2 w = texture(uWaterHeight, p.xz / uWorldSize).rg;
@@ -97,13 +101,22 @@ export const WATER_GLSL = /* glsl */ `
     // smooth ground poking about in its voxels), not anything lower nearby.
     return below <= w.g + 0.25 ? below : -1.0;
   }
+  // How level the water over p is (1 level, 0 steep: a cascade). Under steep
+  // water the columns' levels differ a lot, and blending them makes blobs.
+  float waterLevelness(vec3 p) {
+    vec2 uv = p.xz / uWorldSize, e = vec2(0.5, 0.0) / uWorldSize;
+    float a = texture(uWaterHeight, uv - e.xy).r, b = texture(uWaterHeight, uv + e.xy).r;
+    float c = texture(uWaterHeight, uv - e.yx).r, d = texture(uWaterHeight, uv + e.yx).r;
+    if (min(min(a, b), min(c, d)) < -100.0) return 1.0;
+    return 1.0 - smoothstep(0.1, 0.25, length(vec2(b - a, d - c)));
+  }
   // Shallow water, drawn on the ground itself rather than as a surface (the
   // water surface fades out below about 18 cm): how much (0..1), and, where it
   // runs downhill, which way (unit xz, out) and how much it's running (0..1, out).
   float waterFilm(vec3 p, out vec2 dir, out float run) {
     dir = vec2(0.0);
     run = 0.0;
-    if (uWaterOn < 0.5) return 0.0;
+    if (uWaterOn < 0.5 || uFilmOn < 0.5) return 0.0;
     vec2 uv = p.xz / uWorldSize;
     vec2 w = texture(uWaterHeight, uv).rg;
     if (w.r < -100.0 || w.g <= 0.003 || w.r - p.y < -0.08) return 0.0;

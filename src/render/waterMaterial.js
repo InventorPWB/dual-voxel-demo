@@ -26,6 +26,11 @@ export function createWaterMaterial(shadow, extra = {}) {
     uOpaque: { value: null },
     uOpaqueDepth: { value: null },
     uScreen: { value: new THREE.Vector2(1, 1) },
+    // Depths (metres) over which the surface fades in: see fade in the shader.
+    uFade: { value: new THREE.Vector2(0.08, 0.18) },
+    // From the mesh's flow attribute to a speed (about m/s): the cellular mesher's
+    // is a surface slope, the contoured one's the flux water's own flow.
+    uFlowScale: { value: 18 },
     ...extra,
   };
 
@@ -50,6 +55,8 @@ export function createWaterMaterial(shadow, extra = {}) {
 
   const fragmentShader = /* glsl */ `
     uniform float uTime;
+    uniform vec2 uFade;
+    uniform float uFlowScale;
     ${LIGHTING_GLSL}
     #ifdef REFRACT
       uniform sampler2D uOpaque;
@@ -101,9 +108,9 @@ export function createWaterMaterial(shadow, extra = {}) {
       bool below = !gl_FrontFacing;
       float t = uTime;
       // (The mesh's flow is the surface's slope, small even in a brisk river: scaled up to a speed.)
-      vec2 flow = vFlow.xy * 18.0;
+      vec2 flow = vFlow.xy * uFlowScale;
       float speed = length(flow);
-      if (speed > 1.5) { flow *= 1.5 / speed; speed = 1.5; }
+      if (speed > 2.5) { flow *= 2.5 / speed; speed = 2.5; }
       float falling = vFlow.z;
       bool wall = abs(gn.y) < 0.5;
 
@@ -154,14 +161,21 @@ export function createWaterMaterial(shadow, extra = {}) {
       #endif
       vec3 reflection = sky + S * glint * uSpecularScale;
 
-      // Falling and fast water turns white.
       // Falling water turns white; small cascades and fast water a little.
-      float white = falling > 0.5 ? 0.2 : wall ? 0.15 : smoothstep(1.1, 1.5, speed) * 0.2;
+      float white = falling > 0.5 ? 0.2 : wall ? 0.15 : 0.0;
+      // Fast water breaks into white streaks running downhill (rapids, a
+      // shallow stream on a slope): a moving pattern, not a wash over it all.
+      if (speed > 0.15 && !wall) {
+        vec2 dir = flow / speed;
+        vec2 q = vec2(dot(vPos.xz, vec2(-dir.y, dir.x)), dot(vPos.xz, dir));
+        float st = vnoise(vec2(q.x * 5.0, q.y * 1.2 - t * 3.0 * speed)) * 0.6 + vnoise(vec2(q.x * 2.0 + 3.0, q.y * 0.6 - t * 2.0 * speed)) * 0.4;
+        white = max(white, smoothstep(0.55, 0.8, st) * smoothstep(0.15, 0.7, speed) * 0.55);
+      }
       // The surface fades in with depth, from 8 to 18 cm: shallower water is
       // drawn on the ground under it instead (waterFilm in waterHeight.js),
       // so the shallows, shores and little cascades follow the smooth ground
       // and nothing pops in or out cell by cell.
-      float fade = smoothstep(0.08, 0.18, vWater);
+      float fade = smoothstep(uFade.x, uFade.y, vWater);
       vec3 body = mix(bodyColor, foamColor, white);
       float bodyAlpha = mix(0.62, 0.95, white);
 
@@ -172,17 +186,28 @@ export function createWaterMaterial(shadow, extra = {}) {
         vec2 ruv = uv + n.xz * 0.04 * clamp((texture(uOpaqueDepth, uv).r - surf) * 0.5, 0.0, 1.0);
         float behind = texture(uOpaqueDepth, ruv).r;
         if (behind < surf) { ruv = uv; behind = texture(uOpaqueDepth, uv).r; }
-        float thick = max(behind - surf, 0.0);
+        // (Running water is shaded as if at least 30 cm deep: a stream racing
+        // down a slope is only a centimetre or two of water, but should still
+        // read as the same stream, not vanish into the sand.)
+        float thick = max(max(behind - surf, 0.0), 0.3 * smoothstep(0.1, 0.6, speed));
         // Light crossing the water: red goes first, then green (Beer–Lambert, per metre).
         vec3 through = exp(-vec3(0.45, 0.09, 0.07) * (thick + 0.25) * 1.6);
         vec3 scene = texture(uOpaque, ruv).rgb;
         // Scattered light builds up with depth; the ground fades into it
         // (a little even in the shallows, so they read as water).
         float murk = 0.1 + 0.9 * (1.0 - exp(-thick * 0.35));
+        // Very thin water: the ground under it is wet (darker), and its
+        // surface broken, so it hardly mirrors the sky.
+        float thin = 1.0 - smoothstep(0.02, 0.15, thick);
+        scene *= 1.0 - 0.25 * thin;
+        // (Not running water: its broken surface catches the light all the more.)
+        F *= 1.0 - 0.7 * thin * (1.0 - smoothstep(0.1, 0.6, speed));
         vec3 transmitted = scene * through + body * murk;
         // Foam where the water's thin, along the shore.
-        float foam = (1.0 - smoothstep(0.01, 0.1, thick)) * smoothstep(0.35, 0.75, vnoise(vPos.xz * 5.0 + t * 0.4)) * (below ? 0.0 : 1.0);
-        transmitted = mix(transmitted, foamColor, foam * 0.45 + white * 0.6);
+        // (Only in the last few centimetres at the water's edge, and faint: a
+        // whole shallow sheet is thin, and foamed all over it turns milky.)
+        float foam = (1.0 - smoothstep(0.005, 0.03, thick)) * smoothstep(0.45, 0.8, vnoise(vPos.xz * 5.0 + t * 0.4)) * (below ? 0.0 : 1.0);
+        transmitted = mix(transmitted, foamColor, foam * 0.2 + white * 0.5);
         vec3 color = transmitted * (1.0 - F) + reflection * F;
         color = below ? color : fog(color, vDepth, vPos);
         outColor = vec4(mix(texture(uOpaque, uv).rgb, color, fade), 1.0);

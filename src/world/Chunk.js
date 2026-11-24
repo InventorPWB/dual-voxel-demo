@@ -28,6 +28,7 @@ export class Chunk {
     this.plant = null; // Uint16Array(n)
     this.fluid = null; // Uint16Array(n)
     this.fluidUniform = 0;
+    this.flux = null; // Float32Array(n * 2): flow through each voxel's +x and +z faces last tick (FluxSim)
   }
 
   /** The fluid array, expanding a uniform chunk into one. */
