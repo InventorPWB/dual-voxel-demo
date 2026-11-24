@@ -1,5 +1,6 @@
 import { meshChunk } from './dualContour.js';
 import { meshFoliage, DEFAULT_FOLIAGE_OPTIONS } from './foliage.js';
+import { meshFluid } from './fluidMesh.js';
 
 let crisp = new Float32Array(256);
 let scale = 1;
@@ -14,6 +15,15 @@ self.onmessage = (e) => {
   }
   if (msg.type === 'options') {
     foliageOptions = msg.foliage;
+    return;
+  }
+  if (msg.type === 'fluid') {
+    const t0 = performance.now();
+    const water = meshFluid(msg, scale);
+    self.postMessage(
+      { type: 'fluid', index: msg.index, version: msg.version, ms: performance.now() - t0, water },
+      [water.position.buffer, water.normal.buffer, water.flow.buffer, water.depth.buffer],
+    );
     return;
   }
   if (msg.type === 'mesh') {

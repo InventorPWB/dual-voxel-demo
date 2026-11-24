@@ -54,6 +54,15 @@ export const SETTINGS = [
     key: 'vignette', label: 'Vignette', type: 'toggle', value: true, requires: 'shaderLighting',
     hint: 'Slightly darker corners.',
   },
+  { type: 'section', label: 'Water' },
+  {
+    key: 'waterEffects', label: 'Water effects', type: 'toggle', value: true, requires: 'shaderLighting',
+    hint: 'Water refracts and tints what\'s under it by its depth, with foam along the shore and caustics on the bed. Off: a plain see-through surface (cheaper).',
+  },
+  {
+    key: 'waterSim', label: 'Water flows', type: 'toggle', value: true,
+    hint: 'Run the water simulation. Off: water stays exactly where it is (for looking at things, or debugging).',
+  },
   { type: 'section', label: 'Plants' },
   {
     key: 'leafInterior', label: 'Leaves inside crowns', type: 'toggle', value: true,

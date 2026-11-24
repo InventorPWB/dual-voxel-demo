@@ -24,6 +24,8 @@ export const TOOLS = [
   { kind: 'tool', id: 'shovel', name: 'Shovel', use: 'Left mouse digs · right mouse raises ground', radius: 2 },
   { kind: 'tool', id: 'trowel', name: 'Trowel', use: 'Hold to smooth', radius: 2 },
   { kind: 'tool', id: 'level', name: 'Level', use: 'Hold to flatten to the height you clicked', radius: 2.5 },
+  { kind: 'tool', id: 'bucket', name: 'Bucket', use: 'Left mouse scoops up a cubic metre of water · right mouse pours it out', radius: 0.6 },
+  { kind: 'tool', id: 'water', name: 'Water', use: 'Hold right mouse to flood up to the height you clicked · hold left mouse to soak water up', radius: 2.5 },
 ];
 
 export const TOOL = Object.fromEntries(TOOLS.map((t) => [t.id, t]));
@@ -91,7 +93,7 @@ export function defaultHotbar() {
     TOOL.level,
     buildItem(MAT.PLANKS, 'block'),
     buildItem(MAT.BRICK, 'slope'),
-    PLANT_ITEM.trunk,
-    PLANT_ITEM.leaves,
+    TOOL.bucket,
+    TOOL.water,
   ];
 }

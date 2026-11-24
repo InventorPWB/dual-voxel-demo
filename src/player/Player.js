@@ -13,6 +13,9 @@ const JUMP_V = 8.6;
 const WALK = 4.6;
 const SPRINT = 7.2;
 const FLY = 13;
+/** Deeper water than this (metres, above the feet) and you swim rather than wade. */
+const SWIM_DEPTH = 1.1;
+const SWIM = 3.2;
 
 const _seg = new THREE.Line3();
 const _box = new THREE.Box3();
@@ -43,6 +46,15 @@ export class Player {
     this.flying = false;
     this.onGround = false;
     this.camY = 0;
+    // Water: whether the eye is under, whether the body's in it, and the
+    // last surface level found (metres; -Infinity if dry). onSplash(pos, speed)
+    // fires when you fall in.
+    this.underwater = false;
+    this.inWater = false;
+    this.wasInWater = false;
+    this.waterLevel = -Infinity;
+    this.againstWall = false;
+    this.onSplash = null;
   }
 
   spawn(x, y, z) {
@@ -171,6 +183,35 @@ export class Player {
     return false;
   }
 
+  /**
+   * The water around the player: `depth` (metres of water above the feet; 0
+   * if dry) and `flow` (the current, m/s along x and z, from how the surface
+   * slopes: water runs downhill). Sets `underwater` (the eye is under).
+   */
+  sampleWater() {
+    const w = this.world, V = VOXEL, p = this.pos;
+    const vx = Math.floor(p.x / V), vz = Math.floor(p.z / V);
+    let S = -Infinity, sy = 0;
+    for (let y = Math.floor((p.y + 0.05) / V); y <= Math.floor((p.y + HEIGHT) / V) && S === -Infinity; y++) {
+      S = w.waterSurface(vx, y, vz);
+      sy = y;
+    }
+    const eye = p.y + EYE;
+    const se = w.waterSurface(vx, Math.floor(eye / V), vz);
+    this.underwater = se > eye;
+    this.waterLevel = S;
+    if (S === -Infinity) return { depth: 0, flow: [0, 0] };
+    // Surface slope from the columns either side, at the same layer.
+    const at = (x, z) => {
+      const s = w.waterSurface(x, sy, z);
+      return s === -Infinity ? S : s;
+    };
+    const gx = (at(vx + 1, vz) - at(vx - 1, vz)) / (2 * V), gz = (at(vx, vz + 1) - at(vx, vz - 1)) / (2 * V);
+    const k = 60, max = 2.5;
+    const fx = Math.max(-max, Math.min(max, -gx * k)), fz = Math.max(-max, Math.min(max, -gz * k));
+    return { depth: Math.max(0, S - p.y), flow: [fx, fz] };
+  }
+
   /** Solidity (0..1) at a point in metres: the trilinear field. */
   fieldAt(x, y, z) {
     const w = this.world;
@@ -240,29 +281,58 @@ export class Player {
 
     const v = this.vel;
     const shift = keys.has('ShiftLeft') || keys.has('ShiftRight');
+    const water = this.sampleWater();
     if (this.flying) {
       const up = (keys.has('Space') ? 1 : 0) - (shift ? 1 : 0);
       const k = Math.min(1, dt * 10);
       v.x += (wx * FLY - v.x) * k;
       v.z += (wz * FLY - v.z) * k;
       v.y += (up * FLY - v.y) * k;
+    } else if (water.depth > SWIM_DEPTH) {
+      // Swimming: buoyancy all but cancels gravity, water drags, Space swims
+      // up, and with the head under you swim the way you look.
+      const under = this.underwater;
+      const k = Math.min(1, dt * 3);
+      const pitchUp = under && fwd ? Math.sin(this.pitch) * fwd : 0;
+      const across = under && fwd ? Math.cos(this.pitch) : 1;
+      v.x += (wx * SWIM * across - v.x) * k;
+      v.z += (wz * SWIM * across - v.z) * k;
+      let up = (keys.has('Space') ? 1 : 0) + pitchUp - (shift ? 1 : 0);
+      // Left alone you float up, to rest with the head just out.
+      if (!up && water.depth > SWIM_DEPTH + 0.25) up = under ? 0.5 : 0.4;
+      v.y += (up * SWIM - v.y) * Math.min(1, dt * 2.5) - GRAVITY * 0.04 * dt;
+      // Climbing out: Space against a bank at the surface.
+      if (keys.has('Space') && this.againstWall && water.depth < 1.4) v.y = JUMP_V * 0.75;
     } else {
-      const speed = shift ? SPRINT : WALK;
+      // Wading slows you, the deeper the more.
+      const wade = 1 - 0.55 * Math.min(1, water.depth / SWIM_DEPTH);
+      const speed = (shift ? SPRINT : WALK) * wade;
       const k = Math.min(1, dt * (this.onGround ? 14 : 3));
       v.x += (wx * speed - v.x) * k;
       v.z += (wz * speed - v.z) * k;
-      v.y = Math.max(-50, v.y - GRAVITY * dt);
-      if (keys.has('Space') && this.onGround) { v.y = JUMP_V; this.onGround = false; }
+      v.y = Math.max(water.depth > 0 ? -12 : -50, v.y - GRAVITY * dt);
+      if (keys.has('Space') && this.onGround) { v.y = JUMP_V * (1 - 0.35 * Math.min(1, water.depth / SWIM_DEPTH)); this.onGround = false; }
     }
+    // The current carries you along.
+    if (!this.flying && water.depth > 0.05) {
+      const pull = Math.min(1, water.depth / 0.6) * dt * 4;
+      v.x += water.flow[0] * pull;
+      v.z += water.flow[1] * pull;
+    }
+    this.wasInWater = this.inWater;
+    this.inWater = water.depth > 0.05;
+    if (this.inWater && !this.wasInWater && v.y < -4) this.onSplash?.(this.pos.clone(), -v.y);
 
     if (dt > 0) {
       const dist = Math.hypot(v.x, v.y, v.z) * dt;
       const steps = Math.max(1, Math.ceil(dist / MAX_SUBSTEP));
       const h = dt / steps;
+      this.againstWall = false;
       for (let s = 0; s < steps; s++) {
         const wasGround = this.onGround;
         const c = this.move(v.x * h, v.y * h, v.z * h, !this.flying && wasGround);
         this.onGround = c.ground;
+        if (c.walls.length) this.againstWall = true;
         if (c.ground && v.y < 0) {
           v.y = 0;
           if (this.flying) this.flying = false; // landing ends flight, as in Minecraft

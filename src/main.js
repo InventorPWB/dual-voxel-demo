@@ -9,7 +9,12 @@ import { PostFX } from './render/PostFX.js';
 import { attachMipmaps } from './render/textureArray.js';
 import { hasPhotos } from './render/textures.js';
 import { SunShadow } from './render/SunShadow.js';
-import { ChunkMeshes } from './render/ChunkMeshes.js';
+import { ChunkMeshes, WATER_LAYER } from './render/ChunkMeshes.js';
+import { createWaterMaterial, setWaterRefraction } from './render/waterMaterial.js';
+import { WaterHeight } from './render/waterHeight.js';
+import { Splashes } from './render/Splashes.js';
+import { FluidSim } from './world/FluidSim.js';
+import { FluidCore } from './world/fluidCore.js';
 import { Player } from './player/Player.js';
 import { Interaction } from './items/interaction.js';
 import { defaultHotbar } from './items/items.js';
@@ -46,7 +51,13 @@ const shadow = new SunShadow(renderer, scene);
 let sunAzimuth = SUN_AZIMUTH;
 shadow.setDirection(sunDirection(sunAzimuth));
 attachMipmaps(renderer);
-const chunkMeshes = new ChunkMeshes(world, scene, createChunkMaterials(shadow), createFoliageMaterials(shadow));
+// Water: the simulation, which of it is a source (fluidCore.js), and how it's drawn.
+const fluid = new FluidSim(world);
+const core = new FluidCore(world, fluid);
+const waterHeight = new WaterHeight(world, core);
+const waterMaterial = createWaterMaterial(shadow);
+const chunkMeshes = new ChunkMeshes(world, scene, createChunkMaterials(shadow, waterHeight), createFoliageMaterials(shadow), waterMaterial);
+camera.layers.enable(WATER_LAYER);
 const uTime = lightingUniforms(shadow).uTime;
 chunkMeshes.onChange = () => { shadow.dirty = true; };
 
@@ -77,6 +88,12 @@ function applySettings(key) {
   // The visual settings, applied live.
   post.setEffects({ ao: v.ambientOcclusion, rays: v.sunShafts, bloom: v.bloom, vignette: v.vignette, brightness: v.brightness });
   sky.setClouds(v.clouds);
+  // Water: refraction and the rest need shader lighting's pass of its own.
+  const refract = v.shaderLighting && v.waterEffects;
+  setWaterRefraction(waterMaterial, refract);
+  post.setWater(waterMaterial, WATER_LAYER, refract);
+  waterHeight.setEnabled(refract);
+  fluid.paused = !v.waterSim;
   const lu = lightingUniforms(shadow);
   lu.uSpecularScale.value = v.reflections ? 1 : 0;
   lu.uNormalStrength.value = v.normalMaps ? 1 : 0;
@@ -93,7 +110,21 @@ applySettings();
 settings.onChange = applySettings;
 
 const player = new Player(world, camera, () => chunkMeshes.colliders);
-const interaction = new Interaction({ world, scene, camera, chunkMeshes, player, hotbar });
+const splashes = new Splashes(scene);
+player.onSplash = (pos, speed) => splashes.burst(pos.x, player.waterLevel, pos.z, Math.min(1.5, speed / 8));
+
+const lu0 = lightingUniforms(shadow);
+const airFog = { color: lu0.uFogColor.value.clone(), density: lu0.uFogDensity.value };
+let wasUnderwater = false;
+function setUnderwater(on, time) {
+  post.setUnderwater(on, time);
+  if (on === wasUnderwater) return;
+  wasUnderwater = on;
+  // Without shader lighting, plain fog does it: close and blue-green.
+  lu0.uFogColor.value.copy(on ? new THREE.Color().setHex(0x1d5560, THREE.LinearSRGBColorSpace) : airFog.color);
+  lu0.uFogDensity.value = on ? 0.09 : airFog.density;
+}
+const interaction = new Interaction({ world, scene, camera, chunkMeshes, player, hotbar, fluid, core, onMessage: (m) => hud.flash(m) });
 
 const SPAWN_X = 46.5, SPAWN_Z = 40.5;
 
@@ -110,7 +141,16 @@ player.onFallOut = spawn;
 
 let loaded = false;
 setTimeout(() => {
-  generateWorld(world, 1337, { avoid: [{ x: SPAWN_X, z: SPAWN_Z, r: 10 }] });
+  const { water } = generateWorld(world, 1337, { avoid: [{ x: SPAWN_X, z: SPAWN_Z, r: 10 }] });
+  // The sea and the lake start out still and as sources; the river is set running.
+  core.rebuild(true);
+  if (water) {
+    for (let i = 0; i < water.course.length; i += 4) {
+      const [x, z] = water.course[i];
+      const vx = Math.floor(x / VOXEL), vz = Math.floor(z / VOXEL), vy = Math.floor(water.bed[i] / VOXEL);
+      fluid.wake([vx - 5, vy - 2, vz - 5, vx + 5, Math.ceil(water.lake.level / VOXEL) + 1, vz + 5]);
+    }
+  }
   spawn();
   hud.setLoading('Meshing chunks…');
 }, 30);
@@ -228,7 +268,8 @@ window.addEventListener('keydown', (e) => {
   else if (e.code === 'F3' || e.code === 'Backquote' || e.key === '`') hud.toggleStats();
   else if (e.code === 'Space') {
     const now = performance.now();
-    if (now - lastSpace < 280) { toggleFly(); lastSpace = 0; }
+    // (Not while swimming, where Space is pressed over and over.)
+    if (now - lastSpace < 280 && !player.inWater) { toggleFly(); lastSpace = 0; }
     else lastSpace = now;
   }
 });
@@ -257,7 +298,15 @@ function frame(now) {
     if (!player.flying) hud.flash('Walking');
   }
   interaction.update(dt, locked, keys.has('ShiftLeft') || keys.has('ShiftRight'));
+  if (loaded) {
+    fluid.update(dt, player.pos);
+    core.update();
+    waterHeight.update();
+  }
   chunkMeshes.update(player.pos);
+  splashes.update(dt);
+  // Under water: the view's fogged and tinted (PostFX; plain fog without shader lighting).
+  setUnderwater(player.underwater && !player.flying, now / 1000);
 
   // [ and ] swing the sun around the sky to show the shadows are live.
   const sunSpin = (keys.has('BracketRight') ? 1 : 0) - (keys.has('BracketLeft') ? 1 : 0);
@@ -285,6 +334,7 @@ function frame(now) {
       `Triangles  ${chunkMeshes.triangleCount().toLocaleString()} solid, ${chunkMeshes.foliageTriangleCount().toLocaleString()} foliage\n` +
       `Chunks     ${chunkMeshes.list.length} meshed, ${chunkMeshes.pending} pending\n` +
       `Last mesh  ${chunkMeshes.lastMeshMs.toFixed(1)} ms (${chunkMeshes.workerCount} workers)\n` +
+      `Water      ${fluid.stats.active.toLocaleString()} active, ${fluid.stats.ms.toFixed(1)} ms, ${core.coreCount} source tiles, ${chunkMeshes.waterTriangleCount().toLocaleString()} triangles\n` +
       `Position   ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
       `Chunk      ${Math.floor(p.x / (world.size * VOXEL))} ${Math.floor(p.y / (world.size * VOXEL))} ${Math.floor(p.z / (world.size * VOXEL))}`,
     );
@@ -294,4 +344,4 @@ function frame(now) {
 requestAnimationFrame(frame);
 
 // Handy for poking at the demo from the devtools console.
-if (import.meta.env.DEV) window.demo = { settings, shadow, post, sky, world, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };
+if (import.meta.env.DEV) window.demo = { settings, shadow, post, sky, world, fluid, core, player, interaction, hotbar, hud, chunkMeshes, camera, scene, renderer };

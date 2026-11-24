@@ -10,6 +10,7 @@ import { chop, chopTime, compass, remove, woodChildren } from '../world/chop.js'
 import { SHAPE } from '../world/shapes.js';
 import { meshChunk } from '../mesh/dualContour.js';
 import { averageColor } from '../render/textures.js';
+import { FULL, FLUID, packFluid } from '../world/fluids.js';
 
 const BUILD_REACH = 7; // metres
 /** Pieces placed on natural ground snap to this vertical grid (voxels): 1 m. */
@@ -19,6 +20,10 @@ const DIG_SPEED = 2; // metres per second the surface moves under a held tool
 const BRUSH_HZ = 40;
 const REPEAT_DELAY = 0.3;
 const REPEAT_RATE = 0.18;
+/** A bucketful: one cubic metre (8 voxels). */
+const BUCKET = 8 * FULL;
+/** How fast the water brush floods or soaks up (metres of depth per second). */
+const WATER_RATE = 1.5;
 
 const REMOVE_COLOR = new THREE.Color(0xff5a4a);
 const BLOCKED_COLOR = new THREE.Color(0x888888);
@@ -36,8 +41,12 @@ const BARK_COLOR = new THREE.Color(...averageColor('bark'));
  * a ring showing the brush.
  */
 export class Interaction {
-  constructor({ world, scene, camera, chunkMeshes, player, hotbar }) {
+  constructor({ world, scene, camera, chunkMeshes, player, hotbar, fluid = null, core = null, onMessage = null }) {
     this.world = world;
+    this.fluid = fluid;
+    this.core = core;
+    this.onMessage = onMessage;
+    this.bucket = 0; // water in the bucket (volume units)
     this.chopping = null; // { cell, t }: the axe's stroke under way
     this.camera = camera;
     this.chunkMeshes = chunkMeshes;
@@ -111,9 +120,13 @@ export class Interaction {
     if (item.kind !== 'tool') {
       this.itemAction(button === 0);
       this.repeat = REPEAT_DELAY;
+    } else if (item.id === 'bucket') {
+      this.bucketAction(button === 0);
     } else {
       // Level to whole metres, so a levelled pad lines up with the build grid.
       if (item.id === 'level' && this.hit) this.flattenY = Math.round(this.hit.point.y);
+      // Flood to the height clicked.
+      if (item.id === 'water' && this.hit) this.flattenY = this.hit.point.y;
       this.brushAccum = 1 / BRUSH_HZ; // apply right away
     }
   }
@@ -137,11 +150,16 @@ export class Interaction {
    * ({ leaf: [x, y, z] }, with the voxel face hit). Grass and flowers are
    * looked through.
    */
-  raycast(reach) {
+  raycast(reach, water = false) {
     this.camera.updateMatrixWorld();
     this.raycaster.setFromCamera({ x: 0, y: 0 }, this.camera);
     this.raycaster.far = reach;
     const h = this.raycaster.intersectObjects(this.chunkMeshes.colliders, false)[0];
+    // Water tools aim at the water's surface; everything else through it.
+    if (water) {
+      const wet = this.fluidRay(this.raycaster.ray, h ? h.distance : reach);
+      if (wet) return wet;
+    }
     const leaf = this.leafRay(this.raycaster.ray, h ? h.distance : reach);
     if (leaf) return leaf;
     if (!h) return null;
@@ -157,6 +175,40 @@ export class Interaction {
       hit.wood = [cells[t * 3], cells[t * 3 + 1], cells[t * 3 + 2]];
     }
     return hit;
+  }
+
+  /**
+   * Voxel walk along the ray for the first water within `far` metres: the
+   * point where the ray meets its surface (or enters it from the side), with
+   * { water: true }. Seen from under water, the surface above isn't a hit.
+   */
+  fluidRay(ray, far) {
+    const o = ray.origin, d = ray.direction;
+    const p = [o.x / VOXEL, o.y / VOXEL, o.z / VOXEL], dir = [d.x, d.y, d.z];
+    const cell = p.map(Math.floor);
+    if (this.world.waterSurface(...cell) > o.y) return null; // under water
+    const step = dir.map((v) => (v > 0 ? 1 : -1));
+    const tDelta = dir.map((v) => (v ? Math.abs(1 / v) : Infinity));
+    const tMax = dir.map((v, k) => (v ? ((v > 0 ? cell[k] + 1 - p[k] : p[k] - cell[k]) / Math.abs(v)) : Infinity));
+    const limit = far / VOXEL;
+    let t = 0;
+    while (t <= limit) {
+      const s = this.world.waterSurface(cell[0], cell[1], cell[2]);
+      // (Passing over the water in this cell, above its surface, isn't a hit.)
+      const tExit = Math.min(tMax[0], tMax[1], tMax[2]);
+      if (s > -Infinity && Math.min(p[1] + d.y * t, p[1] + d.y * tExit) <= s / VOXEL) {
+        // Where the ray is at the surface's height, if that's within this cell; else where it entered.
+        let ts = d.y < 0 ? (s / VOXEL - p[1]) / d.y : t;
+        if (ts < t) ts = t;
+        const point = new THREE.Vector3(o.x + d.x * ts * VOXEL, Math.min(s, o.y + d.y * ts * VOXEL), o.z + d.z * ts * VOXEL);
+        return { point, normal: new THREE.Vector3(0, 1, 0), water: cell.slice() };
+      }
+      const axis = tMax[0] < tMax[1] ? (tMax[0] < tMax[2] ? 0 : 2) : tMax[1] < tMax[2] ? 1 : 2;
+      t = tMax[axis];
+      cell[axis] += step[axis];
+      tMax[axis] += tDelta[axis];
+    }
+    return null;
   }
 
   /** Voxel walk (Amanatides and Woo) along the ray for the first targetable plant within `far` metres. */
@@ -304,7 +356,8 @@ export class Interaction {
   update(dt, active, shift) {
     this.shift = shift;
     const item = this.item;
-    this.hit = active && item ? this.raycast(item.kind === 'tool' ? TOOL_REACH : BUILD_REACH) : null;
+    const wet = item && (item.id === 'bucket' || item.id === 'water');
+    this.hit = active && item ? this.raycast(item.kind === 'tool' ? (item.id === 'bucket' ? BUILD_REACH : TOOL_REACH) : BUILD_REACH, wet) : null;
     this.updateGizmos();
     if (!this.hit || !item) return;
 
@@ -515,11 +568,89 @@ export class Interaction {
   /** Brushes never make terrain solid within half a voxel of the player, or where there's solid wood. */
   protect = (x, y, z) => this.player.intersectsVoxel(x, y, z, VOXEL * 0.5) || isSolidWood(this.world.getPlant(x, y, z));
 
+  // ---- water ----------------------------------------------------------------------
+
+  /** Bucket: left mouse scoops up to BUCKET of water where you aim; right mouse pours it out there. */
+  bucketAction(scoop) {
+    const { fluid } = this;
+    if (!this.hit || !fluid) return;
+    if (scoop) {
+      if (!this.hit.water) return;
+      if (this.bucket >= BUCKET) { this.onMessage?.('The bucket is full'); return; }
+      this.bucket += fluid.take(...this.hit.water, BUCKET - this.bucket);
+      this.onMessage?.(this.bucket >= BUCKET ? 'Bucket full' : `Bucket ${Math.round((this.bucket / BUCKET) * 100)}% full`);
+    } else {
+      if (this.bucket <= 0) { this.onMessage?.('The bucket is empty'); return; }
+      const { point, normal: n } = this.hit;
+      let v = [point.x / VOXEL + n.x * 0.3, point.y / VOXEL + n.y * 0.3, point.z / VOXEL + n.z * 0.3].map(Math.floor);
+      if (this.world.isSolid(...v)) v = [v[0], v[1] + 1, v[2]];
+      this.bucket = fluid.deposit(v[0], v[1], v[2], this.bucket);
+      this.onMessage?.(this.bucket ? 'No room to pour it all' : 'Bucket empty');
+    }
+  }
+
+  /**
+   * Water brush: right mouse floods the brush's columns up to the height
+   * you clicked (filling from the ground up, at a steady rate); left mouse
+   * soaks up the water in the brush. Soaking counts as an edit, so a lake
+   * that's soaked away stops being a source at once (see fluidCore.js).
+   */
+  waterBrush(item, dt) {
+    const { fluid, world: w } = this;
+    if (!fluid) return;
+    const r = this.radiusOf(item) / VOXEL;
+    const c = { x: this.hit.point.x / VOXEL, y: this.hit.point.y / VOXEL, z: this.hit.point.z / VOXEL };
+    const rate = Math.round(FULL * dt * WATER_RATE / VOXEL);
+    const touch = (x, y, z, v) => {
+      const before = fluid.vol(x, y, z);
+      if (v === before) return;
+      w.setFluid(x, y, z, packFluid(FLUID.WATER, v));
+      fluid.changed(x, y, z, before, v);
+    };
+    if (this.lmb) {
+      const box = [Math.floor(c.x - r), Math.floor(c.y - r), Math.floor(c.z - r), Math.floor(c.x + r), Math.floor(c.y + r), Math.floor(c.z + r)];
+      for (let z = box[2]; z <= box[5]; z++)
+        for (let y = box[1]; y <= box[4]; y++)
+          for (let x = box[0]; x <= box[3]; x++) {
+            if (Math.hypot(x + 0.5 - c.x, y + 0.5 - c.y, z + 0.5 - c.z) > r) continue;
+            const v = fluid.vol(x, y, z);
+            if (v) touch(x, y, z, Math.max(0, v - rate));
+          }
+      this.core?.edit(box);
+    } else if (this.rmb && this.flattenY !== null) {
+      const level = this.flattenY / VOXEL;
+      // An edit: a source lake flooded higher holds its new level (fluidCore.js).
+      this.core?.edit([Math.floor(c.x - r), Math.floor(level) - 1, Math.floor(c.z - r), Math.floor(c.x + r), Math.floor(level) + 1, Math.floor(c.z + r)]);
+      for (let z = Math.floor(c.z - r); z <= Math.floor(c.z + r); z++)
+        for (let x = Math.floor(c.x - r); x <= Math.floor(c.x + r); x++) {
+          if (Math.hypot(x + 0.5 - c.x, z + 0.5 - c.z) > r) continue;
+          // From the ground up to the level.
+          let y = Math.floor(level);
+          while (y > 0 && !w.isSolid(x, y - 1, z) && level - y < 2 * r + 6) y--;
+          for (; y < level; y++) {
+            if (w.isSolid(x, y, z)) continue;
+            const floor = w.floorOffset(x, y, z);
+            const target = Math.round(Math.min(1 - floor, level - y - floor) * FULL);
+            const v = fluid.vol(x, y, z);
+            if (target > v) {
+              touch(x, y, z, Math.min(target, v + rate));
+              break; // one layer at a time: it fills from the bottom up
+            }
+          }
+        }
+    }
+  }
+
   applyTool(item, dt) {
     const w = this.world;
     const r = this.radiusOf(item) / VOXEL; // voxels
     const { point, normal: n } = this.hit;
     const opts = { protect: this.protect };
+    if (item.id === 'bucket') return;
+    if (item.id === 'water') {
+      this.waterBrush(item, dt);
+      return;
+    }
     // Digging tools also clear the leaves and twigs you aim at, within the
     // brush; solid wood they leave alone.
     if (this.hit.wood) return;
@@ -579,8 +710,8 @@ export class Interaction {
 
     const r = item.kind === 'plant' ? item.radius : this.radiusOf(item);
     const p = this.hit.point;
-    const color = { pickaxe: 0xff8a7c, shovel: this.rmb ? 0x7cff8a : 0xffb07c, trowel: 0x7cd8ff, level: 0xffd34d, axe: 0xffe08a }[item.id] ?? 0x9be07a;
-    if (item.id === 'level') {
+    const color = { pickaxe: 0xff8a7c, shovel: this.rmb ? 0x7cff8a : 0xffb07c, trowel: 0x7cd8ff, level: 0xffd34d, axe: 0xffe08a, bucket: 0x6ab8f0, water: this.lmb ? 0xf0d27c : 0x4aa3df }[item.id] ?? 0x9be07a;
+    if (item.id === 'level' || (item.id === 'water' && this.rmb && this.flattenY !== null)) {
       const y = this.flattenY ?? Math.round(p.y);
       disc.position.set(p.x, y + 0.02, p.z);
       disc.scale.setScalar(r);
@@ -591,7 +722,7 @@ export class Interaction {
       brush.position.copy(p);
       brush.scale.setScalar(r);
       brush.material.color.setHex(color);
-      brush.visible = item.kind === 'tool' && item.id !== 'axe';
+      brush.visible = item.kind === 'tool' && item.id !== 'axe' && item.id !== 'bucket';
       ring.position.copy(p).addScaledVector(this.hit.normal, 0.03);
       ring.quaternion.setFromUnitVectors(new THREE.Vector3(0, 0, 1), this.hit.normal);
     }

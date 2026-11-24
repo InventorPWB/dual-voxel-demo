@@ -23,6 +23,10 @@ Everything is an item in the hotbar. Left mouse breaks or digs, right mouse plac
 | Level | Flatten to the height you clicked (snapped to whole metres, so pads line up with the build grid) | Same |
 | Leaves | Break the metre of leaves you aim at | Place a 1 m block of leaves |
 | Grass | Pull up grass under the brush | Plant grass under the brush (on grass or dirt only) |
+| Bucket | Scoop up a cubic metre of water | Pour it out |
+| Water | Soak up water under the brush | Flood the brush's area up to the height you clicked |
+
+In water you wade (slower the deeper), then swim: you float with your head out, Space swims up, Shift dives, and with your head under, W swims the way you look. Currents carry you along.
 
 Grass and flowers are looked through; leaves can be aimed at.
 
@@ -80,6 +84,16 @@ Grass and flowers are looked through; leaves can be aimed at.
     - **Crown:** dense leaf clusters in two tiers (along and at the end of every limb, then a ring above and inward of those) and on top, so it builds up into a tall dome.
     - **Built as smooth Log terrain:** an exact CSG union of tapered capsules, joined with rounded fillets so there are no creases where parts meet. So each tree leans, forks and spreads differently, and can be dug or chopped like ground.
     - **Thickness limit:** wood stays at least about 1.5 voxels thick, the least the terrain mesher draws reliably; that sets the trunk's minimum width, so the crowns are scaled up to match. Floor plants only grow on soil (grass and dirt).
+- **Water** (`src/world/FluidSim.js`, `fluidCore.js`, `hydrology.js`, `src/mesh/fluidMesh.js`, `src/render/waterMaterial.js`):
+  - **Storage:** a fluid value per empty voxel (volume and type, 16 bits; lava has a type reserved), allocated per chunk only where there's water. A chunk entirely full of still water is kept as one value.
+  - **Simulation:** a cellular automaton on the voxel grid, 20 ticks a second. Water falls into room below, then flows sideways by the difference in level, then overfill goes up. Level counts how far the smooth ground pokes up into a voxel, so gentle slopes and river gradients work. A full cell under more water takes its column's surface as its level, so water finds its level through U-bends and under walls.
+    - Volume is conserved exactly (whole units), and each transfer is made at once, from higher to lower and never past level, so water always comes to rest and then sleeps: only cells near a change are visited.
+    - Edits wake the water around them. A voxel that becomes solid pushes its water out nearby. Deep enough water washes away grass and flowers.
+    - Water farther than 48 m from the player moves only every fourth tick.
+  - **Infinite water, derived from the water itself:** the middle of any large, deep, still body is a source (the body eroded 5 m inward, judged per 2 m tile from each column's depth and surface level). Sources hold their level: they give water without running out and absorb what flows in. So rivers fed by a lake never drain, a river into the sea doesn't raise it, and the sea stays asleep. Ponds and rivers are never sources. A lake you flood yourself becomes one; soak or fill it down and it stops.
+  - **Generation:** a sea basin along the world's lowest edge, flooded to 17 m (caves sealed from it stay dry), a highland lake in a bowl on the mountain's flank, and a river carved from the lake to the sea along the cheapest path, with a bed that falls the whole way.
+  - **Meshing** (on the workers, separately from the ground, at most 10 times a second per chunk): only the surface. Corner heights average the water around them, so the surface is continuous, with smooth normals and per-corner flow. It carries on over the smooth ground beside it and the depth test clips it there, so the shoreline follows the terrain exactly. Level stretches merge into big quads. Walls only where water drops away or meets glass. Every vertex knows how deep the water under it is, and the surface fades in from 8 to 18 cm deep. Shallower water (shallows, shores, water running down slopes and over ledges) is drawn by the ground's own shader instead, as a wet, glossy, tinted film with streaks running downhill, so it follows the smooth ground exactly and never shows the voxel grid. Water in mid-air isn't drawn at all.
+  - **Look:** sky reflection by Fresnel, sun glints, ripples moved along the flow. Under shader lighting, the water is drawn in a pass of its own over a copy of the scene and its depth: refraction, absorption by depth (clear shallows, deep blue-green), shore foam, and caustics and wet darkening on the ground under the water (only within the water that's there: `src/render/waterHeight.js`). Under water the view is tinted and fogged.
 - **Shadows** (`src/render/SunShadow.js`): one 4096² sun shadow map fitted to the whole world (about 4 cm per texel), sampled by every world material through the shared lighting (`src/render/lighting.js`), so blocks, shaped pieces, smooth terrain and foliage all cast and receive shadows alike.
   - Each caster draws the map with its own depth material: plain for opaque surfaces, alpha-tested for glass frames and leaves. Grass and stained glass cast none. Leaves cast without their sway, so the map stays cached.
   - It is only redrawn when a chunk mesh changes or the sun moves (about 1 ms for the whole world). Otherwise shadows cost only a 9-tap hardware PCF lookup per pixel.
@@ -93,12 +107,12 @@ Grass and flowers are looked through; leaves can be aimed at.
 
 | Path | What |
 |---|---|
-| `src/world/` | `World` (voxel storage: materials, shape states, terrain hermite data, plants), shapes, plants, CSG, edit rules, generation, trees, materials, noise |
-| `src/mesh/` | mesher (exact pieces + dual-contoured terrain, per render pass), foliage mesher, worker |
-| `src/render/` | procedural textures and their texture array, shared lighting, chunk and foliage materials, sun shadow, chunk mesh manager (BVH raycasts) |
+| `src/world/` | `World` (voxel storage: materials, shape states, terrain hermite data, plants), shapes, plants, CSG, edit rules, generation, trees, materials, noise; water: fluids, simulation, sources, sea/lake/river generation |
+| `src/mesh/` | mesher (exact pieces + dual-contoured terrain, per render pass), foliage mesher, water mesher, worker |
+| `src/render/` | procedural textures and their texture array, shared lighting, chunk and foliage materials, sun shadow, chunk mesh manager (BVH raycasts), water material, water height texture, splashes |
 | `src/items/` | item registry (tools, plants, material × shape), interaction and in-world previews |
-| `src/player/` | first-person walk/fly and collision |
+| `src/player/` | first-person walk/fly/swim and collision |
 | `src/ui/` | hotbar, inventory, code-drawn icons |
 | `legacy/` | the shelved hybrid design |
 
-In dev builds, `window.demo` exposes the world, player, interaction, hotbar and HUD in the console.
+In dev builds, `window.demo` exposes the world, water (`fluid`, `core`), player, interaction, hotbar and HUD in the console.

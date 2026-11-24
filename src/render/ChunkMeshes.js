@@ -10,6 +10,15 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const COLLIDER_MATERIAL = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
 
+/** Most times a second one chunk's water is re-meshed. */
+const WATER_HZ = 10;
+
+/**
+ * Water's own layer: the camera sees it (main.js enables it), the sun's
+ * shadow camera doesn't, and PostFX can draw it in a pass of its own.
+ */
+export const WATER_LAYER = 2;
+
 /**
  * Keeps the three.js meshes of each chunk in sync with the voxel data. Dirty
  * chunks are re-meshed on a pool of web workers, nearest to the player first.
@@ -25,11 +34,18 @@ const COLLIDER_MATERIAL = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }
  * @param foliage  { materials, shadowMaterials } for the foliage groups
  */
 export class ChunkMeshes {
-  constructor(world, scene, solid, foliage) {
+  constructor(world, scene, solid, foliage, water = null) {
     this.world = world;
     this.scene = scene;
     this.solid = solid;
     this.foliageMaterials = foliage;
+    this.waterMaterial = water;
+    // Water: its own meshes, re-meshed separately (and at most WATER_HZ per chunk) as it moves.
+    this.water = new Array(world.chunks.length).fill(null);
+    this.waterList = [];
+    this.waterInFlight = new Array(world.chunks.length).fill(false);
+    this.waterVersion = new Array(world.chunks.length).fill(0);
+    this.waterSent = new Float64Array(world.chunks.length).fill(-1e9);
     this.meshes = new Array(world.chunks.length).fill(null);
     this.foliage = new Array(world.chunks.length).fill(null);
     this.foliageList = [];
@@ -69,8 +85,94 @@ export class ChunkMeshes {
     return this.world.dirty.size + this.inFlight.filter(Boolean).length;
   }
 
-  /** Dispatch dirty chunks to idle workers, closest to `focus` (metres) first. */
+  /** Dispatch dirty chunks to idle workers, closest to `focus` (metres) first: ground, then water. */
   update(focus) {
+    this.updateSolid(focus);
+    this.updateWater(focus);
+  }
+
+  updateWater(focus) {
+    const { world } = this;
+    if (!this.waterMaterial || !world.fluidDirty.size || !this.idle.length) return;
+    const now = performance.now();
+    const s = world.size * VOXEL;
+    // Running water keeps chunks dirty: farther ones are re-meshed less
+    // often, and the longer one has waited the sooner it goes, so near
+    // water can't starve the rest.
+    const d2 = (i) => dist2(world.chunkCoords(i), focus, s);
+    const order = [...world.fluidDirty].filter((i) => !this.waterInFlight[i] && now - this.waterSent[i] >= (1000 / WATER_HZ) * (1 + Math.sqrt(d2(i)) / 24));
+    const rank = (i) => d2(i) / (1 + Math.min(10, (now - this.waterSent[i]) / 1000)) ** 2;
+    order.sort((a, b) => rank(a) - rank(b));
+    for (const index of order) {
+      if (!this.idle.length) break;
+      world.fluidDirty.delete(index);
+      const [cx, cy, cz] = world.chunkCoords(index);
+      const padded = world.buildFluidPadded(cx, cy, cz);
+      this.waterVersion[index]++;
+      if (!padded) {
+        this.setWater(index, null);
+        continue;
+      }
+      const worker = this.idle.pop();
+      this.waterInFlight[index] = true;
+      this.waterSent[index] = now;
+      worker.postMessage(
+        { type: 'fluid', index, version: this.waterVersion[index], ...padded },
+        [padded.mat.buffer, padded.shape.buffer, padded.fluid.buffer, padded.floor.buffer],
+      );
+    }
+  }
+
+  onWater(msg) {
+    this.waterInFlight[msg.index] = false;
+    if (msg.version !== this.waterVersion[msg.index]) return;
+    const { water } = msg;
+    if (!water.triangles) {
+      this.setWater(msg.index, null);
+      return;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(water.position, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(water.normal, 3));
+    g.setAttribute('flow', new THREE.BufferAttribute(water.flow, 3));
+    g.setAttribute('depth', new THREE.BufferAttribute(water.depth, 1));
+    g.computeBoundingSphere();
+    g.computeBoundingBox();
+    this.setWater(msg.index, g);
+  }
+
+  /** Water mesh of a chunk: drawn only (not collided with or aimed at). */
+  setWater(index, geometry) {
+    let mesh = this.water[index];
+    if (mesh) mesh.geometry.dispose();
+    if (!geometry) {
+      if (mesh) {
+        this.scene.remove(mesh);
+        this.water[index] = null;
+        this.waterList = this.water.filter(Boolean);
+      }
+      return;
+    }
+    if (!mesh) {
+      mesh = new THREE.Mesh(geometry, this.waterMaterial);
+      mesh.matrixAutoUpdate = false;
+      mesh.renderOrder = 1; // after the ground and glass
+      mesh.layers.set(WATER_LAYER);
+      this.water[index] = mesh;
+      this.scene.add(mesh);
+      this.waterList = this.water.filter(Boolean);
+    } else {
+      mesh.geometry = geometry;
+    }
+  }
+
+  waterTriangleCount() {
+    let t = 0;
+    for (const m of this.waterList) t += m.geometry.attributes.position.count / 3;
+    return t;
+  }
+
+  updateSolid(focus) {
     const { world } = this;
     if (!world.dirty.size || !this.idle.length) return;
     const s = world.size * VOXEL;
@@ -99,6 +201,10 @@ export class ChunkMeshes {
 
   onResult(worker, msg) {
     this.idle.push(worker);
+    if (msg.type === 'fluid') {
+      this.onWater(msg);
+      return;
+    }
     this.inFlight[msg.index] = false;
     this.lastMeshMs = msg.ms;
     // A newer request for this chunk is on its way: this result is stale.

@@ -94,5 +94,17 @@ function drawTool(g, id, px) {
     g.beginPath(); g.rect(1.5, 6, 13, 4); metal('#d9a63a');
     g.beginPath(); g.rect(6, 6.9, 4, 2.2); g.fillStyle = '#8fe08a'; g.fill();
     g.beginPath(); g.arc(8, 8, 0.7, 0, Math.PI * 2); g.fillStyle = '#fff'; g.fill();
+  } else if (id === 'bucket' || id === 'bucket:full') {
+    // A wooden pail; full, it shows water at the brim.
+    g.beginPath(); g.moveTo(3, 5); g.lineTo(13, 5); g.lineTo(11.5, 14); g.lineTo(4.5, 14); g.closePath(); metal('#a87a4a');
+    g.strokeStyle = 'rgba(40,30,20,0.7)'; g.lineWidth = 0.7;
+    line(3.6, 8.5, 12.4, 8.5); line(4.2, 11.8, 11.8, 11.8);
+    g.beginPath(); g.arc(8, 5, 5, Math.PI * 1.05, Math.PI * 1.95); g.strokeStyle = '#555'; g.lineWidth = 0.8; g.stroke();
+    if (id === 'bucket:full') { g.beginPath(); g.ellipse(8, 5.4, 4.6, 1, 0, 0, Math.PI * 2); g.fillStyle = '#3d8fc4'; g.fill(); }
+  } else if (id === 'water') {
+    // A drop over a little wave.
+    g.beginPath(); g.moveTo(8, 1.5); g.bezierCurveTo(11, 6, 13, 8, 13, 10); g.arc(8, 10, 5, 0, Math.PI); g.bezierCurveTo(3, 8, 5, 6, 8, 1.5);
+    metal('#4aa3df');
+    g.beginPath(); g.ellipse(6.3, 9.5, 1.1, 2, -0.4, 0, Math.PI * 2); g.fillStyle = 'rgba(255,255,255,0.55)'; g.fill();
   }
 }

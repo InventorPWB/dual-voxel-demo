@@ -8,6 +8,9 @@ export const CHUNK_SIZE = 32;
 /** Edge length of one voxel, in metres. Voxel coords are integers; scene coords are metres. */
 export const VOXEL = 0.5;
 
+/** Voxels of border each side of a chunk its water mesh reads (see buildFluidPadded). */
+export const FLUID_PAD = 2;
+
 const AXES = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
 
 /**
@@ -35,6 +38,13 @@ export class World {
     for (let i = 0; i < nx * ny * nz; i++) this.chunks.push(new Chunk(size));
     /** Indices of chunks whose mesh is out of date. */
     this.dirty = new Set();
+    /** Indices of chunks whose water mesh is out of date. */
+    this.fluidDirty = new Set();
+    /** Fluid pushed out of voxels that became solid: x, y, z, packed, ... (FluidSim puts it back). */
+    this.displaced = [];
+    /** Called with the box of every edit (markDirtyBox): wakes the water there. */
+    this.onEdit = null;
+    this._edge = [0, 0, 0];
   }
 
   chunkIndex(cx, cy, cz) {
@@ -104,10 +114,85 @@ export class World {
     if (!this.inBounds(x, y, z)) return;
     const c = this.chunkAt(x, y, z);
     const i = c.index(x & this.mask, y & this.mask, z & this.mask);
+    if (mat && !c.mat[i]) this.displace(c, i, x, y, z);
+    // (A chunk stored as all one fluid gets its array back first, so a voxel
+    // that opens up starts out dry rather than full.)
+    if (!mat && c.mat[i] && c.fluidUniform) c.ensureFluid();
     c.mat[i] = mat;
     const off = offset && shape ? (offset[0] & 1) << 5 | (offset[1] & 1) << 6 | (offset[2] & 1) << 7 : 0;
     c.shape[i] = mat ? shape | off : 0;
     if (mat && c.plant) c.plant[i] = 0;
+  }
+
+  /** A voxel becoming solid pushes out the fluid it held (FluidSim puts it back nearby). */
+  displace(c, i, x, y, z) {
+    if (!c.hasFluid) return;
+    const f = c.ensureFluid();
+    if (!f[i]) return;
+    this.displaced.push(x, y, z, f[i]);
+    f[i] = 0;
+    this.markFluidDirty(x, y, z);
+  }
+
+  // ---- fluid ------------------------------------------------------------------
+
+  /** Packed fluid (see fluids.js) in voxel (x, y, z); 0 outside the world. */
+  getFluid(x, y, z) {
+    if (!this.inBounds(x, y, z)) return 0;
+    const c = this.chunkAt(x, y, z);
+    if (c.fluid) return c.fluid[c.index(x & this.mask, y & this.mask, z & this.mask)];
+    if (c.fluidUniform && !c.mat[c.index(x & this.mask, y & this.mask, z & this.mask)]) return c.fluidUniform;
+    return 0;
+  }
+
+  /** Set an empty voxel's packed fluid (ignored for solid voxels). Marks its water meshes dirty. */
+  setFluid(x, y, z, packed) {
+    if (!this.inBounds(x, y, z)) return;
+    const c = this.chunkAt(x, y, z);
+    const i = c.index(x & this.mask, y & this.mask, z & this.mask);
+    if (c.mat[i]) return;
+    if (!packed && !c.hasFluid) return;
+    const f = c.ensureFluid();
+    if (f[i] === packed) return;
+    f[i] = packed;
+    this.markFluidDirty(x, y, z);
+  }
+
+  /**
+   * How far smooth ground below pokes up into empty voxel (x, y, z), in
+   * voxels (0..0.5): from the crossing on the vertical edge between the two
+   * voxel centres. Water in the voxel sits on top of it.
+   */
+  floorOffset(x, y, z) {
+    if (y < 1 || !this.isTerrain(x, y - 1, z)) return 0;
+    if (!this.getEdge(x, y - 1, z, 1, this._edge)) return 0;
+    return Math.max(0, this._edge[0] - 0.5);
+  }
+
+  /**
+   * Height (metres) of the surface of the water in voxel (x, y, z), going up
+   * through the water above it; -Infinity if the voxel holds none. (Volume
+   * 4095 is the most a cell holds; a full one is 1024: see fluids.js.)
+   */
+  waterSurface(x, y, z) {
+    let v = this.getFluid(x, y, z) & 4095;
+    if (v < 24) return -Infinity;
+    while (y + 1 < this.sy && (this.getFluid(x, y + 1, z) & 4095) >= 24) {
+      y++;
+      v = this.getFluid(x, y, z) & 4095;
+    }
+    return (y + this.floorOffset(x, y, z) + Math.min(v, 1024) / 1024) * VOXEL;
+  }
+
+  /** Mark the water meshes that draw voxel (x, y, z) out of date. */
+  markFluidDirty(x, y, z) {
+    const s = this.size, P = FLUID_PAD;
+    const cx0 = Math.max(0, Math.floor((x - P) / s)), cx1 = Math.min(this.nx - 1, Math.floor((x + P) / s));
+    const cy0 = Math.max(0, Math.floor((y - P) / s)), cy1 = Math.min(this.ny - 1, Math.floor((y + P) / s));
+    const cz0 = Math.max(0, Math.floor((z - P) / s)), cz1 = Math.min(this.nz - 1, Math.floor((z + P) / s));
+    for (let cz = cz0; cz <= cz1; cz++)
+      for (let cy = cy0; cy <= cy1; cy++)
+        for (let cx = cx0; cx <= cx1; cx++) this.fluidDirty.add(this.chunkIndex(cx, cy, cz));
   }
 
   /** Plant id in voxel (x, y, z) (0 = none). */
@@ -138,6 +223,8 @@ export class World {
     if (!this.inBounds(x, y, z)) return;
     const c = this.chunkAt(x, y, z);
     const i = c.index(x & this.mask, y & this.mask, z & this.mask);
+    if (mat && !c.mat[i]) this.displace(c, i, x, y, z);
+    if (!mat && c.mat[i] && c.fluidUniform) c.ensureFluid();
     c.mat[i] = mat;
     if (!mat) c.shape[i] = 0;
     else if (c.plant) c.plant[i] = 0;
@@ -180,11 +267,20 @@ export class World {
     const cz0 = Math.max(0, Math.floor((z0 - PAD) / s)), cz1 = Math.min(this.nz - 1, Math.floor((z1 + PAD) / s));
     for (let cz = cz0; cz <= cz1; cz++)
       for (let cy = cy0; cy <= cy1; cy++)
-        for (let cx = cx0; cx <= cx1; cx++) this.dirty.add(this.chunkIndex(cx, cy, cz));
+        for (let cx = cx0; cx <= cx1; cx++) {
+          const i = this.chunkIndex(cx, cy, cz);
+          this.dirty.add(i);
+          // Water's shoreline follows the ground: its mesh changes too.
+          if (this.chunks[i].hasFluid) this.fluidDirty.add(i);
+        }
+    this.onEdit?.([x0, y0, z0, x1, y1, z1]);
   }
 
   markAllDirty() {
-    for (let i = 0; i < this.chunks.length; i++) this.dirty.add(i);
+    for (let i = 0; i < this.chunks.length; i++) {
+      this.dirty.add(i);
+      this.fluidDirty.add(i);
+    }
   }
 
   /**
@@ -248,5 +344,51 @@ export class World {
     const uniform = pieces === 0 && plants === 0 && (solid === 0 || solid === N * N * N);
     if (!plants) plant = null;
     return { mat, shape, off, et, en, plant, size: s, origin: [ox, oy, oz], uniform };
+  }
+
+  /**
+   * What a chunk's water mesh needs, padded by FLUID_PAD voxels: materials,
+   * shapes, fluid, and `floor`: for each open voxel, how far ground pokes up
+   * into it (fluid volume units: see floorOffset); for the ground's top voxel
+   * in a column, the height of its surface above the voxel's bottom (the same
+   * units). Null if there's no fluid in or around the chunk.
+   */
+  buildFluidPadded(cx, cy, cz) {
+    let any = false;
+    for (let dz = -1; dz <= 1 && !any; dz++)
+      for (let dy = -1; dy <= 1 && !any; dy++)
+        for (let dx = -1; dx <= 1 && !any; dx++) {
+          const nx = cx + dx, ny = cy + dy, nz = cz + dz;
+          if (nx < 0 || ny < 0 || nz < 0 || nx >= this.nx || ny >= this.ny || nz >= this.nz) continue;
+          any = this.chunks[this.chunkIndex(nx, ny, nz)].hasFluid;
+        }
+    if (!any) return null;
+    const s = this.size, P = FLUID_PAD;
+    const N = s + 2 * P;
+    const mat = new Uint8Array(N * N * N);
+    const shape = new Uint8Array(N * N * N);
+    const fluid = new Uint16Array(N * N * N);
+    const floor = new Uint16Array(N * N * N);
+    const ox = cx * s, oy = cy * s, oz = cz * s;
+    let wet = 0;
+    for (let z = 0, i = 0; z < N; z++)
+      for (let y = 0; y < N; y++)
+        for (let x = 0; x < N; x++, i++) {
+          const gx = ox + x - P, gy = oy + y - P, gz = oz + z - P;
+          mat[i] = this.inBounds(gx, gy, gz) ? this.getMat(gx, gy, gz) : 255; // outside: solid
+          if (mat[i]) {
+            shape[i] = this.getShape(gx, gy, gz);
+            // The ground's top voxel: where its surface is, from the bottom of
+            // the voxel (×1024; 0.5 to 1.5 voxels), for the shoreline.
+            if (mat[i] !== 255 && !shape[i] && !this.isSolid(gx, gy + 1, gz) && gy + 1 < this.sy) {
+              floor[i] = this.getEdge(gx, gy, gz, 1, this._edge) ? Math.round((0.5 + this._edge[0]) * 1024) : 1024;
+            }
+            continue;
+          }
+          if ((fluid[i] = this.getFluid(gx, gy, gz))) wet++;
+          floor[i] = Math.round(this.floorOffset(gx, gy, gz) * 1024);
+        }
+    if (!wet) return null;
+    return { mat, shape, fluid, floor, size: s, pad: P, origin: [ox, oy, oz] };
   }
 }
