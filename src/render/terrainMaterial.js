@@ -3,6 +3,7 @@ import { MATERIALS } from '../world/materials.js';
 import { textureArray } from './textureArray.js';
 import { LIGHTING_GLSL, lightingUniforms, litMaterial } from './lighting.js';
 import { DEPTH_PARAMS, HIDDEN } from './SunShadow.js';
+import { WATER_GLSL } from './waterHeight.js';
 
 export { SKY_COLOR, SUN_AZIMUTH, SUN_ELEVATION, sunDirection } from './lighting.js';
 
@@ -258,7 +259,13 @@ const SURFACE_GLSL = /* glsl */ `
  * Also returns matching depth-only materials for the sun's shadow map:
  * glass frames cast shadows, stained glass casts none.
  */
-export function createChunkMaterials(shadow) {
+export function createChunkMaterials(shadow, water = null) {
+  const waterUniforms = water ? water.uniforms : {
+    uWaterHeight: { value: new THREE.DataTexture(new Float32Array([-1000, 0]), 1, 1, THREE.RGFormat, THREE.FloatType) },
+    uWorldSize: { value: new THREE.Vector2(1, 1) },
+    uWaterOn: { value: 0 },
+    uFilmOn: { value: 0 },
+  };
   const { photo, texture, normals, layerOf, layerScale, layerStoch } = textureArray();
   // Without the photographic textures: the pixel-art texturing and lighting.
   const mode = photo ? {} : { PIXEL_ART: '' };
@@ -324,6 +331,8 @@ export function createChunkMaterials(shadow) {
     ${head}
     ${LIGHTING_GLSL}
     ${SURFACE_GLSL}
+    uniform float uTime;
+    ${WATER_GLSL}
     in vec3 vPos;
     in vec3 vNormal;
     in vec4 vLocal;
@@ -342,12 +351,38 @@ export function createChunkMaterials(shadow) {
       if (vBlend > 0) s = terrainTexture(vPos, n, ivec3(vBlend & 255, (vBlend >> 8) & 255, (vBlend >> 16) & 255), vCorner);
       else s = surface(vPos, n, vLocal, vMat);
       vec4 tex = s.col;
+      // Water: ground under it is wet (a little darker, glossier, with
+      // caustics), fading in from 10 to 30 cm under: by height, so smoothly;
+      // not under shallow sheets, whose 0.5 m columns of water data would
+      // show through as blobs (the water's own surface tints those).
+      float under = underWater(vPos);
+      float wet = smoothstep(0.1, 0.3, under) * (tex.a > 0.5 ? 1.0 : 0.0);
+      if (wet > 0.0) wet *= waterLevelness(vPos);
+      // Shallow water is drawn right here on the ground: dark, glossy, tinted,
+      // with streaks where it runs downhill. It follows the smooth ground
+      // exactly, however the voxels step.
+      vec2 runDir;
+      float run;
+      float film = waterFilm(vPos, runDir, run) * (tex.a > 0.5 ? 1.0 : 0.0);
+      wet = max(wet, film);
       #ifdef PIXEL_ART
-        vec3 color = fog(shade(tex.rgb, vPos, n, vAo, 0.2, 0.0), vDepth, vPos);
+        vec3 color = fog(shade(tex.rgb * mix(1.0, 0.8, wet) * mix(vec3(1.0), vec3(0.6, 0.75, 0.85), film), vPos, n, vAo, 0.2, 0.0), vDepth, vPos);
       #else
-        vec3 albedo = macroVariation(tex.rgb, vPos, vBlend > 0 ? vBlend & 255 : vMat);
+        vec3 albedo = macroVariation(tex.rgb, vPos, vBlend > 0 ? vBlend & 255 : vMat) * mix(1.0, 0.8, wet);
+        albedo *= mix(vec3(1.0), vec3(0.55, 0.7, 0.8), film);
         int sm = vBlend > 0 ? vBlend & 255 : vMat;
-        vec3 color = fog(shadeSurface(albedo, vPos, n, s.n, vAo, 0.2, s.rough, uSpecular[sm]), vDepth, vPos);
+        vec3 color = shadeSurface(albedo, vPos, n, s.n, vAo, 0.2, mix(s.rough * mix(1.0, 0.5, wet), 0.08, film), mix(uSpecular[sm], 1.0, film));
+        #ifdef HDR
+          // Caustics on what's under water: the sun focused by the ripples, fading with depth.
+          if (under > 0.0) color += sunLight() * albedo * caustics(vPos.xz, uTime) * 0.5 * wet * exp(-under * 0.5) * max(n.y, 0.0) * smoothstep(0.0, 0.3, uSunDir.y);
+          if (film * run > 0.0) {
+            // Streaks of white water carried downhill.
+            vec2 q = vec2(dot(vPos.xz, vec2(-runDir.y, runDir.x)), dot(vPos.xz, runDir));
+            float streak = vnoise(vec2(q.x * 7.0, q.y * 1.2 - uTime * 2.2)) * vnoise(vec2(q.x * 3.0 + 4.0, q.y * 0.6 - uTime * 1.4));
+            color += (sunLight() * 0.06 + skyAmbient(vec3(0.0, 1.0, 0.0)) * 0.25) * smoothstep(0.25, 0.6, streak) * film * run;
+          }
+        #endif
+        color = fog(color, vDepth, vPos);
       #endif
       #if defined(CUTOUT)
         if (cutout(tex.a)) discard;
@@ -363,7 +398,7 @@ export function createChunkMaterials(shadow) {
   const make = (defines, extra) => litMaterial(new THREE.ShaderMaterial({
     glslVersion: THREE.GLSL3,
     defines: { ...mode, ...defines },
-    uniforms: { ...lightingUniforms(shadow), ...shared },
+    uniforms: { ...lightingUniforms(shadow), ...shared, ...waterUniforms },
     vertexShader,
     fragmentShader,
     ...extra,

@@ -54,6 +54,23 @@ export const SETTINGS = [
     key: 'vignette', label: 'Vignette', type: 'toggle', value: true, requires: 'shaderLighting',
     hint: 'Slightly darker corners.',
   },
+  { type: 'section', label: 'Water' },
+  {
+    key: 'waterSystem', label: 'Water system', type: 'choice', value: 'spans',
+    options: [
+      ['spans', 'Spans', 'Water as spans per column (a layered heightfield): a stream on a slope is one smooth sheet, with momentum, waterfalls, and dry rooms under water. Changing it reloads the page.'],
+      ['flux', 'Momentum', 'Water per voxel with momentum, drawn as a surface traced like the terrain. Changing it reloads the page.'],
+      ['cells', 'Cellular', 'The first water: per voxel, without momentum. Changing it reloads the page.'],
+    ],
+  },
+  {
+    key: 'waterEffects', label: 'Water effects', type: 'toggle', value: true, requires: 'shaderLighting',
+    hint: 'Water refracts and tints what\'s under it by its depth, with foam along the shore and caustics on the bed. Off: a plain see-through surface (cheaper).',
+  },
+  {
+    key: 'waterSim', label: 'Water flows', type: 'toggle', value: true,
+    hint: 'Run the water simulation. Off: water stays exactly where it is (for looking at things, or debugging).',
+  },
   { type: 'section', label: 'Plants' },
   {
     key: 'leafInterior', label: 'Leaves inside crowns', type: 'toggle', value: true,

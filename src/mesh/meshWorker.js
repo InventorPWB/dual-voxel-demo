@@ -1,5 +1,8 @@
 import { meshChunk } from './dualContour.js';
 import { meshFoliage, DEFAULT_FOLIAGE_OPTIONS } from './foliage.js';
+import { meshFluid } from './fluidMesh.js';
+import { meshFluidSurface } from './fluidSurface.js';
+import { meshSpans } from './spanMesh.js';
 
 let crisp = new Float32Array(256);
 let scale = 1;
@@ -14,6 +17,16 @@ self.onmessage = (e) => {
   }
   if (msg.type === 'options') {
     foliageOptions = msg.foliage;
+    return;
+  }
+  if (msg.type === 'fluid' || msg.type === 'spans') {
+    const t0 = performance.now();
+    // SpanSim's sheet, the contoured surface (FluxSim's water), or the cellular one's.
+    const water = msg.type === 'spans' ? meshSpans(msg, scale) : msg.surface ? meshFluidSurface(msg, scale) : meshFluid(msg, scale);
+    self.postMessage(
+      { type: 'fluid', index: msg.index, version: msg.version, ms: performance.now() - t0, water },
+      [water.position.buffer, water.normal.buffer, water.flow.buffer, water.depth.buffer],
+    );
     return;
   }
   if (msg.type === 'mesh') {

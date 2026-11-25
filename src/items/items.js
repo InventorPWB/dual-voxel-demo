@@ -24,9 +24,12 @@ export const TOOLS = [
   { kind: 'tool', id: 'shovel', name: 'Shovel', use: 'Left mouse digs · right mouse raises ground', radius: 2 },
   { kind: 'tool', id: 'trowel', name: 'Trowel', use: 'Hold to smooth', radius: 2 },
   { kind: 'tool', id: 'level', name: 'Level', use: 'Hold to flatten to the height you clicked', radius: 2.5 },
+  { kind: 'tool', id: 'bucket', name: 'Bucket', use: 'Left mouse scoops up a cubic metre of water · right mouse pours it out', radius: 0.6 },
+  { kind: 'tool', id: 'water', name: 'Water', use: 'Hold right mouse to flood up to the height you clicked · hold left mouse to soak water up', radius: 2.5 },
 ];
 
 export const TOOL = Object.fromEntries(TOOLS.map((t) => [t.id, t]));
+
 
 const buildItems = new Map();
 
@@ -45,6 +48,20 @@ export function buildItem(material, shapeId) {
   }
   return item;
 }
+
+/**
+ * Springs: building pieces water wells up from (see SpanSim): a metre block
+ * gives 100 litres a second, a small block a quarter of that, up to 2 m over
+ * its top. Placed and removed like any piece; bury it and it stops.
+ */
+export const SPRING_ITEMS = [
+  ['block', 'Spring', '100 litres a second'],
+  ['small', 'Small Spring', '25 litres a second'],
+].map(([shape, name, rate]) => ({
+  ...buildItem(MAT.SPRING, shape),
+  name,
+  use: `Right mouse places a spring: water wells up from its top, ${rate}, up to 2 m over it · left mouse removes it`,
+}));
 
 export const PLANT_ITEMS = [
   {
@@ -69,12 +86,12 @@ for (const [name, wood, across] of [['Trunk', 12, '62 cm'], ['Bough', 9, '36 cm'
 export const PLANT_ITEM = { leaves: PLANT_ITEMS[0], grass: PLANT_ITEMS[1], trunk: PLANT_ITEMS[2], branch: PLANT_ITEMS[4] };
 
 /**
- * Inventory layout: tools, plants, terrain (natural ground, one item each:
+ * Inventory layout: tools (and springs), plants, terrain (natural ground, one item each:
  * it places as smooth terrain, not as a shape), then the building grid: one
  * row of shapes per crafted material.
  */
 export const INVENTORY = {
-  tools: TOOLS,
+  tools: [...TOOLS, ...SPRING_ITEMS],
   plants: PLANT_ITEMS,
   terrain: PALETTE.filter((m) => m.natural).map((m) => buildItem(m.id, 'block')),
   rows: PALETTE.filter((m) => !m.natural).map((m) => SHAPES.map((s) => buildItem(m.id, s.id))),
@@ -91,7 +108,7 @@ export function defaultHotbar() {
     TOOL.level,
     buildItem(MAT.PLANKS, 'block'),
     buildItem(MAT.BRICK, 'slope'),
-    PLANT_ITEM.trunk,
-    PLANT_ITEM.leaves,
+    TOOL.bucket,
+    TOOL.water,
   ];
 }

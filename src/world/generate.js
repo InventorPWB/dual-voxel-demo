@@ -3,6 +3,7 @@ import { MAT } from './materials.js';
 import { VOXEL } from './World.js';
 import { fillFromSDF } from './csg.js';
 import { growTrees, growGrass } from './trees.js';
+import { planWater, fillWater } from './hydrology.js';
 
 const smoothstep = (a, b, x) => {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -15,7 +16,7 @@ const smoothstep = (a, b, x) => {
  * are defined in metres and sampled into the 0.5 m voxels the player edits.
  * `avoid` keeps trees clear of places ({ x, z, r } in metres), like the spawn.
  */
-export function generateWorld(world, seed = 1337, { avoid = [] } = {}) {
+export function generateWorld(world, seed = 1337, { avoid = [], withWater = true } = {}) {
   const noise = createNoise3D(seed);
   const { sx, sy, sz } = world;
   const V = VOXEL;
@@ -46,7 +47,12 @@ export function generateWorld(world, seed = 1337, { avoid = [] } = {}) {
   // Height per voxel column (metres), interpolated between column centres.
   const H = new Float32Array(sx * sz);
   for (let z = 0; z < sz; z++) for (let x = 0; x < sx; x++) H[x + sx * z] = heightAt((x + 0.5) * V, (z + 0.5) * V);
+  if (withWater) seaBasin(H, sx, sz, noise);
+  const sandy = H.map((h) => (h < 17.5 ? 1 : 0)); // the lowland, before the river's dug
+  // A lake on the mountain's flank and a river from it down to the sea (shapes H).
+  const water = withWater ? planWater(H, sx, sz, noise, { mountain: { x: mx, z: mz }, avoid }) : null;
   const hAt = (x, z) => H[Math.min(sx - 1, Math.max(0, x)) + sx * Math.min(sz - 1, Math.max(0, z))];
+  const wetAt = (x, z) => sandy[x + sx * z] || (water && water.wet[x + sx * z]);
   const height = (vx, vz) => {
     const fx = vx - 0.5, fz = vz - 0.5;
     const x0 = Math.floor(fx), z0 = Math.floor(fz), tx = fx - x0, tz = fz - z0;
@@ -82,7 +88,7 @@ export function generateWorld(world, seed = 1337, { avoid = [] } = {}) {
     // Steepness: how far the surface leans from level (rise over run is 1/slope).
     const slope = Math.hypot(gx, gz) / Math.max(Math.abs(gy), 1e-3);
     const dd = (d / Math.max(Math.hypot(gx, gy, gz), 0.25)) * V; // metres below the surface
-    if (hAt(x, z) < 17.5 && dd <= 1.5) return MAT.SAND;
+    if (wetAt(Math.min(sx - 1, Math.max(0, x)), Math.min(sz - 1, Math.max(0, z))) && dd <= 1.5) return MAT.SAND;
     if (slope > 1.1) return dd <= 0.6 && slope < 1.6 ? MAT.GRASS : MAT.STONE;
     if (dd <= 0.6) return MAT.GRASS;
     if (dd <= 2.5) return MAT.DIRT;
@@ -90,8 +96,40 @@ export function generateWorld(world, seed = 1337, { avoid = [] } = {}) {
   };
 
   fillFromSDF(world, sdf, matAt);
-  growTrees(world, seed + 1, { avoid });
+  // Trees keep clear of the lake and the river.
+  const clear = water ? [{ x: water.lake.x, z: water.lake.z, r: 14 }, ...water.course.filter((_, i) => i % 3 === 0).map(([x, z]) => ({ x, z, r: 4.5 }))] : [];
+  growTrees(world, seed + 1, { avoid: [...avoid, ...clear] });
   growGrass(world, seed + 2);
+  if (withWater) fillWater(world, water);
+  return { water };
+}
+
+/**
+ * Sink the ground along the world's lowest edge into a basin for the sea:
+ * deepest at the edge (about 8 m down), rising to the original ground some
+ * 30 m in, along a coast that wanders. Works on H (m per voxel column) in place.
+ */
+function seaBasin(H, sx, sz, noise) {
+  const V = VOXEL, band = 20 / V;
+  // Mean ground height in a band along each edge: x = 0, x = max, z = 0, z = max.
+  const mean = [0, 0, 0, 0], n = [0, 0, 0, 0];
+  for (let z = 0; z < sz; z++)
+    for (let x = 0; x < sx; x++) {
+      const h = H[x + sx * z];
+      if (x < band) { mean[0] += h; n[0]++; }
+      if (x >= sx - band) { mean[1] += h; n[1]++; }
+      if (z < band) { mean[2] += h; n[2]++; }
+      if (z >= sz - band) { mean[3] += h; n[3]++; }
+    }
+  const edge = mean.map((m, k) => m / n[k]).reduce((b, m, k, a) => (m < a[b] ? k : b), 0);
+  for (let z = 0; z < sz; z++)
+    for (let x = 0; x < sx; x++) {
+      const d = [x, sx - 1 - x, z, sz - 1 - z][edge] * V; // metres from that edge
+      const along = (edge < 2 ? z : x) * V;
+      const coast = 30 + 6 * noise(along / 25, 9.1, 0.5);
+      const t = Math.min(1, Math.max(0, (coast - d) / coast));
+      H[x + sx * z] -= 8.5 * t * t * (3 - 2 * t);
+    }
 }
 
 /** Height in metres of the top of the highest solid voxel in the column containing metre point (x, z). */

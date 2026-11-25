@@ -10,6 +10,15 @@ THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const COLLIDER_MATERIAL = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide });
 
+/** Most times a second one chunk's water is re-meshed. */
+const WATER_HZ = 10;
+
+/**
+ * Water's own layer: the camera sees it (main.js enables it), the sun's
+ * shadow camera doesn't, and PostFX can draw it in a pass of its own.
+ */
+export const WATER_LAYER = 2;
+
 /**
  * Keeps the three.js meshes of each chunk in sync with the voxel data. Dirty
  * chunks are re-meshed on a pool of web workers, nearest to the player first.
@@ -25,11 +34,22 @@ const COLLIDER_MATERIAL = new THREE.MeshBasicMaterial({ side: THREE.DoubleSide }
  * @param foliage  { materials, shadowMaterials } for the foliage groups
  */
 export class ChunkMeshes {
-  constructor(world, scene, solid, foliage) {
+  constructor(world, scene, solid, foliage, water = null) {
     this.world = world;
     this.scene = scene;
     this.solid = solid;
     this.foliageMaterials = foliage;
+    this.waterMaterial = water;
+    /** Mesh water as the contoured surface (fluidSurface.js, for FluxSim) rather than the cellular one's mesher. */
+    this.waterSurface = false;
+    /** SpanSim, when that's the water: meshed from its spans (spanMesh.js) instead of the voxels. */
+    this.spanSim = null;
+    // Water: its own meshes, re-meshed separately (and at most WATER_HZ per chunk) as it moves.
+    this.water = new Array(world.chunks.length).fill(null);
+    this.waterList = [];
+    this.waterInFlight = new Array(world.chunks.length).fill(false);
+    this.waterVersion = new Array(world.chunks.length).fill(0);
+    this.waterSent = new Float64Array(world.chunks.length).fill(-1e9);
     this.meshes = new Array(world.chunks.length).fill(null);
     this.foliage = new Array(world.chunks.length).fill(null);
     this.foliageList = [];
@@ -69,8 +89,175 @@ export class ChunkMeshes {
     return this.world.dirty.size + this.inFlight.filter(Boolean).length;
   }
 
-  /** Dispatch dirty chunks to idle workers, closest to `focus` (metres) first. */
+  /** Dispatch dirty chunks to idle workers, closest to `focus` (metres) first: ground, then water. */
   update(focus) {
+    this.updateSolid(focus);
+    this.updateWater(focus);
+  }
+
+  updateWater(focus) {
+    const { world } = this;
+    if (!this.waterMaterial || !world.fluidDirty.size || !this.idle.length) return;
+    const now = performance.now();
+    const s = world.size * VOXEL;
+    // Running water keeps chunks dirty: farther ones are re-meshed less
+    // often, and the longer one has waited the sooner it goes, so near
+    // water can't starve the rest.
+    const d2 = (i) => dist2(world.chunkCoords(i), focus, s);
+    const order = [...world.fluidDirty].filter((i) => !this.waterInFlight[i] && now - this.waterSent[i] >= (1000 / WATER_HZ) * (1 + Math.sqrt(d2(i)) / 24));
+    const rank = (i) => d2(i) / (1 + Math.min(10, (now - this.waterSent[i]) / 1000)) ** 2;
+    order.sort((a, b) => rank(a) - rank(b));
+    for (const index of order) {
+      if (!this.idle.length) break;
+      world.fluidDirty.delete(index);
+      const [cx, cy, cz] = world.chunkCoords(index);
+      if (this.spanSim) {
+        const snap = this.spanSim.snapshot(cx, cy, cz);
+        this.waterVersion[index]++;
+        if (!snap) {
+          this.setWater(index, null);
+          continue;
+        }
+        const worker = this.idle.pop();
+        this.waterInFlight[index] = true;
+        this.waterSent[index] = now;
+        worker.postMessage({ type: 'spans', index, version: this.waterVersion[index], ...snap }, [snap.start.buffer, snap.rec.buffer, snap.falls.buffer, snap.glass.buffer]);
+        continue;
+      }
+      const padded = world.buildFluidPadded(cx, cy, cz, this.waterSurface);
+      this.waterVersion[index]++;
+      if (!padded) {
+        this.setWater(index, null);
+        continue;
+      }
+      const worker = this.idle.pop();
+      this.waterInFlight[index] = true;
+      this.waterSent[index] = now;
+      worker.postMessage(
+        { type: 'fluid', index, version: this.waterVersion[index], surface: this.waterSurface, ...padded },
+        [padded.mat.buffer, padded.shape.buffer, padded.fluid.buffer, padded.floor.buffer, ...(padded.et ? [padded.et.buffer, padded.en.buffer, padded.flux.buffer] : [])],
+      );
+    }
+  }
+
+  onWater(msg) {
+    this.waterInFlight[msg.index] = false;
+    if (msg.version !== this.waterVersion[msg.index]) return;
+    const { water } = msg;
+    if (!water.triangles) {
+      this.setWater(msg.index, null);
+      return;
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(water.position, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(water.normal, 3));
+    g.setAttribute('flow', new THREE.BufferAttribute(water.flow, 3));
+    g.setAttribute('depth', new THREE.BufferAttribute(water.depth, 1));
+    if (this.spanSim) {
+      const { morph, was } = this.morphFrom(msg.index, water.position, water.flow, water.depth);
+      g.setAttribute('morph', new THREE.BufferAttribute(morph, 3));
+      g.setAttribute('was', new THREE.BufferAttribute(was, 3));
+    }
+    g.computeBoundingSphere();
+    g.computeBoundingBox();
+    this.setWater(msg.index, g);
+  }
+
+  /**
+   * For a chunk's new water mesh: where each vertex was in the mesh it
+   * replaces (the height shown there now, mid-glide or not), when, and over
+   * how long to glide from there (about the time between the two meshes), so
+   * the surface moves smoothly rather than jumping at each re-mesh (`morph`);
+   * and the flow and depth shown there now, which glide the same way, so the
+   * ripples and white water speed up and slow down smoothly too (`was`). A
+   * vertex with no counterpart (new water, or a level that's changed past
+   * JOIN) starts where it is.
+   */
+  morphFrom(index, position, flow, depth) {
+    const now = performance.now() / 1000;
+    const count = position.length / 3;
+    const morph = new Float32Array(count * 3);
+    const was = new Float32Array(count * 3);
+    const old = this.water[index]?.geometry;
+    const prev = old?.attributes.morph ? old : null;
+    const dur = prev ? Math.min(0.6, Math.max(0.05, now - prev.userData.arrived)) : 0;
+    // What the old mesh shows now, per (x, z): [target height, height, flow x, flow z, depth] per vertex there.
+    const at = new Map();
+    if (prev) {
+      const p = prev.attributes.position.array, m = prev.attributes.morph.array;
+      const f = prev.attributes.flow.array, dp = prev.attributes.depth.array, w = prev.attributes.was.array;
+      for (let v = 0; v < p.length / 3; v++) {
+        const t = m[v * 3 + 2] > 0 ? Math.min(1, Math.max(0, (now - m[v * 3 + 1]) / m[v * 3 + 2])) : 1;
+        const y = m[v * 3] + (p[v * 3 + 1] - m[v * 3]) * t;
+        const fx = w[v * 3] + (f[v * 3] - w[v * 3]) * t, fz = w[v * 3 + 1] + (f[v * 3 + 1] - w[v * 3 + 1]) * t;
+        const d = w[v * 3 + 2] + (dp[v] - w[v * 3 + 2]) * t;
+        const key = `${p[v * 3].toFixed(3)},${p[v * 3 + 2].toFixed(3)}`;
+        const list = at.get(key);
+        if (list) list.push(p[v * 3 + 1], y, fx, fz, d);
+        else at.set(key, [p[v * 3 + 1], y, fx, fz, d]);
+      }
+    }
+    const reach = 0.5; // metres: past this it's a different sheet
+    for (let v = 0; v < count; v++) {
+      const y = position[v * 3 + 1];
+      let from = y, fx = flow[v * 3], fz = flow[v * 3 + 1], d = depth[v];
+      const list = at.get(`${position[v * 3].toFixed(3)},${position[v * 3 + 2].toFixed(3)}`);
+      if (list) {
+        let best = reach;
+        for (let n = 0; n < list.length; n += 5) {
+          const e = Math.abs(list[n] - y);
+          if (e < best) {
+            best = e;
+            from = list[n + 1];
+            fx = list[n + 2];
+            fz = list[n + 3];
+            d = list[n + 4];
+          }
+        }
+      }
+      morph[v * 3] = from;
+      morph[v * 3 + 1] = now;
+      morph[v * 3 + 2] = dur;
+      was[v * 3] = fx;
+      was[v * 3 + 1] = fz;
+      was[v * 3 + 2] = d;
+    }
+    return { morph, was };
+  }
+
+  /** Water mesh of a chunk: drawn only (not collided with or aimed at). */
+  setWater(index, geometry) {
+    let mesh = this.water[index];
+    if (mesh) mesh.geometry.dispose();
+    if (!geometry) {
+      if (mesh) {
+        this.scene.remove(mesh);
+        this.water[index] = null;
+        this.waterList = this.water.filter(Boolean);
+      }
+      return;
+    }
+    geometry.userData.arrived = performance.now() / 1000;
+    if (!mesh) {
+      mesh = new THREE.Mesh(geometry, this.waterMaterial);
+      mesh.matrixAutoUpdate = false;
+      mesh.renderOrder = 1; // after the ground and glass
+      mesh.layers.set(WATER_LAYER);
+      this.water[index] = mesh;
+      this.scene.add(mesh);
+      this.waterList = this.water.filter(Boolean);
+    } else {
+      mesh.geometry = geometry;
+    }
+  }
+
+  waterTriangleCount() {
+    let t = 0;
+    for (const m of this.waterList) t += m.geometry.attributes.position.count / 3;
+    return t;
+  }
+
+  updateSolid(focus) {
     const { world } = this;
     if (!world.dirty.size || !this.idle.length) return;
     const s = world.size * VOXEL;
@@ -99,6 +286,10 @@ export class ChunkMeshes {
 
   onResult(worker, msg) {
     this.idle.push(worker);
+    if (msg.type === 'fluid') {
+      this.onWater(msg);
+      return;
+    }
     this.inFlight[msg.index] = false;
     this.lastMeshMs = msg.ms;
     // A newer request for this chunk is on its way: this result is stale.

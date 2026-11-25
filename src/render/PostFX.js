@@ -61,6 +61,35 @@ export class PostFX {
     this.brightness = 1;
     this.sunClip = new THREE.Vector4();
     this.camDir = new THREE.Vector3();
+
+    // Water (setWater): drawn in a pass of its own over a copy of the scene
+    // behind it and that copy's distance per pixel, so it can refract and
+    // absorb what's under it. The copy's targets aren't multisampled.
+    this.water = null; // { material, layer }
+    this.refraction = true;
+    this.opaque = new THREE.WebGLRenderTarget(1, 1, { type: THREE.HalfFloatType, depthBuffer: false });
+    this.opaqueDepth = new THREE.WebGLRenderTarget(1, 1, { type: THREE.FloatType, format: THREE.RedFormat, depthBuffer: false });
+    this.copyPass = new FullScreenQuad(new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, uniforms: { uColor: { value: this.scene.texture } }, vertexShader: VERT, fragmentShader: COPY_FRAG }));
+    this.distPass = new FullScreenQuad(new THREE.ShaderMaterial({ glslVersion: THREE.GLSL3, uniforms: { ...common }, vertexShader: VERT, fragmentShader: DIST_FRAG }));
+    const cu = this.compositePass.material.uniforms;
+    cu.uUnderwater = { value: 0 };
+    cu.uTime = { value: 0 };
+  }
+
+  /**
+   * Draw `material`'s meshes (on `layer`) as water: with `refraction`, in a
+   * pass of their own after everything else, over the scene behind them.
+   */
+  setWater(material, layer, refraction = true) {
+    this.water = { material, layer };
+    this.refraction = refraction;
+  }
+
+  /** Whether the camera is under water (the composite then fogs and tints the view as water does). */
+  setUnderwater(on, time = 0) {
+    const u = this.compositePass.material.uniforms;
+    u.uUnderwater.value = on ? 1 : 0;
+    u.uTime.value = time;
   }
 
   /**
@@ -92,6 +121,9 @@ export class PostFX {
     const w = Math.max(1, Math.round(width * pr)), h = Math.max(1, Math.round(height * pr));
     this.scene.setSize(w, h);
     this.lit.setSize(w, h);
+    this.opaque.setSize(w, h);
+    this.opaqueDepth.setSize(w, h);
+    this.screen = [w, h];
     const hw = Math.max(1, w >> 1), hh = Math.max(1, h >> 1);
     this.ao.setSize(hw, hh);
     this.aoBlur.setSize(hw, hh);
@@ -113,7 +145,34 @@ export class PostFX {
 
     const fx = this.effects;
     r.setRenderTarget(this.scene);
-    r.render(scene, camera);
+    const wl = this.water && this.refraction ? this.water.layer : -1;
+    if (wl < 0) r.render(scene, camera);
+    else {
+      // 1. Everything but the water.
+      const mask = camera.layers.mask;
+      camera.layers.disable(wl);
+      r.render(scene, camera);
+      // 2. A copy of it, and how far away each pixel is (metres).
+      r.setRenderTarget(this.opaque);
+      this.copyPass.render(r);
+      r.setRenderTarget(this.opaqueDepth);
+      this.distPass.render(r);
+      // 3. The water, over it, refracting the copy.
+      const u = this.water.material.uniforms;
+      u.uOpaque.value = this.opaque.texture;
+      u.uOpaqueDepth.value = this.opaqueDepth.texture;
+      u.uScreen.value.set(this.screen[0], this.screen[1]);
+      if (u.uProj) u.uProj.value.set(camera.projectionMatrix.elements[0], camera.projectionMatrix.elements[5]);
+      r.setRenderTarget(this.scene);
+      camera.layers.set(wl);
+      const autoClear = r.autoClear, background = scene.background;
+      r.autoClear = false;
+      scene.background = null;
+      r.render(scene, camera);
+      r.autoClear = autoClear;
+      scene.background = background;
+      camera.layers.mask = mask;
+    }
     if (fx.ao) {
       r.setRenderTarget(this.ao);
       this.aoPass.render(r);
@@ -267,6 +326,25 @@ const RAYS_FRAG = /* glsl */ `
   }
 `;
 
+const COPY_FRAG = /* glsl */ `
+  uniform sampler2D uColor;
+  in vec2 vUv;
+  layout(location = 0) out vec4 outColor;
+  void main() {
+    outColor = texture(uColor, vUv);
+  }
+`;
+
+/** Distance (metres, along the view axis) to what each pixel shows. */
+const DIST_FRAG = /* glsl */ `
+  ${DEPTH_GLSL}
+  in vec2 vUv;
+  layout(location = 0) out vec4 outColor;
+  void main() {
+    outColor = vec4(-viewPos(vUv).z, 0.0, 0.0, 1.0);
+  }
+`;
+
 const COMPOSITE_FRAG = /* glsl */ `
   ${DEPTH_GLSL}
   uniform sampler2D uColor;
@@ -277,14 +355,28 @@ const COMPOSITE_FRAG = /* glsl */ `
   uniform float uRaysStrength;
   uniform float uSaturation;
   uniform float uVignette;
+  uniform float uUnderwater;
+  uniform float uTime;
   in vec2 vUv;
   layout(location = 0) out vec4 outColor;
   ${SKY_GLSL}
   void main() {
-    vec3 c = texture(uColor, vUv).rgb;
-    float ao = texture(uAO, vUv).r;
+    vec2 uv = vUv;
+    // Under water: the view wavers a little.
+    if (uUnderwater > 0.5) uv += vec2(sin(uv.y * 23.0 + uTime * 1.7), cos(uv.x * 19.0 + uTime * 1.3)) * 0.0025;
+    vec3 c = texture(uColor, uv).rgb;
+    float ao = texture(uAO, uv).r;
     c *= mix(1.0, ao, uAOStrength);
-    c += sunLight() * texture(uRays, vUv).r * uRaysStrength;
+    if (uUnderwater > 0.5) {
+      // Light through water: red goes first, then green, and the water
+      // itself glows blue-green with the light it scatters.
+      float dist = min(-viewPos(uv).z, 200.0);
+      vec3 through = exp(-vec3(0.45, 0.09, 0.07) * dist * 0.9);
+      vec3 water = vec3(0.012, 0.06, 0.07) * (0.4 + 2.0 * sunLight());
+      c = c * through + water * (1.0 - exp(-dist * 0.18));
+    } else {
+      c += sunLight() * texture(uRays, uv).r * uRaysStrength;
+    }
     // Contrast: a curve about mid-grey, in proportion (so hues hold).
     float l = max(dot(c, vec3(0.2126, 0.7152, 0.0722)), 1e-5);
     c *= pow(l / 0.18, 0.12);

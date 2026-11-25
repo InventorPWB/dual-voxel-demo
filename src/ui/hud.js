@@ -9,6 +9,7 @@ export const CONTROLS = [
   ['Jump / fly up', 'Space'],
   ['Sprint / fly down', 'Shift'],
   ['Toggle fly', 'F or double-tap Space'],
+  ['Swim up / dive', 'Space / Shift, or look and W'],
   ['Break / dig / chop', 'Left mouse'],
   ['Place / use', 'Right mouse'],
   ['Paint / lay a loose log', 'Shift + right mouse'],
