@@ -6,10 +6,20 @@ import { plantKind } from './plants.js';
 export const SEA = 17;
 /** The highland lake: radius (m), depth at its middle (m), the band of level it may sit at (m). */
 const LAKE_R = 10, LAKE_DEPTH = 2.6, LAKE_MIN = 26, LAKE_MAX = 31;
-/** How far below the lake's surface its outlet sill is (m): the depth the river leaves it at. */
-const SILL = 0.45;
+/**
+ * How far below the lake's surface its outlet sill is (m): the depth the
+ * river leaves it at. (About what it takes to carry its spring's water out:
+ * deeper, and the lake would settle lower than it's filled.)
+ */
+const SILL = 0.22;
 /** River channel: half-width of its bed (m), width of the banks either side (m), least fall per metre. */
 const HALF_W = 1.3, BANK = 2.4, GRADE = 0.012;
+/**
+ * The spring in the lake's bed that feeds it, and so the river: how much it
+ * gives (m³/s: a good stream), and how far over the lake's level it can push
+ * water (m: dam the outlet and the lake rises that much, short of its rim).
+ */
+const SPRING_RATE = 0.35, SPRING_RISE = 0.4;
 
 const smoothstep = (a, b, x) => {
   const t = Math.min(1, Math.max(0, (x - a) / (b - a)));
@@ -131,14 +141,17 @@ export function planWater(H, sx, sz, noise, { mountain, avoid = [] }) {
   for (let k = 1; k <= 4; k++) course.push([lx + (lx - px) / dl * k, lz + (lz - pz) / dl * k]);
 
   // 3. Its bed: from just under the lake's sill, falling every metre, and
-  // always a little below the ground it passes through.
+  // always a little below the ground it passes through, except while it
+  // cuts through the lake's rim (there the sill is what holds the lake up:
+  // cut deeper, and the lake would drain to that).
   const bed = [];
-  let along = 0;
+  let along = 0, pastRim = false;
   for (let i = 0; i < course.length; i++) {
     const [x, z] = course[i];
     if (i) along = Math.hypot(x - course[i - 1][0], z - course[i - 1][1]);
     const ground = hAt(x, z);
-    const b = i === 0 ? lake.level - SILL : Math.min(bed[i - 1] - GRADE * along, ground - 0.9);
+    if (!pastRim && Math.hypot(x - lake.x, z - lake.z) > LAKE_R + 1 && ground < lake.level) pastRim = true;
+    const b = i === 0 ? lake.level - SILL : Math.min(bed[i - 1] - GRADE * along, pastRim ? ground - 0.9 : Infinity);
     bed.push(Math.max(b, 1.5));
   }
 
@@ -198,7 +211,8 @@ export function planWater(H, sx, sz, noise, { mountain, avoid = [] }) {
 }
 
 /**
- * Fill the sea, the lake and the river (after the terrain, trees and grass).
+ * Fill the sea, the lake and the river (after the terrain, trees and grass),
+ * and put a spring in the lake's bed.
  * The sea floods from the lowland through open voxels below sea level, so
  * caves sealed off from it stay dry; the lake fills its bowl; the river gets
  * a shallow run of water along its bed, which the simulation sets flowing.
@@ -251,9 +265,12 @@ export function fillWater(world, plan) {
 
   if (plan) {
     const { lake, course, bed } = plan;
-    // The lake, kept to its bowl.
+    // The lake, kept to its bowl, and the spring in its bed that keeps it
+    // (and the river) running. (Only the span water uses springs; the others
+    // treat the lake as a source.)
     const lx = Math.floor(lake.x / V), lz = Math.floor(lake.z / V);
     flood([[lx, surfaceVoxel(lx, lz), lz]], lake.level, (x, z) => Math.hypot((x + 0.5) * V - lake.x, (z + 0.5) * V - lake.z) < LAKE_R + 2);
+    world.springs.push({ x: lx, y: surfaceVoxel(lx, lz), z: lz, rate: SPRING_RATE, level: lake.level + SPRING_RISE });
     // The river: a hand's depth along its bed (the simulation sets it flowing).
     for (let i = 0; i < course.length; i++) {
       const [mx, mz] = course[i];

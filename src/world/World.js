@@ -44,6 +44,12 @@ export class World {
     this.displaced = [];
     /** Called with the box of every edit (markDirtyBox): wakes the water there. */
     this.onEdit = null;
+    /**
+     * Springs: where water comes from. Each { x, y, z (the open voxel it
+     * comes out into), rate (m³/s), level (m: how high it can push water;
+     * it slows as the water over it nears that, and stops there) }.
+     */
+    this.springs = [];
     this._edge = [0, 0, 0];
   }
 

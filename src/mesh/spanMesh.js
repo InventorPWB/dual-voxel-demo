@@ -37,6 +37,8 @@ export const DRY = 0.004;
 export const JOIN = 2.5;
 /** Fields per span in a snapshot (SpanSim.snapshot): floor, roof, depth, flow x, flow z, first open voxel. */
 export const REC = 6;
+/** A span this close to full (voxels) is full to its roof: it has no surface to draw. */
+export const FULL_TO = 0.002;
 /** Running water is drawn at least this far clear of the ground (voxels). */
 const MINVIS = 0.16;
 /** How far below a column's floor its ground may fall, towards its corners (voxels). */
@@ -58,6 +60,14 @@ export function meshSpans(p, scale = 1) {
   const N = S + 2 * P;
   const pos = [], flow = [], dep = [], keys = [];
 
+  /**
+   * Does span record o have a water surface: wet, and not full to its roof?
+   * (Water filling a cave under an overhang, or a flooded room, has none:
+   * its top is the rock or the ceiling, and the water's surface is in the
+   * span above.)
+   */
+  const open = (o) => rec[o + 2] > DRY && rec[o + 2] < rec[o + 1] - rec[o] - FULL_TO;
+
   // ---- corners --------------------------------------------------------------------
 
   const cand = [];
@@ -71,9 +81,9 @@ export function meshSpans(p, scale = 1) {
         const c = ci + N * cj;
         for (let r = start[c]; r < start[c + 1]; r++) {
           const o = r * REC, d = rec[o + 2];
-          if (d <= DRY) continue;
+          if (!open(o)) continue;
           const lo = rec[o], hi = rec[o + 1];
-          cand.push({ s: lo + Math.min(d, hi - lo), lo, d: Math.min(d, hi - lo), vx: rec[o + 3], vz: rec[o + 4], c, y0: rec[o + 5] });
+          cand.push({ s: lo + Math.min(d, hi - lo), lo, hi, d: Math.min(d, hi - lo), vx: rec[o + 3], vz: rec[o + 4], c, y0: rec[o + 5] });
         }
       }
     cand.sort((a, b) => a.s - b.s);
@@ -98,9 +108,12 @@ export function meshSpans(p, scale = 1) {
       cache.set(key, null);
       return null;
     }
-    let a = m, b = m;
-    while (a > 0 && cand[a].s - cand[a - 1].s <= JOIN) a--;
-    while (b < cand.length - 1 && cand[b + 1].s - cand[b].s <= JOIN) b++;
+    // (Levels join only where the sheet between them is open: not across a
+    // roof, as from water in a cave under an overhang up to the lake's
+    // surface over it.)
+    let a = m, b = m, roof = cand[m].hi;
+    while (a > 0 && cand[a].s - cand[a - 1].s <= JOIN && cand[a - 1].hi >= cand[b].s) roof = Math.min(roof, cand[--a].hi);
+    while (b < cand.length - 1 && cand[b + 1].s - cand[b].s <= JOIN && roof >= cand[b + 1].s) roof = Math.min(roof, cand[++b].hi);
     const lo = cand[a].s, hi = cand[b].s;
     let hs = 0, n = 0, ds = 0, vx = 0, vz = 0, fs = 0;
     const used = [];
@@ -302,7 +315,7 @@ export function meshSpans(p, scale = 1) {
       const mine = [];
       for (let r = start[c]; r < start[c + 1]; r++) {
         const o = r * REC, d = rec[o + 2];
-        if (d <= DRY) continue;
+        if (!open(o)) continue;
         const lo = rec[o], hi = rec[o + 1];
         const s = lo + Math.min(d, hi - lo);
         mine.push(s);
@@ -319,7 +332,7 @@ export function meshSpans(p, scale = 1) {
           const n = i + di + N * (j + dj);
           for (let r = start[n]; r < start[n + 1]; r++) {
             const o = r * REC, d = rec[o + 2];
-            if (d <= DRY) continue;
+            if (!open(o)) continue;
             const L = rec[o] + Math.min(d, rec[o + 1] - rec[o]);
             if (!inChunk(L)) continue;
             if (levels.some((l) => Math.abs(l - L) <= JOIN)) continue;

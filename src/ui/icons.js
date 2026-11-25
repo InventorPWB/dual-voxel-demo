@@ -51,7 +51,7 @@ function drawBuild(g, item, px) {
   g.scale(s, s);
   g.clip(path);
   g.setTransform(1, 0, 0, 1, 0, 0);
-  g.drawImage(textureCanvas(m.side, px), 0, 0, px, px);
+  g.drawImage(textureCanvas(m.icon || m.side, px), 0, 0, px, px);
   // Light from the top-left.
   const grad = g.createLinearGradient(0, 0, px, px);
   grad.addColorStop(0, 'rgba(255,255,255,0.18)');

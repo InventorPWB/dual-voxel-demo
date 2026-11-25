@@ -1,8 +1,8 @@
 import { describe, it, expect } from 'vitest';
 import { flatWorld, slopedWorld, GROUND, triangles } from './helpers.js';
 import { MAT } from '../src/world/materials.js';
-import { SpanSim } from '../src/world/SpanSim.js';
-import { FluidCore } from '../src/world/fluidCore.js';
+import { SpanSim, SPRING_FLOW } from '../src/world/SpanSim.js';
+import { FluidCore, OCEAN_TILES } from '../src/world/fluidCore.js';
 import { meshSpans, FALLREC } from '../src/mesh/spanMesh.js';
 import { FULL, FLUID, packFluid } from '../src/world/fluids.js';
 
@@ -31,6 +31,7 @@ describe('span simulation', () => {
     walls(w, 4, 4, 20, 20, 6);
     pour(w, 4, GROUND, 4, 7, GROUND + 3, 7); // 64 voxels
     const sim = new SpanSim(w);
+    sim.soaks = false; // (its spreading edge would soak in a little)
     sim.wakeAll();
     const total = sim.totalVolume();
     expect(total).toBeCloseTo(64 * FULL, 3);
@@ -86,6 +87,7 @@ describe('span simulation', () => {
           if (!inRoom && !w.isSolid(x, y, z)) w.setFluid(x, y, z, packFluid(FLUID.WATER, FULL));
         }
     const sim = new SpanSim(w);
+    sim.soaks = false;
     sim.wakeAll();
     const total = sim.totalVolume();
     sim.settle(4000);
@@ -231,7 +233,7 @@ describe('span mesh', () => {
   it('draws thin running water clear of the ground it runs over', () => {
     const w = slopedWorld(0.27);
     const sim = new SpanSim(w);
-    for (let t = 0; t < 120; t++) {
+    for (let t = 0; t < 240; t++) {
       sim.deposit(28, Math.floor(GROUND + 0.3 + 0.27 * 18) + 1, 16, 40);
       sim.tick();
     }
@@ -407,5 +409,175 @@ describe('span mesh', () => {
     }
     expect(below).toBeGreaterThan(0);
     for (const ds of at.values()) expect(ds.size).toBe(1);
+  });
+});
+
+describe('oceans, lakes, springs and soaking', () => {
+  /** Stone walls `h` high round [x0, x1] × [z0, z1] on flat ground, the inside poured full to GROUND + depth - 1. */
+  function lake(w, x0, z0, x1, z1, depth = 6) {
+    walls(w, x0, z0, x1, z1, 8);
+    pour(w, x0, GROUND, z0, x1, GROUND + depth - 1, z1);
+  }
+  /** Open the wall at x = x1 + 1 (z 20..21) into a dry walled run out to x = x2. */
+  function breach(w, x1, x2) {
+    for (let z = 20; z <= 21; z++) for (let y = GROUND; y < GROUND + 8; y++) w.setMat(x1 + 1, y, z, 0);
+    for (let x = x1 + 2; x <= x2; x++) for (let y = GROUND; y < GROUND + 8; y++) { w.setMat(x, y, 19, MAT.STONE); w.setMat(x, y, 22, MAT.STONE); }
+    for (let z = 20; z <= 21; z++) for (let y = GROUND; y < GROUND + 8; y++) w.setMat(x2 + 1, y, z, MAT.STONE);
+    w.markDirtyBox(x1 + 1, GROUND, 19, x2 + 1, GROUND + 8, 22);
+  }
+
+  it('makes a body an ocean only when it is big enough: it holds its level and the river it feeds runs on', () => {
+    const w = flatWorld(3, 32);
+    lake(w, 2, 2, 58, 58);
+    const sim = new SpanSim(w);
+    const core = new FluidCore(w, sim, { oceanTiles: OCEAN_TILES });
+    core.rebuild(true);
+    expect(core.oceanCount).toBeGreaterThanOrEqual(OCEAN_TILES);
+    breach(w, 58, 90);
+    for (let t = 0; t < 600; t++) {
+      sim.tick();
+      if (t % 10 === 0) core.update();
+    }
+    expect(level(sim, 88, 20)).toBeGreaterThan(GROUND + 1);
+    expect(level(sim, 30, 30)).toBeCloseTo(GROUND + 6, 1);
+  });
+
+  it('lets a lake spill only what it holds', () => {
+    const w = flatWorld(3, 32);
+    lake(w, 2, 2, 34, 34);
+    const sim = new SpanSim(w);
+    sim.soaks = false;
+    const core = new FluidCore(w, sim, { oceanTiles: OCEAN_TILES });
+    core.rebuild(true);
+    expect(core.coreCount).toBeGreaterThan(0); // deep and still enough to have been a source before,
+    expect(core.oceanCount).toBe(0); // but not an ocean
+    sim.wakeAll();
+    const total = sim.totalVolume();
+    breach(w, 34, 90);
+    for (let t = 0; t < 6000 && (t < 10 || sim.queue.length); t++) {
+      sim.tick();
+      if (t % 10 === 0) core.update();
+    }
+    expect(sim.queue.length).toBe(0);
+    // All the water there was, now spread over the lake and the run, level.
+    expect(sim.totalVolume()).toBeCloseTo(total, 0);
+    const lakeArea = 33 * 33, run = 2 * (90 - 36 + 1) + 2;
+    const want = GROUND + (6 * lakeArea) / (lakeArea + run);
+    expect(level(sim, 18, 18)).toBeLessThan(GROUND + 5.9);
+    expect(level(sim, 18, 18)).toBeCloseTo(want, 1);
+    expect(level(sim, 80, 20)).toBeCloseTo(want, 1);
+  });
+
+  it('runs a stream from a spring for as long as it flows away', () => {
+    const w = slopedWorld(0.1);
+    for (let x = 0; x < 32; x++) for (let y = 0; y < 32; y++) for (const z of [13, 18]) if (!w.isSolid(x, y, z)) w.setMat(x, y, z, MAT.STONE);
+    for (let x = 0; x <= 5; x++) for (let z = 14; z <= 17; z++) for (let y = 1; y < 28; y++) w.setMat(x, y, z, 0);
+    const y = Math.floor(GROUND + 0.3 + 0.1 * 18) + 1;
+    w.springs.push({ x: 29, y, z: 15, rate: 0.05, level: (y + 1) * 0.5 });
+    const sim = new SpanSim(w);
+    const depth = [];
+    for (let t = 0; t < 700; t++) {
+      sim.tick();
+      if (t >= 500) depth.push(sim.getColumn(16, 15).spans.find((s) => s.d > 0)?.d || 0);
+    }
+    // A steady stream mid-channel, running downhill.
+    expect(Math.min(...depth)).toBeGreaterThan(0.02);
+    expect(Math.max(...depth) - Math.min(...depth)).toBeLessThan(0.005);
+    const s = sim.getColumn(16, 15).spans.find((s) => s.d > 0);
+    expect(sim.flowOf(s, [0, 0])[0]).toBeLessThan(-0.1);
+  });
+
+  it('stops a spring once its water backs up to its level', () => {
+    const w = flatWorld();
+    // A pit 4 deep with a spring in its floor that can push water up to a voxel below the ground.
+    for (let x = 10; x <= 13; x++) for (let z = 10; z <= 13; z++) for (let y = GROUND - 4; y < GROUND; y++) w.setMat(x, y, z, 0);
+    w.springs.push({ x: 11, y: GROUND - 4, z: 11, rate: 0.2, level: (GROUND - 1) * 0.5 });
+    const sim = new SpanSim(w);
+    for (let t = 0; t < 4000; t++) sim.tick();
+    expect(sim.queue.length).toBe(0);
+    const total = sim.totalVolume();
+    // Filled to its level, and stopped there.
+    expect(level(sim, 11, 11)).toBeCloseTo(GROUND - 1, 1);
+    expect(level(sim, 13, 13)).toBeCloseTo(GROUND - 1, 1);
+    for (let t = 0; t < 200; t++) sim.tick();
+    expect(sim.totalVolume()).toBeCloseTo(total, 3);
+  });
+
+  it('soaks away a stray film, but not the shallow edge of a pond', () => {
+    // A film a few millimetres deep on grass: gone in a few seconds.
+    const w = flatWorld();
+    for (let x = 8; x <= 12; x++) for (let z = 8; z <= 12; z++) w.setFluid(x, GROUND, z, packFluid(FLUID.WATER, 2));
+    const sim = new SpanSim(w);
+    sim.wakeAll();
+    expect(sim.totalVolume()).toBeGreaterThan(0);
+    for (let t = 0; t < 100; t++) sim.tick();
+    expect(sim.totalVolume()).toBe(0);
+    // A pond on a slope, its edge thinning to nothing: settled, it keeps all its water.
+    const p = slopedWorld(0.03);
+    const ps = new SpanSim(p);
+    for (let t = 0; t < 60; t++) {
+      ps.deposit(3, GROUND, 16, 255);
+      ps.tick();
+    }
+    ps.settle(6000);
+    const kept = ps.totalVolume();
+    let thin = 0;
+    for (let x = 0; x < 32; x++) for (let z = 0; z < 32; z++) for (const s of ps.getColumn(x, z).spans) if (s.d > 0 && s.d < 0.02) thin++;
+    expect(thin).toBeGreaterThan(0);
+    ps.wakeAll();
+    for (let t = 0; t < 400; t++) ps.tick();
+    expect(ps.totalVolume()).toBeCloseTo(kept, 3);
+  });
+  it('draws only the surface over an underwater overhang, and the water under it settles', () => {
+    for (const shelf of [GROUND, GROUND - 3]) {
+      const w = flatWorld(2, 16);
+      // A deep pool with a rock shelf inside it, under water: water under the shelf and over it.
+      for (let y = GROUND - 6; y < GROUND + 6; y++) for (let x = 3; x <= 26; x++) for (const z of [3, 26]) w.setMat(x, y, z, MAT.STONE);
+      for (let y = GROUND - 6; y < GROUND + 6; y++) for (let z = 3; z <= 26; z++) for (const x of [3, 26]) w.setMat(x, y, z, MAT.STONE);
+      for (let x = 4; x <= 25; x++) for (let z = 4; z <= 25; z++) for (let y = GROUND - 6; y < GROUND; y++) w.setMat(x, y, z, 0);
+      for (let x = 10; x <= 16; x++) for (let z = 10; z <= 16; z++) w.setMat(x, shelf, z, MAT.STONE);
+      pour(w, 4, GROUND - 6, 4, 25, GROUND + 1, 25);
+      const sim = new SpanSim(w);
+      sim.wakeAll();
+      expect(sim.settle(2000)).toBeLessThan(2000);
+      // Under the shelf it's full, at the pool's pressure; nothing's drawn there,
+      // and the surface over it is level with the rest.
+      const snap = sim.snapshot(0, 0, 0);
+      expect(snap.falls.length).toBe(0);
+      const m = meshSpans(snap, 0.5);
+      const ys = [];
+      for (let i = 0; i < m.position.length; i += 3) if (m.flow[i + 2] === 0) ys.push(m.position[i + 1] / 0.5);
+      expect(ys.length).toBeGreaterThan(100);
+      expect(Math.max(...ys) - Math.min(...ys)).toBeLessThan(0.05);
+    }
+  });
+  it('makes a spring of a spring block: it gives water from its top until removed or buried', () => {
+    const w = flatWorld();
+    const sim = new SpanSim(w);
+    sim.soaks = false;
+    const block = (mat, y0 = GROUND, y1 = GROUND + 1) => {
+      for (let x = 14; x <= 15; x++) for (let z = 14; z <= 15; z++) for (let y = y0; y <= y1; y++) w.setVoxel(x, y, z, mat, mat ? 1 : 0);
+      w.markDirtyBox(14, y0, 14, 15, y1, 15);
+    };
+    block(MAT.SPRING);
+    // A metre block: every voxel a spring, but only the four on top open (the rest are covered by it).
+    expect(w.springs.length).toBe(8);
+    expect(w.springs.filter((sp) => !w.isSolid(sp.x, sp.y, sp.z)).length).toBe(4);
+    for (let t = 0; t < 200; t++) sim.tick();
+    // Ten seconds at 100 litres a second: a cubic metre, 8 voxels.
+    const given = sim.totalVolume() / FULL;
+    expect(given).toBeCloseTo((4 * SPRING_FLOW * 10) / 0.125, 0);
+    // Buried, it stops.
+    block(MAT.STONE, GROUND + 2, GROUND + 2);
+    sim.settle(4000);
+    const v = sim.totalVolume();
+    for (let t = 0; t < 100; t++) sim.tick();
+    expect(sim.totalVolume()).toBeCloseTo(v, 3);
+    // Uncovered it runs again; taken away, it's gone.
+    block(0, GROUND + 2, GROUND + 2);
+    for (let t = 0; t < 20; t++) sim.tick();
+    expect(sim.totalVolume()).toBeGreaterThan(v + FULL * 0.5);
+    block(0);
+    expect(w.springs.length).toBe(0);
   });
 });

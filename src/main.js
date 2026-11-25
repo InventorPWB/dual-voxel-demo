@@ -16,7 +16,7 @@ import { Splashes } from './render/Splashes.js';
 import { FluidSim } from './world/FluidSim.js';
 import { FluxSim } from './world/FluxSim.js';
 import { SpanSim } from './world/SpanSim.js';
-import { FluidCore } from './world/fluidCore.js';
+import { FluidCore, OCEAN_TILES } from './world/fluidCore.js';
 import { Player } from './player/Player.js';
 import { Interaction } from './items/interaction.js';
 import { defaultHotbar } from './items/items.js';
@@ -59,7 +59,7 @@ attachMipmaps(renderer);
 const waterSystem = savedSetting('waterSystem');
 const spanWater = waterSystem === 'spans', fluxWater = waterSystem === 'flux';
 const fluid = spanWater ? new SpanSim(world) : fluxWater ? new FluxSim(world) : new FluidSim(world);
-const core = new FluidCore(world, fluid);
+const core = new FluidCore(world, fluid, { oceanTiles: spanWater ? OCEAN_TILES : 0 });
 const waterHeight = new WaterHeight(world, core);
 const waterMaterial = createWaterMaterial(shadow);
 const chunkMeshes = new ChunkMeshes(world, scene, createChunkMaterials(shadow, waterHeight), createFoliageMaterials(shadow), waterMaterial);
@@ -351,7 +351,7 @@ function frame(now) {
       `Triangles  ${chunkMeshes.triangleCount().toLocaleString()} solid, ${chunkMeshes.foliageTriangleCount().toLocaleString()} foliage\n` +
       `Chunks     ${chunkMeshes.list.length} meshed, ${chunkMeshes.pending} pending\n` +
       `Last mesh  ${chunkMeshes.lastMeshMs.toFixed(1)} ms (${chunkMeshes.workerCount} workers)\n` +
-      `Water      ${fluid.stats.active.toLocaleString()} active, ${fluid.stats.ms.toFixed(1)} ms, ${core.coreCount} source tiles, ${chunkMeshes.waterTriangleCount().toLocaleString()} triangles\n` +
+      `Water      ${fluid.stats.active.toLocaleString()} active, ${fluid.stats.ms.toFixed(1)} ms, ${core.oceanCount} source tiles, ${chunkMeshes.waterTriangleCount().toLocaleString()} triangles\n` +
       `Position   ${p.x.toFixed(1)} ${p.y.toFixed(1)} ${p.z.toFixed(1)}\n` +
       `Chunk      ${Math.floor(p.x / (world.size * VOXEL))} ${Math.floor(p.y / (world.size * VOXEL))} ${Math.floor(p.z / (world.size * VOXEL))}`,
     );

@@ -6,6 +6,14 @@ import { TICK_HZ } from './FluidSim.js';
  * from the water itself, so a lake the player floods becomes one just like
  * the sea, and one they drain or fill in stops being one.
  *
+ * With `oceanTiles` (SpanSim's water), only an ocean is: a body whose core
+ * (connected core tiles) is at least that many tiles. It's water so big it
+ * doesn't notice what's taken or added, so it holds its level: take from it
+ * and it doesn't run out, rivers run into it and it doesn't rise. Smaller
+ * bodies are just the water in them: breach a lake and it spills what it
+ * holds. Edits (the water brush) still set an ocean's level, so a lake built
+ * big enough becomes an ocean at its level, and can be raised or lowered.
+ *
  * Per column: the top water surface and the depth of water under it (kept
  * up to date for the columns the simulation touches). Per tile (TILE × TILE
  * columns): how many of its columns are deep, and the lowest and highest
@@ -37,8 +45,12 @@ export const DEMOTE = 1;
 /** How often dirty tiles are looked at again (seconds). */
 const EVERY = 0.5;
 
+/** Core tiles an ocean has at least, for SpanSim's water (64: about 25 m across of water 1 m deep). */
+export const OCEAN_TILES = 64;
+
 export class FluidCore {
-  constructor(world, sim) {
+  /** `oceanTiles`: core tiles a body needs to be a source (0: any core is; the cellular and flux water). */
+  constructor(world, sim, { oceanTiles = 0 } = {}) {
     this.world = world;
     this.sim = sim;
     const { sx, sz } = world;
@@ -62,17 +74,23 @@ export class FluidCore {
     this.edited = new Set(); // tiles changed by an edit since last looked at
     this.lastEval = 0;
     this.coreCount = 0;
+    this.oceanTiles = oceanTiles;
+    // Bodies: connected core tiles (8 ways), and whether each tile's is an ocean.
+    this.body = new Int32Array(nTiles).fill(-1);
+    this.ocean = new Uint8Array(nTiles);
+    this.oceanCount = 0;
+    this.bodiesDirty = false;
     /** Goes up whenever column surfaces are measured again (see WaterHeight). */
     this.version = 0;
 
     sim.isSource = (x, y, z) => {
       const t = (x / TILE | 0) + this.tx * (z / TILE | 0);
-      return this.core[t] === 1 && y < this.level[t] - 0.01;
+      return this.ocean[t] === 1 && y < this.level[t] - 0.01;
     };
     // (SpanSim asks for the level itself: a span is a source if it reaches it.)
     sim.sourceLevel = (x, z) => {
       const t = (x / TILE | 0) + this.tx * (z / TILE | 0);
-      return this.core[t] === 1 ? this.level[t] : -Infinity;
+      return this.ocean[t] === 1 ? this.level[t] : -Infinity;
     };
     const prevColumn = sim.onColumn;
     sim.onColumn = (x, y, z) => {
@@ -152,6 +170,51 @@ export class FluidCore {
     for (const t of this.watch) if (this.judge(t, now, force)) done.push(t);
     for (const t of done) this.watch.delete(t);
     this.edited.clear();
+    if (this.bodiesDirty) this.findBodies();
+  }
+
+  /**
+   * Group core tiles into bodies, and mark the tiles of every body big enough
+   * to be an ocean. Water that becomes (or stops being) an ocean is woken.
+   */
+  findBodies() {
+    this.bodiesDirty = false;
+    const { tx, tz } = this;
+    const body = this.body.fill(-1);
+    const stack = [];
+    let id = 0;
+    this.oceanCount = 0;
+    for (let t = 0; t < tx * tz; t++) {
+      if (!this.core[t] || body[t] >= 0) continue;
+      const tiles = [t];
+      body[t] = id;
+      stack.push(t);
+      while (stack.length) {
+        const u = stack.pop();
+        const x = u % tx, z = (u - x) / tx;
+        for (let dz = -1; dz <= 1; dz++)
+          for (let dx = -1; dx <= 1; dx++) {
+            const nx = x + dx, nz = z + dz;
+            if (nx < 0 || nz < 0 || nx >= tx || nz >= tz) continue;
+            const v = nx + tx * nz;
+            if (!this.core[v] || body[v] >= 0) continue;
+            body[v] = id;
+            tiles.push(v);
+            stack.push(v);
+          }
+      }
+      const ocean = tiles.length >= this.oceanTiles ? 1 : 0;
+      for (const u of tiles) this.setOcean(u, ocean);
+      if (ocean) this.oceanCount += tiles.length;
+      id++;
+    }
+    for (let t = 0; t < tx * tz; t++) if (body[t] < 0) this.setOcean(t, 0);
+  }
+
+  setOcean(t, on) {
+    if (this.ocean[t] === on) return;
+    this.ocean[t] = on;
+    this.wakeTile(t);
   }
 
   /** Recompute a tile's stats; true if they changed. */
@@ -203,7 +266,10 @@ export class FluidCore {
         if (now - this.changed[u] < SETTLE) settled = false;
         if (this.edited.has(u)) edited = true;
       }
-    if (ok && mx - mn > LEVEL_TOL) ok = false;
+    // (An ocean holds its level whatever's flowing out of it, but the water
+    // round its edge, feeding a breach, is drawn down: so it only has to stay
+    // deep, or it would wear away from a breach until it was gone.)
+    if (ok && mx - mn > LEVEL_TOL && !(this.ocean[t] && this.oceanTiles)) ok = false;
 
     if (this.core[t]) {
       if (ok) {
@@ -228,7 +294,12 @@ export class FluidCore {
     if (on) this.level[t] = this.minS[t];
     this.failing[t] = -1;
     this.coreCount += on ? 1 : -1;
-    // Its water (at the edge of the core above all) may now flow differently.
+    this.bodiesDirty = true;
+    this.wakeTile(t);
+  }
+
+  /** Wake tile t's water: it may now flow differently (at the edge of a source above all). */
+  wakeTile(t) {
     const tx = t % this.tx, tz = (t - tx) / this.tx;
     const x0 = tx * TILE, z0 = tz * TILE;
     let y0 = Infinity, y1 = -Infinity;
@@ -252,5 +323,6 @@ export class FluidCore {
       this.changed[t] = -1e9;
     }
     for (let t = 0; t < this.tx * this.tz; t++) this.judge(t, this.now, instant);
+    this.findBodies();
   }
 }

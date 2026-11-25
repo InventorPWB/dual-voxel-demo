@@ -142,6 +142,30 @@ const GENERATORS = {
     if (d1 < 2) c = shade(c, 1.12);
     return jitter(c, 6, hash(x, y, 27));
   },
+  spring_top(x, y) {
+    // A ring of mossy stone round a welling pool: deep blue in the middle,
+    // lighter towards its lip, with bubbles breaking the surface.
+    const r = Math.hypot(x + 0.5 - 16, y + 0.5 - 16);
+    if (r < 10.5) {
+      const t = r / 10.5;
+      let c = [28 + 70 * t * t, 92 + 80 * t * t, 132 + 70 * t * t];
+      const b = hash(x, y, 61);
+      if ((b > 0.93 && r > 3) || Math.abs(r - 5.5 - 2 * vnoise(x, y, 8, 62)) < 0.6) c = [196, 226, 236];
+      return jitter(c, 4, hash(x, y, 63));
+    }
+    if (r < 12) return jitter([58, 70, 66], 5, hash(x, y, 64)); // its wet lip
+    return GENERATORS.spring(x, y);
+  },
+  spring(x, y) {
+    // Weathered stone, mossy and darkened with wet where water runs over it.
+    const n = vnoise(x, y, 8, 65), m = vnoise(x, y, 4, 66);
+    let c = [118 + 26 * n, 120 + 26 * n, 116 + 24 * n];
+    if (m > 0.62) c = [72 + 30 * m, 104 + 34 * m, 58 + 16 * m]; // moss
+    const wet = vnoise(x * 0.5, y * 0.12, 4, 67);
+    if (wet > 0.55) c = c.map((v, i) => v * (i === 2 ? 0.86 : 0.74));
+    if (Math.floor(y) % 11 === 10) c = shade(c, 0.78); // courses
+    return jitter(c, 5, hash(x, y, 68));
+  },
   bark(x, y) {
     // Vertical ridges with darker furrows between them.
     const ridge = vnoise(x, y * 0.25, 4, 30);

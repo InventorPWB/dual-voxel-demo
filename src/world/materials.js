@@ -10,7 +10,7 @@
 // pieces; 'piece' maps one texture over each whole piece, following its shape
 // (glass in a pillar wraps round it). `frame` (rgba, 0..1) draws a border
 // along each piece's outline, as on glass. `hidden` materials aren't in the
-// inventory.
+// inventory's rows. `icon`: the texture its items show (else its side's).
 
 export const AIR = 0;
 
@@ -32,9 +32,11 @@ export const MATERIALS = [
     id: 10, name: 'Stained Glass', natural: false, crisp: 1, render: 'translucent', mapping: 'piece', frame: [0.13, 0.22, 0.4, 0.92],
     top: 'stained_glass', side: 'stained_glass', bottom: 'stained_glass',
   },
+  // Water wells up from a spring's top (see SpanSim). Its own items, not a row of shapes.
+  { id: 11, name: 'Spring', natural: false, crisp: 1, mapping: 'piece', hidden: true, top: 'spring_top', side: 'spring', bottom: 'spring', icon: 'spring_top' },
 ];
 
-export const MAT = { GRASS: 1, DIRT: 2, STONE: 3, SAND: 4, PLANKS: 5, BRICK: 6, STONE_BRICK: 7, COBBLE: 8, GLASS: 9, STAINED_GLASS: 10 };
+export const MAT = { GRASS: 1, DIRT: 2, STONE: 3, SAND: 4, PLANKS: 5, BRICK: 6, STONE_BRICK: 7, COBBLE: 8, GLASS: 9, STAINED_GLASS: 10, SPRING: 11 };
 
 /** Render passes, in drawing order. */
 export const PASS_OPAQUE = 0, PASS_CUTOUT = 1, PASS_TRANSLUCENT = 2;
