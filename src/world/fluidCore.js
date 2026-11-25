@@ -69,6 +69,11 @@ export class FluidCore {
       const t = (x / TILE | 0) + this.tx * (z / TILE | 0);
       return this.core[t] === 1 && y < this.level[t] - 0.01;
     };
+    // (SpanSim asks for the level itself: a span is a source if it reaches it.)
+    sim.sourceLevel = (x, z) => {
+      const t = (x / TILE | 0) + this.tx * (z / TILE | 0);
+      return this.core[t] === 1 ? this.level[t] : -Infinity;
+    };
     const prevColumn = sim.onColumn;
     sim.onColumn = (x, y, z) => {
       prevColumn?.(x, y, z);

@@ -42,6 +42,8 @@ export class ChunkMeshes {
     this.waterMaterial = water;
     /** Mesh water as the contoured surface (fluidSurface.js, for FluxSim) rather than the cellular one's mesher. */
     this.waterSurface = false;
+    /** SpanSim, when that's the water: meshed from its spans (spanMesh.js) instead of the voxels. */
+    this.spanSim = null;
     // Water: its own meshes, re-meshed separately (and at most WATER_HZ per chunk) as it moves.
     this.water = new Array(world.chunks.length).fill(null);
     this.waterList = [];
@@ -109,6 +111,19 @@ export class ChunkMeshes {
       if (!this.idle.length) break;
       world.fluidDirty.delete(index);
       const [cx, cy, cz] = world.chunkCoords(index);
+      if (this.spanSim) {
+        const snap = this.spanSim.snapshot(cx, cy, cz);
+        this.waterVersion[index]++;
+        if (!snap) {
+          this.setWater(index, null);
+          continue;
+        }
+        const worker = this.idle.pop();
+        this.waterInFlight[index] = true;
+        this.waterSent[index] = now;
+        worker.postMessage({ type: 'spans', index, version: this.waterVersion[index], ...snap }, [snap.start.buffer, snap.rec.buffer, snap.falls.buffer, snap.glass.buffer]);
+        continue;
+      }
       const padded = world.buildFluidPadded(cx, cy, cz, this.waterSurface);
       this.waterVersion[index]++;
       if (!padded) {
@@ -138,9 +153,57 @@ export class ChunkMeshes {
     g.setAttribute('normal', new THREE.BufferAttribute(water.normal, 3));
     g.setAttribute('flow', new THREE.BufferAttribute(water.flow, 3));
     g.setAttribute('depth', new THREE.BufferAttribute(water.depth, 1));
+    if (this.spanSim) g.setAttribute('morph', new THREE.BufferAttribute(this.morphFrom(msg.index, water.position), 3));
     g.computeBoundingSphere();
     g.computeBoundingBox();
     this.setWater(msg.index, g);
+  }
+
+  /**
+   * For a chunk's new water mesh: where each vertex was in the mesh it
+   * replaces (the height shown there now, mid-glide or not), when, and over
+   * how long to glide from there (about the time between the two meshes), so
+   * the surface moves smoothly rather than jumping at each re-mesh. A vertex
+   * with no counterpart (new water, or a level that's changed past JOIN)
+   * starts where it is.
+   */
+  morphFrom(index, position) {
+    const now = performance.now() / 1000;
+    const count = position.length / 3;
+    const morph = new Float32Array(count * 3);
+    const old = this.water[index]?.geometry;
+    const was = old?.attributes.morph ? old : null;
+    const dur = was ? Math.min(0.6, Math.max(0.05, now - was.userData.arrived)) : 0;
+    // Heights shown now by the old mesh, per (x, z) corner.
+    const at = new Map();
+    if (was) {
+      const p = was.attributes.position.array, m = was.attributes.morph.array;
+      for (let v = 0; v < p.length / 3; v++) {
+        const t = m[v * 3 + 2] > 0 ? Math.min(1, Math.max(0, (now - m[v * 3 + 1]) / m[v * 3 + 2])) : 1;
+        const y = m[v * 3] + (p[v * 3 + 1] - m[v * 3]) * t;
+        const key = `${p[v * 3].toFixed(3)},${p[v * 3 + 2].toFixed(3)}`;
+        const list = at.get(key);
+        if (list) list.push(p[v * 3 + 1], y);
+        else at.set(key, [p[v * 3 + 1], y]);
+      }
+    }
+    const reach = 0.5; // metres: past this it's a different sheet
+    for (let v = 0; v < count; v++) {
+      const y = position[v * 3 + 1];
+      let from = y;
+      const list = at.get(`${position[v * 3].toFixed(3)},${position[v * 3 + 2].toFixed(3)}`);
+      if (list) {
+        let best = reach;
+        for (let n = 0; n < list.length; n += 2) {
+          const e = Math.abs(list[n] - y);
+          if (e < best) { best = e; from = list[n + 1]; }
+        }
+      }
+      morph[v * 3] = from;
+      morph[v * 3 + 1] = now;
+      morph[v * 3 + 2] = dur;
+    }
+    return morph;
   }
 
   /** Water mesh of a chunk: drawn only (not collided with or aimed at). */
@@ -155,6 +218,7 @@ export class ChunkMeshes {
       }
       return;
     }
+    geometry.userData.arrived = performance.now() / 1000;
     if (!mesh) {
       mesh = new THREE.Mesh(geometry, this.waterMaterial);
       mesh.matrixAutoUpdate = false;

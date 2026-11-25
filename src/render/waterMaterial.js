@@ -35,19 +35,26 @@ export function createWaterMaterial(shadow, extra = {}) {
   };
 
   const vertexShader = /* glsl */ `
+    uniform float uTime;
     in vec3 flow;
     in float depth;
+    // Where this vertex was in the chunk's previous mesh (height), when this
+    // mesh arrived and over how long to move from there (seconds): the
+    // surface glides between re-meshes instead of jumping (ChunkMeshes).
+    in vec3 morph;
     out float vWater;
     out vec3 vPos;
     out vec3 vNormal;
     out vec3 vFlow;
     out float vDepth;
     void main() {
-      vPos = position;
+      vec3 p = position;
+      p.y = mix(morph.x, p.y, morph.z > 0.0 ? clamp((uTime - morph.y) / morph.z, 0.0, 1.0) : 1.0);
+      vPos = p;
       vNormal = normal;
       vFlow = flow;
       vWater = depth;
-      vec4 mv = modelViewMatrix * vec4(position, 1.0);
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
       vDepth = -mv.z;
       gl_Position = projectionMatrix * mv;
     }
@@ -111,12 +118,16 @@ export function createWaterMaterial(shadow, extra = {}) {
       vec2 flow = vFlow.xy * uFlowScale;
       float speed = length(flow);
       if (speed > 2.5) { flow *= 2.5 / speed; speed = 2.5; }
-      float falling = vFlow.z;
-      bool wall = abs(gn.y) < 0.5;
+      // 1: falling water; 2: a pane of still water against glass (SpanSim's).
+      bool pane = vFlow.z > 1.5;
+      float falling = pane ? 0.0 : vFlow.z;
+      bool wall = !pane && abs(gn.y) < 0.5;
 
       // Shading normal: ripples, stronger where it runs, streaks where it falls.
       vec3 n;
-      if (wall) {
+      if (pane) {
+        n = gn;
+      } else if (wall) {
         // Along the wall: streaks running down.
         vec3 side = normalize(cross(gn, vec3(0.0, 1.0, 0.0)));
         vec2 q = vec2(dot(vPos, side) * 3.0, vPos.y * 0.8 + t * 2.4);
@@ -190,6 +201,9 @@ export function createWaterMaterial(shadow, extra = {}) {
         // down a slope is only a centimetre or two of water, but should still
         // read as the same stream, not vanish into the sand.)
         float thick = max(max(behind - surf, 0.0), 0.3 * smoothstep(0.1, 0.6, speed));
+        // Through a window into water: what's behind is the glass, but the
+        // view goes on through the water beyond it.
+        if (pane) thick = max(thick, 4.0);
         // Light crossing the water: red goes first, then green (Beer–Lambert, per metre).
         vec3 through = exp(-vec3(0.45, 0.09, 0.07) * (thick + 0.25) * 1.6);
         vec3 scene = texture(uOpaque, ruv).rgb;
@@ -233,6 +247,11 @@ export function createWaterMaterial(shadow, extra = {}) {
     blendDst: THREE.OneMinusSrcAlphaFactor,
     blendSrcAlpha: THREE.OneFactor,
     blendDstAlpha: THREE.OneMinusSrcAlphaFactor,
+    // Wins ties with the ground it lies on (a thin sheet over the smooth
+    // ground), rather than the two fighting over which shows, in bands.
+    polygonOffset: true,
+    polygonOffsetFactor: -1,
+    polygonOffsetUnits: -2,
   }));
   return material;
 }

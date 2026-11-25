@@ -15,6 +15,7 @@ import { WaterHeight } from './render/waterHeight.js';
 import { Splashes } from './render/Splashes.js';
 import { FluidSim } from './world/FluidSim.js';
 import { FluxSim } from './world/FluxSim.js';
+import { SpanSim } from './world/SpanSim.js';
 import { FluidCore } from './world/fluidCore.js';
 import { Player } from './player/Player.js';
 import { Interaction } from './items/interaction.js';
@@ -53,10 +54,11 @@ let sunAzimuth = SUN_AZIMUTH;
 shadow.setDirection(sunDirection(sunAzimuth));
 attachMipmaps(renderer);
 // Water: the simulation, which of it is a source (fluidCore.js), and how it's drawn.
-// The new water (Settings: water with momentum) or the earlier cellular water:
-// chosen at start (changing it reloads).
-const fluxWater = savedSetting('fluxWater');
-const fluid = fluxWater ? new FluxSim(world) : new FluidSim(world);
+// Which water (Settings: water system), chosen at start (changing it reloads):
+// spans per column, voxels with momentum, or the first, cellular water.
+const waterSystem = savedSetting('waterSystem');
+const spanWater = waterSystem === 'spans', fluxWater = waterSystem === 'flux';
+const fluid = spanWater ? new SpanSim(world) : fluxWater ? new FluxSim(world) : new FluidSim(world);
 const core = new FluidCore(world, fluid);
 const waterHeight = new WaterHeight(world, core);
 const waterMaterial = createWaterMaterial(shadow);
@@ -65,9 +67,13 @@ camera.layers.enable(WATER_LAYER);
 // The contoured surface draws thin water itself, fading in over its first few
 // centimetres; the cellular mesher leaves shallows to a film painted on the ground.
 chunkMeshes.waterSurface = fluxWater;
-waterMaterial.uniforms.uFade.value.set(fluxWater ? 0.0 : 0.08, fluxWater ? 0.04 : 0.18);
-waterMaterial.uniforms.uFlowScale.value = fluxWater ? 3 : 18;
-waterHeight.uniforms.uFilmOn.value = fluxWater ? 0 : 1;
+chunkMeshes.spanSim = spanWater ? fluid : null;
+if (spanWater) waterMaterial.uniforms.uFade.value.set(0.0, 0.03);
+else waterMaterial.uniforms.uFade.value.set(fluxWater ? 0.0 : 0.08, fluxWater ? 0.04 : 0.18);
+// (SpanSim's flow is in m/s, but a thin sheet on a slope runs fast: scaled
+// down so only the steepest runs turn white.)
+waterMaterial.uniforms.uFlowScale.value = spanWater ? 0.15 : fluxWater ? 3 : 18;
+waterHeight.uniforms.uFilmOn.value = spanWater || fluxWater ? 0 : 1;
 const uTime = lightingUniforms(shadow).uTime;
 chunkMeshes.onChange = () => { shadow.dirty = true; };
 
@@ -90,7 +96,7 @@ const settings = new Settings();
 function applySettings(key) {
   const v = settings.values;
   // Textures are built once, at start (boot.js): start again with the other set.
-  if (key === 'realisticTextures' || key === 'fluxWater') {
+  if (key === 'realisticTextures' || key === 'waterSystem') {
     location.reload();
     return;
   }
@@ -120,8 +126,8 @@ applySettings();
 settings.onChange = applySettings;
 
 const player = new Player(world, camera, () => chunkMeshes.colliders);
-// Currents: the flux water's own velocity (the cellular water's are guessed from its slope).
-if (fluxWater) player.currentAt = (x, y, z, out) => fluid.velocity(x, y, z, out);
+// Currents: the water's own velocity (the cellular water's are guessed from its slope).
+if (fluxWater || spanWater) player.currentAt = (x, y, z, out) => fluid.velocity(x, y, z, out);
 const splashes = new Splashes(scene);
 player.onSplash = (pos, speed) => splashes.burst(pos.x, player.waterLevel, pos.z, Math.min(1.5, speed / 8));
 

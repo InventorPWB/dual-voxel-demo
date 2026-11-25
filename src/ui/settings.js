@@ -56,8 +56,12 @@ export const SETTINGS = [
   },
   { type: 'section', label: 'Water' },
   {
-    key: 'fluxWater', label: 'Water with momentum (new)', type: 'toggle', value: true,
-    hint: 'The new water: flows with momentum (rivers run on, floods surge, ripples cross a pond and fade), drawn as one smooth surface traced like the terrain, waterfalls included. Off: the earlier cellular water. Changing it reloads the page.',
+    key: 'waterSystem', label: 'Water system', type: 'choice', value: 'spans',
+    options: [
+      ['spans', 'Spans', 'Water as spans per column (a layered heightfield): a stream on a slope is one smooth sheet, with momentum, waterfalls, and dry rooms under water. Changing it reloads the page.'],
+      ['flux', 'Momentum', 'Water per voxel with momentum, drawn as a surface traced like the terrain. Changing it reloads the page.'],
+      ['cells', 'Cellular', 'The first water: per voxel, without momentum. Changing it reloads the page.'],
+    ],
   },
   {
     key: 'waterEffects', label: 'Water effects', type: 'toggle', value: true, requires: 'shaderLighting',
