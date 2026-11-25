@@ -7,9 +7,9 @@ const DRY = -1000;
 /**
  * The water over every column, as a texture the ground's shader reads
  * (terrainMaterial.js) for what's under water: a little darker (wet) and lit
- * by caustics. Per column, the height (metres) of the top water surface (red)
- * and how deep the water is there (green); dry columns next to water take
- * its level with no depth. Ground below the level but deeper than the water
+ * by caustics. Per column, the height (metres) of the top water surface (red),
+ * how deep the water is there (green) and how deep it is within a metre round
+ * (blue: see update); dry columns next to water take its level with no depth. Ground below the level but deeper than the water
  * (down a slope from a lake, say) isn't under it. Rebuilt from FluidCore's column survey when that
  * changes (at most a few times a second).
  */
@@ -19,10 +19,10 @@ export class WaterHeight {
     this.core = core;
     const { sx, sz } = world;
     // Half floats, so it can be filtered smoothly between columns.
-    this.half = new Uint16Array(sx * sz * 2);
+    this.half = new Uint16Array(sx * sz * 4);
     const dry = THREE.DataUtils.toHalfFloat(DRY);
-    for (let c = 0; c < sx * sz; c++) this.half[c * 2] = dry;
-    this.texture = new THREE.DataTexture(this.half, sx, sz, THREE.RGFormat, THREE.HalfFloatType);
+    for (let c = 0; c < sx * sz; c++) this.half[c * 4] = dry;
+    this.texture = new THREE.DataTexture(this.half, sx, sz, THREE.RGBAFormat, THREE.HalfFloatType);
     this.texture.magFilter = THREE.LinearFilter;
     this.texture.minFilter = THREE.LinearFilter;
     this.texture.needsUpdate = true;
@@ -54,12 +54,13 @@ export class WaterHeight {
       level[c] = wet ? s[c] * VOXEL : DRY;
       depth[c] = wet ? d[c] * VOXEL : 0;
     }
-    // Dry columns beside water take its level, with no depth: so where the
+    // Dry columns near water take its level, with no depth: so where the
     // water's edge crosses them is decided by the ground's height there
     // (smooth), not by which column holds water (0.5 m steps). With no depth,
     // only ground just under the level counts, so a slope dropping away from
-    // the water stays dry.
-    for (let k = 0; k < 2; k++) {
+    // the water stays dry. (Out to 2 m: the "dry" value must be well clear
+    // of any water, as filtering blends it in half a column either side.)
+    for (let k = 0; k < 4; k++) {
       const prev = level.slice();
       for (let z = 0; z < sz; z++)
         for (let x = 0; x < sx; x++) {
@@ -73,9 +74,34 @@ export class WaterHeight {
           level[c] = best;
         }
     }
+    // A column's depth is how deep the water is at its centre, but its ground
+    // can fall away much deeper within it (a steep bank): so for what's under
+    // water, each column also counts as deep as the water up to a metre
+    // round it at the same level (otherwise what's under water on a steep
+    // bank is cut off column by column, in jagged teeth). Further out, a
+    // little less than none, so the edge of that blends away smoothly.
+    let near = depth.map((v, c) => (s[c] >= 0 ? v : -0.5));
+    for (let k = 0; k < 2; k++) {
+      const prev = near;
+      near = prev.slice();
+      for (let z = 0; z < sz; z++)
+        for (let x = 0; x < sx; x++) {
+          const c = x + sx * z;
+          if (level[c] <= DRY) continue;
+          for (let dz = -1; dz <= 1; dz++)
+            for (let dx = -1; dx <= 1; dx++) {
+              const nx = x + dx, nz = z + dz;
+              if ((!dx && !dz) || nx < 0 || nz < 0 || nx >= sx || nz >= sz) continue;
+              const n = nx + sx * nz;
+              if (prev[n] > near[c] && Math.abs(level[n] - level[c]) < 0.25) near[c] = prev[n];
+            }
+        }
+    }
     for (let c = 0; c < sx * sz; c++) {
-      h[c * 2] = toHalf(level[c]);
-      h[c * 2 + 1] = toHalf(depth[c]);
+      h[c * 4] = toHalf(level[c]);
+      h[c * 4 + 1] = toHalf(depth[c]);
+      h[c * 4 + 2] = toHalf(near[c]);
+      h[c * 4 + 3] = toHalf(1);
     }
     this.texture.needsUpdate = true;
   }
@@ -93,13 +119,13 @@ export const WATER_GLSL = /* glsl */ `
   uniform float uFilmOn;
   float underWater(vec3 p) {
     if (uWaterOn < 0.5) return -1.0;
-    vec2 w = texture(uWaterHeight, p.xz / uWorldSize).rg;
+    vec3 w = texture(uWaterHeight, p.xz / uWorldSize).rgb;
     // (Where water meets a dry column, filtering mixes in the "dry" value: not under.)
     if (w.r < -100.0) return -1.0;
     float below = w.r - p.y;
     // Only within the water that's actually there (plus a little for the
     // smooth ground poking about in its voxels), not anything lower nearby.
-    return below <= w.g + 0.25 ? below : -1.0;
+    return below <= w.b + 0.25 ? below : -1.0;
   }
   // How level the water over p is (1 level, 0 steep: a cascade). Under steep
   // water the columns' levels differ a lot, and blending them makes blobs.

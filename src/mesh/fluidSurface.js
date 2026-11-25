@@ -24,7 +24,7 @@
  * real 3D faces), and water in caves and against glass, with no special cases.
  *
  * Vertices carry `normal` (smoothed), `flow` (xz: velocity from FluxSim's
- * face flows, z: 1 for water in free fall) and `depth` (metres of water
+ * face flows, z: 2 for water in free fall) and `depth` (metres of water
  * there, for fading the thinnest water in).
  *
  * Input: World.buildFluidPadded (with `et`/`en` hermite data and `flux`).
@@ -239,7 +239,7 @@ export function meshFluidSurface(p, scale = 1) {
             const fxi = (flux[i * 2] + flux[(i - 1) * 2]) / 2, fzi = (flux[i * 2 + 1] + flux[(i - NN) * 2 + 1]) / 2;
             fx += fxi / v; fz += fzi / v; fw++;
           }
-          if (yy > 0 && !mat[i - N] && vol(i - N) < THIN) falling = 1;
+          if (yy > 0 && !mat[i - N] && vol(i - N) < THIN) falling = 2; // (broken up: see waterMaterial)
         }
         c = {
           p: [sx / n, sy / n, sz / n],

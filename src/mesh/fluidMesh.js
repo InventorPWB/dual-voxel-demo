@@ -300,7 +300,8 @@ export function meshFluid(p, scale = 1) {
       fx += dx * d; fz += dz * d;
     }
     // Falling: nothing but air below (not just a cell that isn't full yet).
-    const falling = y > 0 && !mat[i - N] && vol(i - N) < THIN ? 1 : 0;
+    // (2: falling, and already broken up into white water; see waterMaterial.)
+    const falling = y > 0 && !mat[i - N] && vol(i - N) < THIN ? 2 : 0;
     return [fx, fz, falling];
   }
 

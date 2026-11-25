@@ -1,9 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { flatWorld, slopedWorld, GROUND } from './helpers.js';
+import { flatWorld, slopedWorld, GROUND, triangles } from './helpers.js';
 import { MAT } from '../src/world/materials.js';
 import { SpanSim } from '../src/world/SpanSim.js';
 import { FluidCore } from '../src/world/fluidCore.js';
-import { meshSpans } from '../src/mesh/spanMesh.js';
+import { meshSpans, FALLREC } from '../src/mesh/spanMesh.js';
 import { FULL, FLUID, packFluid } from '../src/world/fluids.js';
 
 /** Fill voxels in a box with water (inclusive). */
@@ -138,6 +138,29 @@ describe('span simulation', () => {
     expect(Math.abs(sim.totalVolume() - total)).toBeLessThan(1);
     expect(level(sim, 4, 4)).toBeGreaterThan(GROUND + 2);
   });
+
+  it('runs steadily down a channel, at a realistic pace, without surging', () => {
+    const w = slopedWorld(0.1);
+    // A channel 4 wide down the slope, draining into a pit at the bottom.
+    for (let x = 0; x < 32; x++) for (let y = 0; y < 32; y++) for (const z of [13, 18]) if (!w.isSolid(x, y, z)) w.setMat(x, y, z, MAT.STONE);
+    for (let x = 0; x <= 5; x++) for (let z = 14; z <= 17; z++) for (let y = 1; y < 28; y++) w.setMat(x, y, z, 0);
+    const sim = new SpanSim(w);
+    const yTop = Math.floor(GROUND + 0.3 + 0.1 * 18) + 1;
+    const depth = [];
+    for (let t = 0; t < 700; t++) {
+      for (let z = 14; z <= 17; z++) sim.deposit(29, yTop, z, 10);
+      sim.tick();
+      if (t >= 500) depth.push(sim.getColumn(16, 15).spans.find((s) => s.d > 0).d);
+    }
+    // Steady: the depth mid-channel holds to a fraction of a millimetre.
+    expect(Math.max(...depth) - Math.min(...depth)).toBeLessThan(0.002);
+    // A few centimetres deep, running at about a metre a second.
+    const s = sim.getColumn(16, 15).spans.find((s) => s.d > 0);
+    expect(s.d).toBeGreaterThan(0.06);
+    const speed = Math.hypot(...sim.flowOf(s, [0, 0]));
+    expect(speed).toBeGreaterThan(0.3);
+    expect(speed).toBeLessThan(3);
+  });
 });
 
 describe('span mesh', () => {
@@ -169,15 +192,16 @@ describe('span mesh', () => {
   it('joins neighbouring columns at different levels without gaps', () => {
     const w = slopedWorld(0.27);
     const sim = new SpanSim(w);
-    for (let t = 0; t < 120; t++) {
+    for (let t = 0; t < 240; t++) {
       sim.deposit(28, Math.floor(GROUND + 0.3 + 0.27 * 18) + 1, 16, 40);
       sim.tick();
     }
     const m = meshSpans(sim.snapshot(0, 0, 1), 0.5);
-    // Corners shared by squares meet exactly: every position at a given (x, z) on the stream has one height.
+    // Squares meet exactly: every position at a given (x, z) on the stream has
+    // one height (corners, and the points the squares are split at).
     const at = new Map();
     for (let i = 0; i < m.position.length; i += 3) {
-      if (m.flow[i + 2] !== 0 || m.depth[i / 3] < 0.004) continue;
+      if (m.flow[i + 2] !== 0 || m.depth[i / 3] < 0.01) continue;
       const k = `${m.position[i]},${m.position[i + 2]}`;
       const y = m.position[i + 1];
       if (!at.has(k)) at.set(k, new Set());
@@ -198,7 +222,7 @@ describe('span mesh', () => {
       sim.tick();
       for (let cy = 0; cy < 2; cy++) {
         const snap = sim.snapshot(0, cy, 1);
-        if (snap) falls += snap.falls.length / 6;
+        if (snap) falls += snap.falls.length / FALLREC;
       }
     }
     expect(falls).toBeGreaterThan(0);
@@ -217,7 +241,7 @@ describe('span mesh', () => {
     for (let i = 0; i < m.position.length; i += 3) {
       if (m.flow[i + 2] !== 0 || m.depth[i / 3] < 0.004) continue;
       const x = m.position[i] / 0.5, z = m.position[i + 2] / 0.5, y = m.position[i + 1] / 0.5;
-      if (x < 13 || x > 26 || z !== 16) continue;
+      if (x < 13 || x > 26 || z !== 16 || x % 1) continue;
       let floor = 0, k = 0;
       for (const [cx, cz] of [[x - 1, z - 1], [x, z - 1], [x - 1, z], [x, z]]) {
         const sp = sim.getColumn(cx, cz).spans.find((s) => s.d > 0.004);
@@ -261,5 +285,127 @@ describe('span mesh', () => {
     };
     expect(make(MAT.GLASS).glass.length).toBeGreaterThan(0);
     expect(make(MAT.STONE).glass.length).toBe(0);
+  });
+
+  it('keeps a stream down a steep slope clear of the ground under it', () => {
+    const w = slopedWorld(0.8);
+    const sim = new SpanSim(w);
+    for (let t = 0; t < 300; t++) {
+      sim.deposit(26, Math.floor(GROUND + 0.3 + 0.8 * 16) + 1, 16, 30);
+      sim.tick();
+    }
+    // The ground's triangles facing up, by column.
+    const bins = new Map();
+    for (const t of triangles(w)) {
+      const ny = (t[5] - t[2]) * (t[6] - t[0]) - (t[3] - t[0]) * (t[8] - t[2]);
+      if (ny <= 0) continue;
+      const x0 = Math.floor(Math.min(t[0], t[3], t[6]) / 0.5), x1 = Math.floor(Math.max(t[0], t[3], t[6]) / 0.5);
+      const z0 = Math.floor(Math.min(t[2], t[5], t[8]) / 0.5), z1 = Math.floor(Math.max(t[2], t[5], t[8]) / 0.5);
+      for (let z = z0; z <= z1; z++) for (let x = x0; x <= x1; x++) bins.set(`${x},${z}`, [...(bins.get(`${x},${z}`) || []), t]);
+    }
+    const groundAt = (x, z, y) => {
+      let best = -Infinity;
+      for (const t of bins.get(`${Math.floor(x / 0.5)},${Math.floor(z / 0.5)}`) || []) {
+        const d = (t[5] - t[8]) * (t[0] - t[6]) + (t[6] - t[3]) * (t[2] - t[8]);
+        const l0 = ((t[5] - t[8]) * (x - t[6]) + (t[6] - t[3]) * (z - t[8])) / d;
+        const l1 = ((t[8] - t[2]) * (x - t[6]) + (t[0] - t[6]) * (z - t[8])) / d;
+        if (l0 < -1e-6 || l1 < -1e-6 || 1 - l0 - l1 < -1e-6) continue;
+        const ty = l0 * t[1] + l1 * t[4] + (1 - l0 - l1) * t[7];
+        if (ty < y + 0.5 && ty > best) best = ty;
+      }
+      return best;
+    };
+    // Points across the stream's sheet, where it runs over wet columns well inside the stream.
+    let n = 0;
+    for (const [cx, cy, cz] of [[0, 0, 1], [0, 1, 1]]) {
+      const snap = sim.snapshot(cx, cy, cz);
+      if (!snap) continue;
+      const m = meshSpans(snap, 0.5);
+      const p = m.position;
+      for (let v = 0; v < p.length / 3; v += 3) {
+        if (m.flow[v * 3 + 2] !== 0) continue;
+        for (const [a, b] of [[1 / 3, 1 / 3], [0.6, 0.2], [0.2, 0.6], [0.2, 0.2]]) {
+          const c = 1 - a - b;
+          const x = a * p[v * 3] + b * p[v * 3 + 3] + c * p[v * 3 + 6];
+          const y = a * p[v * 3 + 1] + b * p[v * 3 + 4] + c * p[v * 3 + 7];
+          const z = a * p[v * 3 + 2] + b * p[v * 3 + 5] + c * p[v * 3 + 8];
+          const vx = Math.floor(x / 0.5), vz = Math.floor(z / 0.5);
+          let inside = true;
+          for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) if (!sim.getColumn(vx + dx, vz + dz)?.spans.some((s) => s.d > 0.004)) inside = false;
+          if (!inside) continue;
+          const g = groundAt(x, z, y);
+          if (g === -Infinity) continue;
+          expect(y - g).toBeGreaterThan(0.005);
+          n++;
+        }
+      }
+    }
+    expect(n).toBeGreaterThan(20);
+  });
+
+  it('bends sloping water smoothly, never past its corners, and leaves level water in whole squares', () => {
+    const w = slopedWorld(0.27);
+    const sim = new SpanSim(w);
+    for (let t = 0; t < 240; t++) {
+      sim.deposit(28, Math.floor(GROUND + 0.3 + 0.27 * 18) + 1, 16, 40);
+      sim.tick();
+    }
+    const m = meshSpans(sim.snapshot(0, 0, 1), 0.5);
+    const at = new Map();
+    for (let i = 0; i < m.position.length; i += 3) if (m.flow[i + 2] === 0) at.set(`${(m.position[i] / 0.5).toFixed(2)},${(m.position[i + 2] / 0.5).toFixed(2)}`, m.position[i + 1]);
+    // Points halfway along a square's edge lie between the corners at its ends.
+    let split = 0;
+    for (const [k, y] of at) {
+      const [x, z] = k.split(',').map(Number);
+      if (x % 1 && z % 1) continue;
+      const ends = x % 1 ? [[x - 0.5, z], [x + 0.5, z]] : z % 1 ? [[x, z - 0.5], [x, z + 0.5]] : null;
+      if (!ends || ends.some(([ex, ez]) => !at.has(`${ex.toFixed(2)},${ez.toFixed(2)}`))) continue;
+      const [ya, yb] = ends.map(([ex, ez]) => at.get(`${ex.toFixed(2)},${ez.toFixed(2)}`));
+      expect(y).toBeGreaterThanOrEqual(Math.min(ya, yb) - 1e-4);
+      expect(y).toBeLessThanOrEqual(Math.max(ya, yb) + 1e-4);
+      split++;
+    }
+    expect(split).toBeGreaterThan(10);
+    // A still pool: whole squares only.
+    const pw = flatWorld();
+    walls(pw, 4, 4, 12, 12, 6);
+    pour(pw, 4, GROUND, 4, 12, GROUND + 1, 12);
+    const pm = meshSpans(new SpanSim(pw).snapshot(0, 0, 0), 0.5);
+    for (let i = 0; i < pm.position.length; i += 3) {
+      expect((pm.position[i] / 0.5) % 1).toBe(0);
+      expect((pm.position[i + 2] / 0.5) % 1).toBe(0);
+    }
+  });
+
+  it('joins neighbouring waterfalls into one sheet, thrown clear of the lip', () => {
+    const w = flatWorld(2, 16, 4);
+    // A shelf 8 high, x <= 10, with water across it pouring off its edge.
+    for (let x = 0; x <= 10; x++) for (let z = 0; z < 32; z++) for (let y = 4; y < 12; y++) w.setMat(x, y, z, MAT.STONE);
+    const sim = new SpanSim(w);
+    let m = null;
+    for (let t = 0; t < 40; t++) {
+      for (let z = 12; z <= 20; z++) sim.deposit(8, 12, z, 60);
+      sim.tick();
+      const snap = sim.snapshot(0, 0, 1);
+      if (snap && snap.falls.length / FALLREC >= 3) m = meshSpans(snap, 0.5);
+    }
+    expect(m).not.toBeNull();
+    // Every point of the falls has one solidity (where two falls meet, they agree).
+    const at = new Map();
+    let below = 0;
+    for (let v = 0; v < m.depth.length; v++) {
+      const k3 = m.flow[v * 3 + 2];
+      if (k3 < 1 || k3 > 2) continue;
+      const k = `${m.position[v * 3].toFixed(4)},${m.position[v * 3 + 2].toFixed(4)},${m.position[v * 3 + 1].toFixed(4)}`;
+      if (!at.has(k)) at.set(k, new Set());
+      at.get(k).add(m.depth[v].toFixed(4));
+      // Once it's falling, it's out past the lip's edge (x = 11) by half a voxel or more.
+      if (k3 > 1.1) {
+        expect(m.position[v * 3] / 0.5).toBeGreaterThanOrEqual(11.5 - 1e-4);
+        below++;
+      }
+    }
+    expect(below).toBeGreaterThan(0);
+    for (const ds of at.values()) expect(ds.size).toBe(1);
   });
 });

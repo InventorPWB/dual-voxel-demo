@@ -153,7 +153,11 @@ export class ChunkMeshes {
     g.setAttribute('normal', new THREE.BufferAttribute(water.normal, 3));
     g.setAttribute('flow', new THREE.BufferAttribute(water.flow, 3));
     g.setAttribute('depth', new THREE.BufferAttribute(water.depth, 1));
-    if (this.spanSim) g.setAttribute('morph', new THREE.BufferAttribute(this.morphFrom(msg.index, water.position), 3));
+    if (this.spanSim) {
+      const { morph, was } = this.morphFrom(msg.index, water.position, water.flow, water.depth);
+      g.setAttribute('morph', new THREE.BufferAttribute(morph, 3));
+      g.setAttribute('was', new THREE.BufferAttribute(was, 3));
+    }
     g.computeBoundingSphere();
     g.computeBoundingBox();
     this.setWater(msg.index, g);
@@ -163,47 +167,62 @@ export class ChunkMeshes {
    * For a chunk's new water mesh: where each vertex was in the mesh it
    * replaces (the height shown there now, mid-glide or not), when, and over
    * how long to glide from there (about the time between the two meshes), so
-   * the surface moves smoothly rather than jumping at each re-mesh. A vertex
-   * with no counterpart (new water, or a level that's changed past JOIN)
-   * starts where it is.
+   * the surface moves smoothly rather than jumping at each re-mesh (`morph`);
+   * and the flow and depth shown there now, which glide the same way, so the
+   * ripples and white water speed up and slow down smoothly too (`was`). A
+   * vertex with no counterpart (new water, or a level that's changed past
+   * JOIN) starts where it is.
    */
-  morphFrom(index, position) {
+  morphFrom(index, position, flow, depth) {
     const now = performance.now() / 1000;
     const count = position.length / 3;
     const morph = new Float32Array(count * 3);
+    const was = new Float32Array(count * 3);
     const old = this.water[index]?.geometry;
-    const was = old?.attributes.morph ? old : null;
-    const dur = was ? Math.min(0.6, Math.max(0.05, now - was.userData.arrived)) : 0;
-    // Heights shown now by the old mesh, per (x, z) corner.
+    const prev = old?.attributes.morph ? old : null;
+    const dur = prev ? Math.min(0.6, Math.max(0.05, now - prev.userData.arrived)) : 0;
+    // What the old mesh shows now, per (x, z): [target height, height, flow x, flow z, depth] per vertex there.
     const at = new Map();
-    if (was) {
-      const p = was.attributes.position.array, m = was.attributes.morph.array;
+    if (prev) {
+      const p = prev.attributes.position.array, m = prev.attributes.morph.array;
+      const f = prev.attributes.flow.array, dp = prev.attributes.depth.array, w = prev.attributes.was.array;
       for (let v = 0; v < p.length / 3; v++) {
         const t = m[v * 3 + 2] > 0 ? Math.min(1, Math.max(0, (now - m[v * 3 + 1]) / m[v * 3 + 2])) : 1;
         const y = m[v * 3] + (p[v * 3 + 1] - m[v * 3]) * t;
+        const fx = w[v * 3] + (f[v * 3] - w[v * 3]) * t, fz = w[v * 3 + 1] + (f[v * 3 + 1] - w[v * 3 + 1]) * t;
+        const d = w[v * 3 + 2] + (dp[v] - w[v * 3 + 2]) * t;
         const key = `${p[v * 3].toFixed(3)},${p[v * 3 + 2].toFixed(3)}`;
         const list = at.get(key);
-        if (list) list.push(p[v * 3 + 1], y);
-        else at.set(key, [p[v * 3 + 1], y]);
+        if (list) list.push(p[v * 3 + 1], y, fx, fz, d);
+        else at.set(key, [p[v * 3 + 1], y, fx, fz, d]);
       }
     }
     const reach = 0.5; // metres: past this it's a different sheet
     for (let v = 0; v < count; v++) {
       const y = position[v * 3 + 1];
-      let from = y;
+      let from = y, fx = flow[v * 3], fz = flow[v * 3 + 1], d = depth[v];
       const list = at.get(`${position[v * 3].toFixed(3)},${position[v * 3 + 2].toFixed(3)}`);
       if (list) {
         let best = reach;
-        for (let n = 0; n < list.length; n += 2) {
+        for (let n = 0; n < list.length; n += 5) {
           const e = Math.abs(list[n] - y);
-          if (e < best) { best = e; from = list[n + 1]; }
+          if (e < best) {
+            best = e;
+            from = list[n + 1];
+            fx = list[n + 2];
+            fz = list[n + 3];
+            d = list[n + 4];
+          }
         }
       }
       morph[v * 3] = from;
       morph[v * 3 + 1] = now;
       morph[v * 3 + 2] = dur;
+      was[v * 3] = fx;
+      was[v * 3 + 1] = fz;
+      was[v * 3 + 2] = d;
     }
-    return morph;
+    return { morph, was };
   }
 
   /** Water mesh of a chunk: drawn only (not collided with or aimed at). */

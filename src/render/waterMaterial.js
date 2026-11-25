@@ -2,20 +2,25 @@ import * as THREE from 'three';
 import { LIGHTING_GLSL, lightingUniforms, litMaterial } from './lighting.js';
 
 /**
- * The water surface (src/mesh/fluidMesh.js). Drawn after everything solid,
- * blended, from both sides (from underwater you see its underside).
+ * The water surface (spanMesh.js and the other water meshers). Drawn after
+ * everything solid, blended, from both sides (from underwater you see its
+ * underside).
  *
- *  - Ripples: a height field of a few octaves of noise, finite-differenced
- *    into a normal. Moved along the mesh's `flow` (downhill along the
- *    surface) with the usual two-phase flow-map blend, so rivers visibly run
- *    and still water only shimmers. Falling water streams downwards.
- *  - Reflection: the sky in the mirror direction (the sky dome's own
- *    function under shader lighting), by Fresnel, and the sun's glint
- *    (GGX on a nearly smooth surface: bright enough to bloom).
- *  - Below the surface: a tinted, lit body colour, and see-through by how
- *    much isn't reflected. With `REFRACT` (shader lighting, PostFX's water
- *    pass), the ground behind is refracted and absorbed by how much water the
- *    light crosses, and the shallows foam; see PostFX.
+ *  - Small waves: gradient noise, its slope worked out exactly (no finite
+ *    differences), carried along the mesh's `flow` (m/s): a river's surface
+ *    visibly runs downstream, drawn out along the current the faster it goes,
+ *    and still water only shimmers. See `waves`.
+ *  - White water where water runs fast over a shallow bed (its Froude number:
+ *    speed against the speed of waves at that depth), as a steep chute
+ *    does; faint streaks of foam riding a brisk current; falling water white.
+ *  - Reflection: the sky in the mirror direction (the sky dome's own function
+ *    under shader lighting), by Fresnel, and the sun's glint (GGX).
+ *  - Below the surface: with `REFRACT` (shader lighting, PostFX's water pass),
+ *    the ground behind refracted, darkened where it's wet and absorbed by how
+ *    much water the view crosses (Beer–Lambert), and the surface fades out
+ *    over the last few centimetres of depth, so a shore is one clean, soft
+ *    line wherever the ground meets the water. Without it, a tinted body
+ *    colour, blended.
  * Output is premultiplied (what shows through is scaled by 1 − alpha), so
  * reflection adds to the scene behind rather than covering it.
  */
@@ -26,10 +31,12 @@ export function createWaterMaterial(shadow, extra = {}) {
     uOpaque: { value: null },
     uOpaqueDepth: { value: null },
     uScreen: { value: new THREE.Vector2(1, 1) },
-    // Depths (metres) over which the surface fades in: see fade in the shader.
+    // REFRACT: the camera's projection scale (x, y), to find what's behind a pixel.
+    uProj: { value: new THREE.Vector2(1, 1) },
+    // Without REFRACT: the mesh's depths (metres) over which the surface fades in.
     uFade: { value: new THREE.Vector2(0.08, 0.18) },
-    // From the mesh's flow attribute to a speed (about m/s): the cellular mesher's
-    // is a surface slope, the contoured one's the flux water's own flow.
+    // From the mesh's flow attribute to a speed (m/s): the cellular mesher's
+    // is a surface slope, the others' the water's own speed.
     uFlowScale: { value: 18 },
     ...extra,
   };
@@ -39,9 +46,11 @@ export function createWaterMaterial(shadow, extra = {}) {
     in vec3 flow;
     in float depth;
     // Where this vertex was in the chunk's previous mesh (height), when this
-    // mesh arrived and over how long to move from there (seconds): the
-    // surface glides between re-meshes instead of jumping (ChunkMeshes).
+    // mesh arrived and over how long to move from there (seconds), and the
+    // flow (x, z) and depth shown there then: the surface, and how it runs,
+    // glide between re-meshes instead of jumping (ChunkMeshes).
     in vec3 morph;
+    in vec3 was;
     out float vWater;
     out vec3 vPos;
     out vec3 vNormal;
@@ -49,11 +58,16 @@ export function createWaterMaterial(shadow, extra = {}) {
     out float vDepth;
     void main() {
       vec3 p = position;
-      p.y = mix(morph.x, p.y, morph.z > 0.0 ? clamp((uTime - morph.y) / morph.z, 0.0, 1.0) : 1.0);
-      vPos = p;
-      vNormal = normal;
       vFlow = flow;
       vWater = depth;
+      if (morph.z > 0.0) {
+        float k = clamp((uTime - morph.y) / morph.z, 0.0, 1.0);
+        p.y = mix(morph.x, p.y, k);
+        vFlow.xy = mix(was.xy, flow.xy, k);
+        vWater = mix(was.z, depth, k);
+      }
+      vPos = p;
+      vNormal = normal;
       vec4 mv = modelViewMatrix * vec4(p, 1.0);
       vDepth = -mv.z;
       gl_Position = projectionMatrix * mv;
@@ -69,6 +83,12 @@ export function createWaterMaterial(shadow, extra = {}) {
       uniform sampler2D uOpaque;
       uniform sampler2D uOpaqueDepth;
       uniform vec2 uScreen;
+      uniform vec2 uProj;
+      // The world point at screen position q (0..1) and linear depth d.
+      vec3 worldAt(vec2 q, float d) {
+        vec2 ndc = q * 2.0 - 1.0;
+        return cameraPosition + transpose(mat3(viewMatrix)) * (vec3(ndc.x / uProj.x, ndc.y / uProj.y, -1.0) * d);
+      }
     #endif
     in vec3 vPos;
     in vec3 vNormal;
@@ -77,36 +97,93 @@ export function createWaterMaterial(shadow, extra = {}) {
     in float vWater;
     layout(location = 0) out vec4 outColor;
 
-    float hash(vec2 p) {
-      p = fract(p * vec2(123.34, 456.21));
-      p += dot(p, p + 45.32);
-      return fract(p.x * p.y);
+    // Integer hash: as good a hundred metres from the origin as at it (a
+    // float hash loses precision far out, and its pattern turns to lines).
+    uint hashu(ivec2 q) {
+      uvec2 u = uvec2(q) * uvec2(1597334673u, 3812015801u);
+      uint n = (u.x ^ u.y) * 1597334673u;
+      return n ^ (n >> 16);
     }
-    float vnoise(vec2 p) {
-      vec2 i = floor(p), f = fract(p);
-      vec2 u = f * f * (3.0 - 2.0 * f);
-      return mix(mix(hash(i), hash(i + vec2(1, 0)), u.x), mix(hash(i + vec2(0, 1)), hash(i + vec2(1, 1)), u.x), u.y);
+    vec2 hash2(ivec2 q) {
+      uint n = hashu(q);
+      return vec2(float(n & 65535u), float(n >> 16)) * (1.0 / 65535.0);
     }
-    // Ripple height at p (metres), still water drifting slowly with time.
-    float ripples(vec2 p, float t) {
-      float h = vnoise(p * 0.9 + vec2(t * 0.11, t * 0.07)) * 0.55;
-      h += vnoise(p * 2.3 + vec2(-t * 0.21, t * 0.17)) * 0.3;
-      h += vnoise(p * 5.7 + vec2(t * 0.37, -t * 0.29)) * 0.15;
-      return h;
+    // Gradient noise (about -0.7..0.7) and its exact gradient: xy gradient, z value.
+    vec3 noised(vec2 p) {
+      vec2 fi = floor(p);
+      ivec2 i = ivec2(fi);
+      vec2 f = p - fi;
+      vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+      vec2 du = 30.0 * f * f * (f * (f - 2.0) + 1.0);
+      vec2 ga = hash2(i) * 2.0 - 1.0;
+      vec2 gb = hash2(i + ivec2(1, 0)) * 2.0 - 1.0;
+      vec2 gc = hash2(i + ivec2(0, 1)) * 2.0 - 1.0;
+      vec2 gd = hash2(i + ivec2(1, 1)) * 2.0 - 1.0;
+      float va = dot(ga, f);
+      float vb = dot(gb, f - vec2(1.0, 0.0));
+      float vc = dot(gc, f - vec2(0.0, 1.0));
+      float vd = dot(gd, f - vec2(1.0, 1.0));
+      float k = va - vb - vc + vd;
+      vec2 g = ga + u.x * (gb - ga) + u.y * (gc - ga) + u.x * u.y * (ga - gb - gc + gd) + du * (u.yx * k + vec2(vb, vc) - va);
+      return vec3(g, va + u.x * (vb - va) + u.y * (vc - va) + u.x * u.y * k);
     }
-    vec2 rippleSlope(vec2 p, float t) {
-      const float e = 0.04;
-      float h = ripples(p, t);
-      return vec2(ripples(p + vec2(e, 0.0), t) - h, ripples(p + vec2(0.0, e), t) - h) / e;
-    }
-    // Two phases of the pattern carried along the flow, each reset while the
-    // other is shown, so it moves without stretching.
-    vec2 flowSlope(vec2 p, vec2 flow, float t) {
-      float ph0 = fract(t * 0.35), ph1 = fract(t * 0.35 + 0.5);
-      float w = abs(ph0 - 0.5) * 2.0;
-      vec2 a = rippleSlope(p - flow * ph0 * 1.6, t);
-      vec2 b = rippleSlope(p - flow * ph1 * 1.6 + 0.37, t);
-      return mix(a, b, w);
+
+    // Small waves at p (metres) on water running at flow (m/s): their slope
+    // (xy: dh/dx, dh/dz) and a pattern (z, about -1..1) for foam to follow.
+    // fw: the pixel's footprint (metres); finer detail is left out (it
+    // would only shimmer).
+    //
+    // The plane is cut into tiles. Each draws the pattern turned to the
+    // current and drawn out along it, anchored at its own centre (turned
+    // about the world's origin instead, a slight bend in the current would
+    // shear it into fine lines), and the four tiles round a point blend
+    // smoothly. And it rides the current in two phases, each restarted
+    // (with a fresh pattern) while the other shows, so it moves on for ever
+    // without being stretched out of shape where the current speeds up.
+    // Both blends keep the waves' strength the same throughout.
+    const float TILE = 2.5;
+    const float PERIOD = 1.7;
+    vec3 waves(vec2 p, vec2 flow, float t, float fw) {
+      // (A breath of wind, so still water isn't frozen.)
+      flow += vec2(0.05, 0.035);
+      float speed = length(flow);
+      vec2 dir = flow / speed;
+      vec2 side = vec2(-dir.y, dir.x);
+      float stretch = 1.0 + 2.5 * smoothstep(0.2, 2.5, speed);
+      vec2 g = p / TILE - 0.5;
+      vec2 c = floor(g), fr = g - c;
+      vec3 acc = vec3(0.0);
+      float w2 = 0.0;
+      for (int k = 0; k < 4; k++) {
+        ivec2 o = ivec2(k & 1, k >> 1);
+        vec2 bw = mix(1.0 - fr, fr, vec2(o));
+        float wt = bw.x * bw.y;
+        if (wt < 0.002) continue;
+        ivec2 tile = ivec2(c) + o;
+        vec2 d = p - (vec2(tile) + 0.5) * TILE;
+        vec2 q0 = vec2(dot(d, dir), dot(d, side));
+        for (int ph = 0; ph < 2; ph++) {
+          float cyc = t / PERIOD + 0.5 * float(ph);
+          float phase = fract(cyc);
+          float w = wt * (1.0 - abs(2.0 * phase - 1.0));
+          if (w < 0.002) continue;
+          vec2 q = vec2((q0.x - speed * phase * PERIOD) / stretch, q0.y);
+          q += hash2(tile * 7 + ivec2(int(floor(cyc)) * 13, ph * 5)) * 64.0;
+          vec3 s = vec3(0.0);
+          float amp = 1.0, freq = 1.3;
+          for (int n = 0; n < 3; n++) {
+            float keep = 1.0 - smoothstep(0.2, 0.5, fw * freq);
+            if (keep <= 0.0) break;
+            vec3 h = noised(q * freq + float(n) * 31.7);
+            s += vec3(h.xy * freq, h.z) * amp * keep;
+            amp *= 0.45;
+            freq *= 2.3;
+          }
+          acc += w * vec3(s.x * dir / stretch + s.y * side, s.z);
+          w2 += w * w;
+        }
+      }
+      return acc / sqrt(max(w2, 1e-6));
     }
 
     void main() {
@@ -114,29 +191,57 @@ export function createWaterMaterial(shadow, extra = {}) {
       vec3 v = normalize(cameraPosition - vPos);
       bool below = !gl_FrontFacing;
       float t = uTime;
-      // (The mesh's flow is the surface's slope, small even in a brisk river: scaled up to a speed.)
       vec2 flow = vFlow.xy * uFlowScale;
       float speed = length(flow);
-      if (speed > 2.5) { flow *= 2.5 / speed; speed = 2.5; }
-      // 1: falling water; 2: a pane of still water against glass (SpanSim's).
-      bool pane = vFlow.z > 1.5;
-      float falling = pane ? 0.0 : vFlow.z;
-      bool wall = !pane && abs(gn.y) < 0.5;
+      if (speed > 6.0) { flow *= 6.0 / speed; speed = 6.0; }
+      // flow.z: 0 the surface; 1..2 falling water (1 leaving the lip, 2 at
+      // the bottom: glassy as it goes over, white by the time it lands); 3 a
+      // pane of still water against glass (SpanSim's).
+      bool pane = vFlow.z > 2.5;
+      float falling = !pane && vFlow.z > 0.5 ? 1.0 : 0.0;
+      float down = falling * clamp(vFlow.z - 1.0, 0.0, 1.0);
+      float fw = max(length(dFdx(vPos.xz)), length(dFdy(vPos.xz)));
 
-      // Shading normal: ripples, stronger where it runs, streaks where it falls.
-      vec3 n;
-      if (pane) {
-        n = gn;
-      } else if (wall) {
-        // Along the wall: streaks running down.
-        vec3 side = normalize(cross(gn, vec3(0.0, 1.0, 0.0)));
-        vec2 q = vec2(dot(vPos, side) * 3.0, vPos.y * 0.8 + t * 2.4);
-        float s = vnoise(q) - vnoise(q + vec2(0.0, 0.15));
-        n = normalize(gn + side * s * 0.6);
-      } else {
-        vec2 slope = flowSlope(vPos.xz, flow, t) * (0.035 + 0.05 * min(speed, 1.0));
-        n = normalize(vec3(-slope.x, 1.0, -slope.y) * vec3(1.0, sign(gn.y), 1.0));
-        n = normalize(n + vec3(gn.x, 0.0, gn.z));
+      // White water: fast over a shallow bed (Froude number well over 1), or
+      // running down anything steep.
+      float froude = speed / sqrt(9.81 * max(vWater, 0.03));
+      float steep = 1.0 - smoothstep(0.62, 0.9, abs(gn.y));
+      float rough = max(smoothstep(1.3, 3.5, froude) * smoothstep(0.6, 1.5, speed), steep * smoothstep(0.1, 0.5, speed + falling));
+      if (falling > 0.5) rough *= smoothstep(0.0, 0.45, down);
+
+      // Shading normal: small waves on the level, and where it's steep (or
+      // falling) streaks pouring down it, drawn on the two upright planes
+      // (along x and along z) and blended by which way it faces, so they
+      // never shear.
+      vec3 n = gn;
+      float pattern = 0.0;
+      if (!pane) {
+        float top = falling > 0.5 ? 0.0 : smoothstep(0.5, 0.8, abs(gn.y));
+        vec2 slope = vec2(0.0);
+        if (top > 0.0) {
+          vec3 w = waves(vPos.xz, flow, t, fw);
+          float strength = mix(0.05, 0.13, smoothstep(0.05, 1.2, speed)) + 0.12 * rough;
+          slope = w.xy * strength * top;
+          pattern = w.z * top;
+        }
+        vec3 side = vec3(0.0);
+        if (top < 1.0) {
+          float down = 2.2 + 1.5 * falling;
+          float ax = abs(gn.x), az = abs(gn.z);
+          float wx = ax / max(ax + az, 1e-4);
+          vec2 qx = vec2(vPos.z * 3.5, vPos.y * 0.9 + t * down);
+          vec2 qz = vec2(vPos.x * 3.5, vPos.y * 0.9 + t * down);
+          vec3 hx = noised(qx) + noised(qx * vec2(2.1, 1.7) + 9.3) * 0.5;
+          vec3 hz = noised(qz) + noised(qz * vec2(2.1, 1.7) + 9.3) * 0.5;
+          vec3 h = mix(hz, hx, wx);
+          pattern += h.z * (1.0 - top);
+          vec3 across = cross(gn, vec3(0.0, 1.0, 0.0));
+          across = dot(across, across) > 1e-6 ? normalize(across) : vec3(1.0, 0.0, 0.0);
+          side = across * h.x * 0.25 * (1.0 - top);
+        }
+        // (Added to the sheet's own slope where it runs down one.)
+        float gy = abs(gn.y);
+        n = normalize(vec3(gn.x - slope.x * gy, gn.y, gn.z - slope.y * gy) + side);
       }
       if (below) { n = -n; gn = -gn; }
 
@@ -148,12 +253,12 @@ export function createWaterMaterial(shadow, extra = {}) {
       float ndl = dot(gn, uSunDir);
       float vis = ndl > 0.0 ? sunShadow(vPos, gn, ndl) : 0.0;
       vec3 r = reflect(-v, n);
-      vec3 h = normalize(v + uSunDir);
-      float nh = max(dot(n, h), 0.0), nl = max(dot(n, uSunDir), 0.0);
-      float rough = wall || falling > 0.5 ? 0.35 : 0.06;
-      float a2 = rough * rough * rough * rough;
-      float d = nh * nh * (a2 - 1.0) + 1.0;
-      float glint = a2 / (3.14159265 * d * d) * nl * vis * 0.25;
+      vec3 hv = normalize(v + uSunDir);
+      float nh = max(dot(n, hv), 0.0), nl = max(dot(n, uSunDir), 0.0);
+      float roughness = falling > 0.5 ? mix(0.06, 0.35, smoothstep(0.0, 0.4, down)) : mix(0.05, 0.22, rough);
+      float a2 = roughness * roughness * roughness * roughness;
+      float dd = nh * nh * (a2 - 1.0) + 1.0;
+      float glint = a2 / (3.14159265 * dd * dd) * nl * vis * 0.25;
 
       #ifdef HDR
         vec3 sky = skyRadiance(r);
@@ -172,60 +277,64 @@ export function createWaterMaterial(shadow, extra = {}) {
       #endif
       vec3 reflection = sky + S * glint * uSpecularScale;
 
-      // Falling water turns white; small cascades and fast water a little.
-      float white = falling > 0.5 ? 0.2 : wall ? 0.15 : 0.0;
-      // Fast water breaks into white streaks running downhill (rapids, a
-      // shallow stream on a slope): a moving pattern, not a wash over it all.
-      if (speed > 0.15 && !wall) {
-        vec2 dir = flow / speed;
-        vec2 q = vec2(dot(vPos.xz, vec2(-dir.y, dir.x)), dot(vPos.xz, dir));
-        float st = vnoise(vec2(q.x * 5.0, q.y * 1.2 - t * 3.0 * speed)) * 0.6 + vnoise(vec2(q.x * 2.0 + 3.0, q.y * 0.6 - t * 2.0 * speed)) * 0.4;
-        white = max(white, smoothstep(0.55, 0.8, st) * smoothstep(0.15, 0.7, speed) * 0.55);
-      }
-      // The surface fades in with depth, from 8 to 18 cm: shallower water is
-      // drawn on the ground under it instead (waterFilm in waterHeight.js),
-      // so the shallows, shores and little cascades follow the smooth ground
-      // and nothing pops in or out cell by cell.
-      float fade = smoothstep(uFade.x, uFade.y, vWater);
+      // How white: falling water mostly; white water in streaks along the
+      // current; and on a brisk current, faint lines of foam riding it (not
+      // on a film of water running over the grass).
+      float p01 = clamp(0.5 + pattern * 0.8, 0.0, 1.0);
+      float white = falling > 0.5 ? mix(0.45, 0.85, smoothstep(0.3, 0.7, p01)) * smoothstep(0.0, 0.45, down) : 0.0;
+      white = max(white, rough * mix(0.25, 0.8, smoothstep(0.35, 0.75, p01)));
+      white = max(white, smoothstep(0.62, 0.82, p01) * smoothstep(0.15, 0.9, speed) * smoothstep(0.05, 0.15, vWater) * 0.22);
+      if (below) white *= 0.3;
       vec3 body = mix(bodyColor, foamColor, white);
-      float bodyAlpha = mix(0.62, 0.95, white);
 
       #ifdef REFRACT
-        // What's behind, refracted by the ripples, and how much water it's seen through.
         vec2 uv = gl_FragCoord.xy / uScreen;
         float surf = vDepth;
-        vec2 ruv = uv + n.xz * 0.04 * clamp((texture(uOpaqueDepth, uv).r - surf) * 0.5, 0.0, 1.0);
+        float behind0 = texture(uOpaqueDepth, uv).r;
+        // What's behind, refracted by the waves (less through thin water),
+        // and only if it's under this water: not something in front of it,
+        // nor the bank above the waterline (which would streak down into it).
+        vec2 ruv = uv + n.xz * 0.08 * clamp((behind0 - surf) * 0.5, 0.0, 1.0);
         float behind = texture(uOpaqueDepth, ruv).r;
-        if (behind < surf) { ruv = uv; behind = texture(uOpaqueDepth, uv).r; }
-        // (Running water is shaded as if at least 30 cm deep: a stream racing
-        // down a slope is only a centimetre or two of water, but should still
-        // read as the same stream, not vanish into the sand.)
-        float thick = max(max(behind - surf, 0.0), 0.3 * smoothstep(0.1, 0.6, speed));
-        // Through a window into water: what's behind is the glass, but the
-        // view goes on through the water beyond it.
-        if (pane) thick = max(thick, 4.0);
-        // Light crossing the water: red goes first, then green (Beer–Lambert, per metre).
-        vec3 through = exp(-vec3(0.45, 0.09, 0.07) * (thick + 0.25) * 1.6);
+        if (behind < surf || dot(worldAt(ruv, behind) - vPos, gn) > 0.0) { ruv = uv; behind = behind0; }
         vec3 scene = texture(uOpaque, ruv).rgb;
-        // Scattered light builds up with depth; the ground fades into it
-        // (a little even in the shallows, so they read as water).
-        float murk = 0.1 + 0.9 * (1.0 - exp(-thick * 0.35));
-        // Very thin water: the ground under it is wet (darker), and its
-        // surface broken, so it hardly mirrors the sky.
-        float thin = 1.0 - smoothstep(0.02, 0.15, thick);
-        scene *= 1.0 - 0.25 * thin;
-        // (Not running water: its broken surface catches the light all the more.)
-        F *= 1.0 - 0.7 * thin * (1.0 - smoothstep(0.1, 0.6, speed));
-        vec3 transmitted = scene * through + body * murk;
-        // Foam where the water's thin, along the shore.
-        // (Only in the last few centimetres at the water's edge, and faint: a
-        // whole shallow sheet is thin, and foamed all over it turns milky.)
-        float foam = (1.0 - smoothstep(0.005, 0.03, thick)) * smoothstep(0.45, 0.8, vnoise(vPos.xz * 5.0 + t * 0.4)) * (below ? 0.0 : 1.0);
-        transmitted = mix(transmitted, foamColor, foam * 0.2 + white * 0.5);
+        // How far the view runs through water to reach it (metres), and how
+        // deep the water is over it (across the sheet, so a sheet running
+        // down a slope is as deep seen from below as from above).
+        float ray = distance(worldAt(ruv, behind), vPos);
+        float deep = max(dot(vPos - worldAt(uv, behind0), gn), 0.0);
+        if (pane) { ray = max(ray, 4.0); deep = 1.0; }
+        // The shore: the surface fades out over the last few centimetres of
+        // depth (wider far off, where depth is coarser), so where the ground
+        // meets the water is one soft, exact line.
+        float edge = pane || below ? 1.0 : smoothstep(0.0, 0.025 + surf * 0.0015, deep);
+        // Light crossing the water: red goes first, then green (Beer–Lambert, per metre).
+        vec3 through = exp(-vec3(0.5, 0.11, 0.085) * ray * 2.0);
+        // Ground under water is wet: darker.
+        scene *= 0.78;
+        // Light scattered back out of the water builds up with depth.
+        float murk = 1.0 - exp(-ray * 0.7);
+        vec3 transmitted = scene * through + bodyColor * murk;
+        if (falling > 0.5) {
+          // A falling sheet, laid over whatever's behind it (the pool it falls
+          // into included): glassy as it leaves the lip (what's behind seen
+          // through it, bent and tinted), white water further down.
+          float solid = clamp(vWater, 0.0, 1.0);
+          vec3 vn = normalize((viewMatrix * vec4(n, 0.0)).xyz);
+          vec3 glass = texture(uOpaque, uv + vn.xy * 0.025).rgb * vec3(0.72, 0.86, 0.88) * 0.85;
+          vec3 c = mix(glass * (1.0 - F) + reflection * F, foamColor, white);
+          float a = solid * mix(0.7, 1.0, white);
+          outColor = vec4(fog(c, vDepth, vPos) * a, a);
+          return;
+        }
+        transmitted = mix(transmitted, foamColor, white);
         vec3 color = transmitted * (1.0 - F) + reflection * F;
         color = below ? color : fog(color, vDepth, vPos);
-        outColor = vec4(mix(texture(uOpaque, uv).rgb, color, fade), 1.0);
+        // (Premultiplied: at the shore, what's already there shows through.)
+        outColor = vec4(color * edge, edge);
       #else
+        float fade = falling > 0.5 ? clamp(vWater, 0.0, 1.0) : smoothstep(uFade.x, uFade.y, vWater);
+        float bodyAlpha = mix(0.6, 0.95, white);
         vec3 lit = below ? body : fog(body, vDepth, vPos);
         vec3 refl = below ? reflection : fog(reflection, vDepth, vPos);
         float a = bodyAlpha * (1.0 - F);

@@ -70,9 +70,8 @@ chunkMeshes.waterSurface = fluxWater;
 chunkMeshes.spanSim = spanWater ? fluid : null;
 if (spanWater) waterMaterial.uniforms.uFade.value.set(0.0, 0.03);
 else waterMaterial.uniforms.uFade.value.set(fluxWater ? 0.0 : 0.08, fluxWater ? 0.04 : 0.18);
-// (SpanSim's flow is in m/s, but a thin sheet on a slope runs fast: scaled
-// down so only the steepest runs turn white.)
-waterMaterial.uniforms.uFlowScale.value = spanWater ? 0.15 : fluxWater ? 3 : 18;
+// (SpanSim's flow is in m/s already.)
+waterMaterial.uniforms.uFlowScale.value = spanWater ? 1 : fluxWater ? 3 : 18;
 waterHeight.uniforms.uFilmOn.value = spanWater || fluxWater ? 0 : 1;
 const uTime = lightingUniforms(shadow).uTime;
 chunkMeshes.onChange = () => { shadow.dirty = true; };

@@ -13,15 +13,17 @@
  *
  * Shores: the sheet carries on flat over the dry columns next to it (a
  * skirt), so the ground cuts it off exactly where it rises out of the water,
- * not at the edge of a column. Moving or sloping water is drawn at least MINVIS deep,
- * so a thin stream still reads as one sheet over the smooth ground.
+ * not at the edge of a column. Running water is drawn clear of the ground
+ * under it by at least MINVIS (see corner), so a stream, however thin and
+ * however steep its bed, reads as one sheet over the ground.
  *
  * Waterfalls (water pouring over a drop) are a falling sheet from the lip
  * down to the water below, and water against a building piece (an
  * aquarium, a flooded room seen through glass) a pane on its side.
  *
- * Attributes: position, normal, flow (x, z in m/s; then 1 falling, 2 pane),
- * depth (metres, which fades the surface in at the very edge).
+ * Attributes: position, normal, flow (x, z in m/s; then 0 on the surface,
+ * 1..2 falling: 1 at the lip, 2 at the bottom; 3 a pane),
+ * depth (metres: of the water there; for a falling sheet, how solid it is, 0..1).
  */
 
 /** Shallower than this (voxels) a span counts as dry. */
@@ -33,10 +35,20 @@ export const DRY = 0.004;
  * staircase of little falls.)
  */
 export const JOIN = 2.5;
-/** Fields per span in a snapshot (SpanSim.snapshot): floor, roof, depth, flow x, flow z. */
-export const REC = 5;
-/** Running water is drawn at least this deep (voxels). */
+/** Fields per span in a snapshot (SpanSim.snapshot): floor, roof, depth, flow x, flow z, first open voxel. */
+export const REC = 6;
+/** Running water is drawn at least this far clear of the ground (voxels). */
 const MINVIS = 0.16;
+/** How far below a column's floor its ground may fall, towards its corners (voxels). */
+const TREAD = 0.25;
+/** How far above its floor the ground may rise at a lip, over a drop (voxels). */
+const LIP = 0.15;
+/** A falling sheet clears the lip by this much before it falls away (voxels). */
+const CLEAR = 0.5;
+/** Fields per fall in a snapshot: x, z, side, top, bottom, flow (voxels³ a tick), speed (m/s). */
+export const FALLREC = 7;
+/** Heights this close (voxels: 1 mm) are level: a square that's level all round isn't split. */
+const LEVEL = 2e-3;
 
 const SIDES = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 
@@ -61,7 +73,7 @@ export function meshSpans(p, scale = 1) {
           const o = r * REC, d = rec[o + 2];
           if (d <= DRY) continue;
           const lo = rec[o], hi = rec[o + 1];
-          cand.push({ s: lo + Math.min(d, hi - lo), lo, d, vx: rec[o + 3], vz: rec[o + 4], c });
+          cand.push({ s: lo + Math.min(d, hi - lo), lo, d: Math.min(d, hi - lo), vx: rec[o + 3], vz: rec[o + 4], c, y0: rec[o + 5] });
         }
       }
     cand.sort((a, b) => a.s - b.s);
@@ -90,18 +102,22 @@ export function meshSpans(p, scale = 1) {
     while (a > 0 && cand[a].s - cand[a - 1].s <= JOIN) a--;
     while (b < cand.length - 1 && cand[b + 1].s - cand[b].s <= JOIN) b++;
     const lo = cand[a].s, hi = cand[b].s;
-    let hs = 0, n = 0, ds = 0, vx = 0, vz = 0;
+    let hs = 0, n = 0, ds = 0, vx = 0, vz = 0, fs = 0;
     const used = [];
     for (let q = a; q <= b; q++) {
       const c = cand[q];
       hs += c.s;
       ds += c.d;
+      fs += c.lo;
       vx += c.vx;
       vz += c.vz;
       n++;
       used.push(c.c);
     }
     const members = n;
+    // A drop beside this corner (water below that isn't part of this sheet,
+    // or open air down past JOIN): the ground here is a lip.
+    let lip = a > 0;
     // Dry ground lower than the water, beside it: the sheet runs down onto it.
     for (let dj = -1; dj <= 0; dj++)
       for (let di = -1; di <= 0; di++) {
@@ -112,27 +128,46 @@ export function meshSpans(p, scale = 1) {
         let floor = -Infinity;
         for (let r = start[c]; r < start[c + 1]; r++) {
           const o = r * REC;
-          if (rec[o + 2] > DRY) continue;
           const f = rec[o];
+          if (f <= lo - JOIN && rec[o + 1] > lo) lip = true;
+          if (rec[o + 2] > DRY) continue;
           if (f < hi && f > lo - JOIN && rec[o + 1] > f && f > floor) floor = f;
         }
         if (floor > -Infinity) {
           hs += floor;
+          fs += floor;
           n++;
         }
       }
     vx /= members;
     vz /= members;
     let h = hs / n;
-    // Thin water that's moving, or on a slope: at least MINVIS deep, so it
-    // covers the ground it runs over. (Drawn a few millimetres over the ground,
-    // the faceted ground would poke through it along every contour, in bands
-    // that crawl as the water moves.) Still, level water isn't lifted, so a
-    // lake's shore stays exactly where the ground meets its level.
+    // Running water stays clear of the ground under it. The ground's
+    // surface over a column lies within that column's own layer of cells
+    // (from half a voxel under its first open voxel to half a voxel over),
+    // so down a steep slope it's terraced, a step per column, while the
+    // sheet's corners, averaged, make a smooth ramp: that would dip into
+    // the top of every step. So a corner rises to clear the ground of each
+    // column round it (the floor here, held to that column's layer and not
+    // far below its own floor) by
+    // MINVIS, or half the water's depth if more. Thin water on gentler
+    // ground is lifted the same way: drawn a few millimetres over the
+    // faceted ground, the ground would poke through along every contour,
+    // in bands that crawl as it moves. Still, level water isn't lifted, so
+    // a lake's shore stays exactly where the ground meets its level.
+    const floorHere = fs / n;
+    let ground = -Infinity;
+    for (let q = a; q <= b; q++) {
+      const { y0, lo: f } = cand[q];
+      // (Within a step the ground is nearly level, falling away only at its
+      // edge: so not much below the column's own floor either. At a lip it
+      // ends in an edge, a little above the floor.)
+      ground = Math.max(ground, Math.min(y0 + 0.5, Math.max(y0 - 0.5, floorHere, lip ? f + LIP : f - TREAD)));
+    }
     const speed = Math.hypot(vx, vz);
     const moving = Math.max(Math.min(1, speed / 0.05), Math.min(1, (hi - lo) / 0.05));
-    h += Math.max(0, MINVIS - ds / n) * moving;
-    out = { h, depth: (ds / 4) * scale + 0.05 * Math.min(1, speed / 0.3), vx, vz };
+    h += Math.max(0, ground + Math.max(MINVIS, (ds / members) * 0.5) - h) * moving;
+    out = { h, depth: (ds / members) * scale, vx, vz };
     cache.set(key, out);
     return out;
   }
@@ -143,20 +178,94 @@ export function meshSpans(p, scale = 1) {
     pos.push(x * scale, y * scale, z * scale);
     flow.push(fx, fz, kind);
     dep.push(d);
-    keys.push(kind === 0 ? `${x},${z},${y.toFixed(4)}` : null);
+    // (Vertices of the sheet, and of the falls, share normals with the others at the same point.)
+    keys.push(kind < 3 ? `${kind ? 'f' : ''}${x.toFixed(4)},${z.toFixed(4)},${y.toFixed(4)}` : null);
   }
 
-  /** A column's square from its four corners (x0, z0 the corner of the lowest x and z). */
-  function square(x0, z0, c00, c10, c01, c11) {
-    const v = (x, z, c) => vert(x, c.h, z, c.vx, c.vz, 0, c.depth);
-    // (Split along the diagonal whose ends are closer in height: the flatter way.)
-    if (Math.abs(c00.h - c11.h) <= Math.abs(c10.h - c01.h)) {
-      v(x0, z0, c00); v(x0, z0 + 1, c01); v(x0 + 1, z0 + 1, c11);
-      v(x0, z0, c00); v(x0 + 1, z0 + 1, c11); v(x0 + 1, z0, c10);
-    } else {
-      v(x0, z0, c00); v(x0, z0 + 1, c01); v(x0 + 1, z0, c10);
-      v(x0 + 1, z0, c10); v(x0, z0 + 1, c01); v(x0 + 1, z0 + 1, c11);
+  /**
+   * Height halfway from p1 to p2 on a monotone cubic through p0..p3
+   * (Fritsch–Carlson; p0 or p3 null where there's nothing): a smooth curve
+   * that never goes past p1 or p2, so a fold rounds off without bulging
+   * into the ground or up over a lip. Level stays exactly level.
+   */
+  function mid(p0, p1, p2, p3) {
+    const d1 = p2 - p1;
+    if (Math.abs(d1) < LEVEL) return (p1 + p2) / 2;
+    const d0 = p0 === null ? d1 : p1 - p0, d2 = p3 === null ? d1 : p3 - p2;
+    let m1 = d0 * d1 <= 0 ? 0 : (d0 + d1) / 2;
+    let m2 = d1 * d2 <= 0 ? 0 : (d1 + d2) / 2;
+    const a = m1 / d1, b = m2 / d1, r = a * a + b * b;
+    if (r > 9) {
+      const k = 3 / Math.sqrt(r);
+      m1 = k * a * d1;
+      m2 = k * b * d1;
     }
+    return (p1 + p2) / 2 + (m1 - m2) / 8;
+  }
+
+  /** Two triangles over a quad (a: lowest x and z, b: +x, c: +z, d: both), split a–d or b–c, facing up. */
+  function quad(a, b, c, d, ad) {
+    if (ad) for (const q of [a, c, d, a, d, b]) vert(q.x, q.h, q.z, q.vx, q.vz, 0, q.depth);
+    else for (const q of [a, c, b, b, c, d]) vert(q.x, q.h, q.z, q.vx, q.vz, 0, q.depth);
+  }
+
+  const g16 = new Array(16);
+  /**
+   * Column (i, j)'s square (x0, z0: its corner of lowest x and z), from the
+   * sheet's corners round it: own(di, dj) gives its own four (di, dj 0..1),
+   * and the sheet beyond them is looked up from those (null where there's
+   * none: the ground's). Level (its own four corners), it's two triangles. Otherwise it's split in four, the new points on
+   * smooth curves through the corners either side, so the sheet bends
+   * smoothly instead of folding along the squares' edges. (Both squares
+   * either side of an edge work out the point on it from the same four
+   * corners along it, so they meet exactly; and an edge that's level stays
+   * straight, so a square that isn't split meets one that is.)
+   */
+  function square(x0, z0, i, j, own) {
+    const c4 = [own(0, 0), own(1, 0), own(0, 1), own(1, 1)];
+    const P = (x, z, c) => ({ x, z, h: c.h, vx: c.vx, vz: c.vz, depth: c.depth });
+    const c00 = P(x0, z0, c4[0]), c10 = P(x0 + 1, z0, c4[1]), c01 = P(x0, z0 + 1, c4[2]), c11 = P(x0 + 1, z0 + 1, c4[3]);
+    const lo = Math.min(c00.h, c10.h, c01.h, c11.h), hi = Math.max(c00.h, c10.h, c01.h, c11.h);
+    if (hi - lo < LEVEL) {
+      quad(c00, c10, c01, c11, true);
+      return;
+    }
+    for (let dj = -1, n = 0; dj <= 2; dj++)
+      for (let di = -1; di <= 2; di++, n++) {
+        const ci = di < 0 ? 0 : di > 1 ? 1 : di, cj = dj < 0 ? 0 : dj > 1 ? 1 : dj;
+        let c = c4[ci + 2 * cj];
+        // Beyond its own corners: the sheet through the nearest of them (so
+        // the squares either side of an edge find the same).
+        if (ci !== di || cj !== dj) c = corner(i + di, j + dj, c.h, false) || outer(i + di, j + dj, c.h);
+        g16[n] = c;
+      }
+    const C = (di, dj) => g16[di + 1 + 4 * (dj + 1)];
+    const H = (di, dj) => {
+      const c = C(di, dj);
+      return c ? c.h : null;
+    };
+    const row = (dj) => (H(0, dj) === null || H(1, dj) === null ? null : mid(H(-1, dj), H(0, dj), H(1, dj), H(2, dj)));
+    const col = (di) => (H(di, 0) === null || H(di, 1) === null ? null : mid(H(di, -1), H(di, 0), H(di, 1), H(di, 2)));
+    const eb = row(0), et = row(1), el = col(0), er = col(1);
+    const hc = (mid(row(-1), eb, et, row(2)) + mid(col(-1), el, er, col(2))) / 2;
+    const blend = (x, z, h, ...cs) => {
+      const q = { x, z, h, vx: 0, vz: 0, depth: 0 };
+      for (const c of cs) {
+        q.vx += c.vx / cs.length;
+        q.vz += c.vz / cs.length;
+        q.depth += c.depth / cs.length;
+      }
+      return q;
+    };
+    const xm = x0 + 0.5, zm = z0 + 0.5;
+    const pb = blend(xm, z0, eb, c00, c10), pt = blend(xm, z0 + 1, et, c01, c11);
+    const pl = blend(x0, zm, el, c00, c01), pr = blend(x0 + 1, zm, er, c10, c11);
+    const pc = blend(xm, zm, hc, c00, c10, c01, c11);
+    // Each quarter split through the middle (the diagonal from its outer corner).
+    quad(c00, pb, pl, pc, true);
+    quad(pb, c10, pc, pr, false);
+    quad(pl, pc, c01, pt, false);
+    quad(pc, pr, pt, c11, true);
   }
 
   const inChunk = (s) => {
@@ -198,7 +307,7 @@ export function meshSpans(p, scale = 1) {
         const s = lo + Math.min(d, hi - lo);
         mine.push(s);
         if (!inChunk(s)) continue;
-        square(x0, z0, corner(i, j, s), corner(i + 1, j, s), corner(i, j + 1, s), corner(i + 1, j + 1, s));
+        square(x0, z0, i, j, (di, dj) => corner(i + di, j + dj, s));
       }
 
       // Skirt: water beside this column (any of the eight round it) at a
@@ -217,8 +326,7 @@ export function meshSpans(p, scale = 1) {
             if (mine.some((l) => Math.abs(l - L) <= JOIN)) continue;
             levels.push(L);
             if (!isBank(c, L)) continue;
-            const k = (ci, cj) => corner(ci, cj, L, false) || outer(ci, cj, L);
-            square(x0, z0, k(i, j), k(i + 1, j), k(i, j + 1), k(i + 1, j + 1));
+            square(x0, z0, i, j, (di, dj) => corner(i + di, j + dj, L, false) || outer(i + di, j + dj, L));
           }
         }
     }
@@ -244,47 +352,57 @@ export function meshSpans(p, scale = 1) {
     return [[i, j], [i + 1, j]];
   }
 
-  // Which sides of which columns pour, and how much: a fall's ends fade out
-  // where the next column along the lip doesn't pour, so a falling sheet has
-  // soft sides rather than square ones.
+  // Which sides of which columns pour (the chunk's, and the columns just
+  // round it), how solid each fall is and where it lands. Where the next
+  // column along the lip pours too, the two falls meet halfway between
+  // their own: as solid and landing as low as each other, so a wide fall is
+  // one sheet. Where it doesn't, the fall fades out at that end.
+  const solidOf = (f) => 0.3 + 0.7 * Math.min(1, f * 8);
   const pours = new Map();
-  for (let n = 0; n < falls.length; n += 6) pours.set(`${falls[n]},${falls[n + 1]},${falls[n + 2]}`, falls[n + 5]);
+  for (let n = 0; n < falls.length; n += FALLREC) pours.set(`${falls[n]},${falls[n + 1]},${falls[n + 2]}`, [solidOf(falls[n + 5]), falls[n + 4]]);
   /** Neighbours along the lip at face end a and b (see faceEnds). */
   const ALONG = [[[0, -1], [0, 1]], [[0, 1], [0, -1]], [[1, 0], [-1, 0]], [[-1, 0], [1, 0]]];
-  // The fall's profile: [out from the lip, how far down (0..1), how solid].
-  // A parabola (it leaves the lip moving and speeds up), thinning out into
-  // spray at the bottom rather than ending in a hard line.
-  const PROFILE = [[0, 0, 1], [0.12, 0.08, 1], [0.24, 0.3, 0.95], [0.34, 0.62, 0.8], [0.42, 1, 0.35]];
+  // The fall's profile: [how far down (0..1), how solid]. It leaves the lip
+  // as fast as the water ran over it and falls away under gravity (out ∝
+  // √down), after first clearing the lip's edge (the smooth ground can
+  // reach half a voxel past the column's side), thinning into spray at the
+  // bottom rather than ending in a hard line.
+  const PROFILE = [[0, 1], [0.04, 1], [0.2, 0.95], [0.5, 0.8], [0.8, 0.45], [1, 0.1]];
 
-  for (let n = 0; n < falls.length; n += 6) {
-    const x = falls[n], z = falls[n + 1], k = falls[n + 2], top = falls[n + 3], bottom = falls[n + 4], f = falls[n + 5];
-    if (!inChunk(top)) continue;
+  for (let n = 0; n < falls.length; n += FALLREC) {
+    const x = falls[n], z = falls[n + 1], k = falls[n + 2], top = falls[n + 3], bottom = falls[n + 4], f = falls[n + 5], u = falls[n + 6];
+    // How far out it lands (voxels): speed × time to fall.
+    const reach = Math.min(2, (u * Math.sqrt((2 * (top - bottom) * scale) / 9.81)) / scale);
+    const out = (row) => (row[0] > 0 ? CLEAR + reach * Math.sqrt(row[0]) : 0);
+    if (!inChunk(top) || x < ox || z < oz || x >= ox + S || z >= oz + S) continue;
     const i = x - ox + P, j = z - oz + P;
     const [dx, dz] = SIDES[k];
     const [a, b] = faceEnds(k, i, j);
     // The lip: the sheet's own corners there.
     const ta = (corner(a[0], a[1], top) || flat(top)).h, tb = (corner(b[0], b[1], top) || flat(top)).h;
-    const d = Math.min(1, f * 3) * 0.6 + 0.03;
-    const side = (e) => {
-      const nf = pours.get(`${x + ALONG[k][e][0]},${z + ALONG[k][e][1]},${k}`);
-      return nf === undefined ? 0 : Math.min(1, 0.5 + nf / Math.max(f, 1e-6) / 2);
-    };
-    const sa = side(0), sb = side(1);
+    const d = solidOf(f);
+    const na = pours.get(`${x + ALONG[k][0][0]},${z + ALONG[k][0][1]},${k}`), nb = pours.get(`${x + ALONG[k][1][0]},${z + ALONG[k][1][1]},${k}`);
+    const sa = na ? (d + na[0]) / 2 : 0, sb = nb ? (d + nb[0]) / 2 : 0;
+    const ba = na ? (bottom + na[1]) / 2 : bottom, bb = nb ? (bottom + nb[1]) / 2 : bottom;
     // Ends with no fall beside them are pulled in a little, so the sheet narrows.
-    const ia = sa ? 0 : 0.15, ib = sb ? 0 : 0.15;
+    const ia = na ? 0 : 0.15, ib = nb ? 0 : 0.15;
     const ea = [a[0] + (b[0] - a[0]) * ia, a[1] + (b[1] - a[1]) * ia], eb = [b[0] + (a[0] - b[0]) * ib, b[1] + (a[1] - b[1]) * ib];
-    const p = (c, row, hTop) => [ox + c[0] - P + dx * row[0], hTop + (bottom - hTop) * row[1], oz + c[1] - P + dz * row[0]];
-    // Across the lip: its two ends and the middle (full strength there; an
-    // end fades to nothing unless the next column along pours too).
-    const em = [(ea[0] + eb[0]) / 2, (ea[1] + eb[1]) / 2], tm = (ta + tb) / 2;
-    const across = [[ea, ta, sa], [em, tm, 1], [eb, tb, sb]];
+    const p = (c, row, hTop, hBot) => [ox + c[0] - P + dx * out(row), hTop + (hBot - hTop) * row[0], oz + c[1] - P + dz * out(row)];
+    // Across the lip: its two ends and the middle. (The middle of the lip
+    // on the sheet's own curve along it: see square.)
+    const along = (c, e, ref) => {
+      const q = [c[0] + (b[0] - a[0]) * e, c[1] + (b[1] - a[1]) * e];
+      return (corner(q[0], q[1], ref, false) || outer(q[0], q[1], ref)).h;
+    };
+    const em = [(ea[0] + eb[0]) / 2, (ea[1] + eb[1]) / 2], tm = mid(along(a, -1, ta), ta, tb, along(b, 1, tb));
+    const across = [[ea, ta, sa, ba], [em, tm, d, bottom], [eb, tb, sb, bb]];
     for (let r = 0; r < PROFILE.length - 1; r++) {
       const r0 = PROFILE[r], r1 = PROFILE[r + 1];
       for (let c = 0; c < 2; c++) {
-        const [ca, ha, wa] = across[c], [cb, hb, wb] = across[c + 1];
-        const a0 = [p(ca, r0, ha), d * r0[2] * wa], b0 = [p(cb, r0, hb), d * r0[2] * wb];
-        const a1 = [p(ca, r1, ha), d * r1[2] * wa], b1 = [p(cb, r1, hb), d * r1[2] * wb];
-        for (const [v, dv] of [a0, b0, b1, a0, b1, a1]) vert(v[0], v[1], v[2], dx * 0.5, dz * 0.5, 1, dv);
+        const [ca, ha, wa, la] = across[c], [cb, hb, wb, lb] = across[c + 1];
+        const a0 = [p(ca, r0, ha, la), wa * r0[1]], b0 = [p(cb, r0, hb, lb), wb * r0[1]];
+        const a1 = [p(ca, r1, ha, la), wa * r1[1]], b1 = [p(cb, r1, hb, lb), wb * r1[1]];
+        for (const [v, dv, down] of [[...a0, r0[0]], [...b0, r0[0]], [...b1, r1[0]], [...a0, r0[0]], [...b1, r1[0]], [...a1, r1[0]]]) vert(v[0], v[1], v[2], dx * 0.5, dz * 0.5, 1 + down, dv);
       }
     }
   }
@@ -300,7 +418,7 @@ export function meshSpans(p, scale = 1) {
     const [dx, dz] = SIDES[k];
     const at = (c, y) => [ox + c[0] - P + dx * 0.01, y, oz + c[1] - P + dz * 0.01];
     const a1 = at(a, y1), b1 = at(b, y1), a0 = at(a, y0), b0 = at(b, y0);
-    for (const q of [a1, b1, b0, a1, b0, a0]) vert(q[0], q[1], q[2], 0, 0, 2, 1);
+    for (const q of [a1, b1, b0, a1, b0, a0]) vert(q[0], q[1], q[2], 0, 0, 3, 1);
   }
 
   // ---- normals: the sheet's averaged over the squares meeting at each corner --------

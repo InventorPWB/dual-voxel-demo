@@ -162,6 +162,7 @@ export class PostFX {
       u.uOpaque.value = this.opaque.texture;
       u.uOpaqueDepth.value = this.opaqueDepth.texture;
       u.uScreen.value.set(this.screen[0], this.screen[1]);
+      if (u.uProj) u.uProj.value.set(camera.projectionMatrix.elements[0], camera.projectionMatrix.elements[5]);
       r.setRenderTarget(this.scene);
       camera.layers.set(wl);
       const autoClear = r.autoClear, background = scene.background;
